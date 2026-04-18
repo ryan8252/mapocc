@@ -1,5 +1,57 @@
 _base_ = ['./ProtoOcc_1key.py']
 
+# Python-level variables from _base_ are NOT inherited by mmcv config system.
+# Re-declare everything used in this file's Python expressions.
+voxel_out_channels = 48
+
+data_config = {
+    'cams': [
+        'CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_BACK_LEFT',
+        'CAM_BACK', 'CAM_BACK_RIGHT'
+    ],
+    'Ncams': 6,
+    'input_size': (256, 704),
+    'src_size': (900, 1600),
+    'resize': (-0.06, 0.11),
+    'rot': (-5.4, 5.4),
+    'flip': True,
+    'crop_h': (0.0, 0.0),
+    'resize_test': 0.00,
+}
+
+grid_config = {
+    'x': [-40, 40, 0.4],
+    'y': [-40, 40, 0.4],
+    'z': [-1, 5.4, 6.4],
+    'depth': [1.0, 45.0, 0.5],
+}
+
+bda_aug_conf = dict(
+    rot_lim=(-0., 0.),
+    scale_lim=(1., 1.),
+    flip_dx_ratio=0.5,
+    flip_dy_ratio=0.5,
+)
+
+class_names = [
+    'car', 'truck', 'construction_vehicle', 'bus', 'trailer', 'barrier',
+    'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
+]
+
+data_root = 'data/nuscenes/'
+file_client_args = dict(backend='disk')
+
+learning_map = {
+    1: 0,   5: 0,   7: 0,   8: 0,
+    10: 0,  11: 0,  13: 0,  19: 0,
+    20: 0,  0: 0,   29: 0,  31: 0,
+    9: 1,   14: 2,  15: 3,  16: 3,
+    17: 4,  18: 5,  21: 6,  2: 7,
+    3: 7,   4: 7,   6: 7,   12: 8,
+    22: 9,  23: 10, 24: 11, 25: 12,
+    26: 13, 27: 14, 28: 15, 30: 16,
+}
+
 # BEVFusion-style semantic map classes.
 map_classes = [
     'drivable_area',
@@ -16,6 +68,34 @@ map_xbound = [-40.0, 40.0, 0.4]
 map_ybound = [-40.0, 40.0, 0.4]
 
 dataset_type = 'NuScenesDatasetMultitask'
+
+model = dict(
+    dual_branch_encoder=dict(
+        return_bev_feature=True,
+    ),
+    bev_seg_head=dict(
+        type='BEVSegHead',
+        in_channels=voxel_out_channels,
+        hidden_channels=voxel_out_channels * 2,
+        num_classes=len(map_classes),
+        num_convs=2,
+        with_cp=True,
+        loss_bce=dict(
+            type='CrossEntropyLoss',
+            use_sigmoid=True,
+            reduction='mean',
+            loss_weight=5.0,
+        ),
+        loss_dice=dict(
+            type='DiceLoss',
+            use_sigmoid=True,
+            activate=True,
+            reduction='mean',
+            naive_dice=True,
+            loss_weight=1.0,
+        ),
+    ),
+)
 
 train_pipeline = [
     dict(

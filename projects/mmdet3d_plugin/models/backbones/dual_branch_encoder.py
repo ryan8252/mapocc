@@ -44,9 +44,11 @@ class Dual_Branch_Encoder(nn.Module):
         bev_encoder_backbone=None,
         bev_encoder_neck=None,
         down_sample_for_3d_pooling=None,
+        return_bev_feature=False,
     ):
         super().__init__()
         self.with_cp = with_cp
+        self.return_bev_feature = return_bev_feature
         
         # BEV encoder
         self.down_sample_for_3d_pooling = \
@@ -166,7 +168,11 @@ class Dual_Branch_Encoder(nn.Module):
 
         # residual connection (for high performance)
         bev = self.bev_encoder_neck(multi_scale_bev)
-        vox = self.voxelize_module(bev[0])
+        bev_feature = bev[0]
+        vox = self.voxelize_module(bev_feature)
         comprehensive_voxel_feature = vox + vox_raw
+
+        if self.return_bev_feature:
+            return comprehensive_voxel_feature, bev_feature
 
         return comprehensive_voxel_feature

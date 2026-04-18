@@ -70,7 +70,7 @@ class LoadBEVSegmentation(object):
     def _build_layer_mapping(self):
         mappings = {}
         for name in self.classes:
-            if name == 'drivable_area*':
+            if name in ('drivable_area', 'drivable_area*'):
                 mappings[name] = ['road_segment', 'lane']
             elif name == 'divider':
                 mappings[name] = ['road_divider', 'lane_divider']
