@@ -12,7 +12,6 @@ from mmdet3d.datasets import DATASETS
 from .nuscenes_dataset_bevdet import NuScenesDatasetBEVDet as NuScenesDataset
 from ..core.evaluation.occ_metrics import Metric_mIoU, Metric_FScore
 from .ego_pose_dataset import EgoPoseDataset
-from ..core.evaluation.ray_metrics import main as calc_rayiou
 from torch.utils.data import DataLoader
 
 
@@ -50,6 +49,11 @@ class NuScenesDatasetOccpancy(NuScenesDataset):
         metric = eval_kwargs['metric'][0]
         print("metric = ", metric)
         if metric == 'ray-iou':
+            # Import ray-IoU evaluation lazily so unrelated tools (for example
+            # dataset visualization scripts) do not try to build the optional
+            # DVR extension during dataset registration.
+            from ..core.evaluation.ray_metrics import main as calc_rayiou
+
             occ_gts = []
             occ_preds = []
             lidar_origins = []

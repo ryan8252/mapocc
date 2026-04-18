@@ -1,5 +1,4 @@
 import numpy as np
-import torch
 from nuscenes.map_expansion.map_api import NuScenesMap
 from pyquaternion import Quaternion
 
@@ -51,12 +50,19 @@ class LoadBEVSegmentation(object):
             curr['ego2global_rotation']).rotation_matrix
         ego2global[:3, 3] = curr['ego2global_translation']
 
-        bda_rot = results['img_inputs'][6]
-        if isinstance(bda_rot, torch.Tensor):
-            bda_rot = bda_rot.detach().cpu().numpy()
-
+        # Use rotation + scale only — no flip.
+        # get_map_mask accepts a scalar angle, so reflections cannot be encoded
+        # in patch_angle (a flip would appear as a 180° rotation, causing
+        # flip_x + flip_y instead of just flip_x/flip_y). Flips are applied
+        # post-rasterization in __call__ to match LoadOccGTFromFile's behaviour.
+        rotate_bda = float(results.get('rotate_bda', 0.0))
+        scale_bda = float(results.get('scale_bda', 1.0))
+        c, s = np.cos(-rotate_bda), np.sin(-rotate_bda)
+        rot_mat = np.array(
+            [[c, s, 0.0], [-s, c, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32
+        )
         lidar_aug = np.eye(4, dtype=np.float32)
-        lidar_aug[:3, :3] = bda_rot
+        lidar_aug[:3, :3] = scale_bda * rot_mat
 
         aug_lidar2global = ego2global @ lidar2ego @ np.linalg.inv(lidar_aug)
         return aug_lidar2global
@@ -106,6 +112,11 @@ class LoadBEVSegmentation(object):
             layer_names=layer_names,
             canvas_size=self.canvas_size,
         )
+        # get_map_mask returns (C, canvas_h, canvas_w) = (C, y_cells, x_cells).
+        # Transpose to (C, x_cells, y_cells) before boolean assignment.
+        # Because labels is created with canvas_size shape (y_cells, x_cells), and the grid
+        # is symmetric (x_cells == y_cells for nuScenes), numpy silently applies the boolean
+        # mask without error but physically swaps x and y indices in labels.
         masks = masks.transpose(0, 2, 1).astype(np.bool_)
 
         labels = np.zeros((len(self.classes), *self.canvas_size), dtype=np.int64)
@@ -114,5 +125,19 @@ class LoadBEVSegmentation(object):
                 mask_index = layer_names.index(layer_name)
                 labels[class_index, masks[mask_index]] = 1
 
-        results['gt_masks_bev'] = labels
+        # The two transposes cancel the index swap, leaving labels in (C, x_cells, y_cells).
+        # The [:, :, ::-1] corrects the y-axis direction: NuScenes row 0 = y_max (North = top),
+        # flipping gives y_idx=0 = y_min to match voxel_semantics[x_idx, y_idx, z_idx].
+        labels = labels.transpose(0, 2, 1)[:, :, ::-1]
+
+        # Post-rasterization flip to match LoadOccGTFromFile's BDA flip:
+        #   flip_dx -> torch.flip(semantics, [0])  => labels[:, ::-1, :]
+        #   flip_dy -> torch.flip(semantics, [1])  => labels[:, :, ::-1]
+        # get_map_mask only accepts a scalar angle, so reflections must be applied here.
+        if results.get('flip_dx', False):
+            labels = labels[:, ::-1, :]
+        if results.get('flip_dy', False):
+            labels = labels[:, :, ::-1]
+
+        results['gt_masks_bev'] = np.ascontiguousarray(labels)
         return results
