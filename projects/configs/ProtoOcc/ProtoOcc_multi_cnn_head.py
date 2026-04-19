@@ -78,7 +78,7 @@ data_root = 'data/nuscenes/'
 file_client_args = dict(backend='disk')
 
 model = dict(
-    type='ProtoOccMultitask',
+    type='ProtoOccCnnSegHead',
     pc_range=point_cloud_range,
     grid_size=grid_size,
     img_bev_encoder_backbone=None,  # for avoiding error during init BEVDet

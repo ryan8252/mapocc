@@ -9,7 +9,7 @@ from mmdet3d.models import builder
 
  
 @DETECTORS.register_module()
-class ProtoOccMultitask(BEVDet):
+class ProtoOccCnnSegHead(BEVDet):
     def __init__(self,
                  pc_range = [-40.0, -40.0, -1, 40.0, 40.0, 5.4],
                  grid_size = [200, 200, 16],
@@ -19,7 +19,7 @@ class ProtoOccMultitask(BEVDet):
                  prototype_query_decoder=None,
                  bev_seg_head=None,
                  **kwargs):
-        super(ProtoOccMultitask, self).__init__(**kwargs)
+        super(ProtoOccCnnSegHead, self).__init__(**kwargs)
         self.pts_bbox_head = None # useless
         self.pc_range = torch.tensor(pc_range)
         self.grid_size = torch.tensor(grid_size)
@@ -132,7 +132,7 @@ class ProtoOccMultitask(BEVDet):
                 raise ValueError('BEV segmentation head requires BEV features from Dual_Branch_Encoder.')
             gt_masks_bev = self._normalize_map_targets(gt_masks_bev)
             if gt_masks_bev is None:
-                raise ValueError('Expected `gt_masks_bev` when training ProtoOccMultitask with a BEV segmentation head.')
+                raise ValueError('Expected `gt_masks_bev` when training ProtoOccCnnSegHead with a BEV segmentation head.')
             bev_seg_logits = self.bev_seg_head(bev_feature)
             losses.update(self.bev_seg_head.loss(bev_seg_logits, gt_masks_bev))
         
