@@ -9,7 +9,7 @@ from .bevdet4d import BEVDet4D
 
 __all__ = [
     'ProtoOcc',
-    'ProtoOccMapGT',
+    'ProtoOccMultitask',
     'BEVStereo4D',
     'BEVDet',
     'BEVDepth4D',

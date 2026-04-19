@@ -33,9 +33,8 @@ class LoadBEVSegmentation(object):
         self.canvas_size = (canvas_h, canvas_w)
         self.classes = tuple(classes)
 
-        self.maps = {}
-        for location in LOCATIONS:
-            self.maps[location] = NuScenesMap(dataset_root, location)
+        self.dataset_root = dataset_root
+        self.maps = {}  # lazy-loaded per location to save worker RAM
 
     def _build_lidar2global(self, results):
         curr = results['curr']
@@ -106,6 +105,8 @@ class LoadBEVSegmentation(object):
         layer_names = list(dict.fromkeys(layer_names))
 
         location = results['location']
+        if location not in self.maps:
+            self.maps[location] = NuScenesMap(self.dataset_root, location)
         masks = self.maps[location].get_map_mask(
             patch_box=patch_box,
             patch_angle=patch_angle,
