@@ -1,4 +1,6 @@
 # Copyright (c) Phigent Robotics. All rights reserved.
+import numpy as np
+
 from .bevdet import BEVDet
 from mmdet3d.models import DETECTORS
 from mmdet3d.models.builder import build_head
@@ -7,7 +9,7 @@ from mmdet3d.models import builder
 
  
 @DETECTORS.register_module()
-class ProtoOcc(BEVDet):
+class ProtoOccMapGT(BEVDet):
     def __init__(self,
                  pc_range = [-40.0, -40.0, -1, 40.0, 40.0, 5.4],
                  grid_size = [200, 200, 16],
@@ -15,8 +17,9 @@ class ProtoOcc(BEVDet):
                  dual_branch_encoder=None,
                  cnn3d_decoder=None,
                  prototype_query_decoder=None,
+                 bev_seg_head=None,
                  **kwargs):
-        super(ProtoOcc, self).__init__(**kwargs)
+        super(ProtoOccMapGT, self).__init__(**kwargs)
         self.pts_bbox_head = None # useless
         self.pc_range = torch.tensor(pc_range)
         self.grid_size = torch.tensor(grid_size)
@@ -26,6 +29,7 @@ class ProtoOcc(BEVDet):
         self.dual_branch_encoder = builder.build_backbone(dual_branch_encoder)
         self.cnn3d_decoder = build_head(cnn3d_decoder)
         self.prototype_query_decoder = build_head(prototype_query_decoder)
+        self.bev_seg_head = build_head(bev_seg_head) if bev_seg_head is not None else None
 
     def image_encoder(self, img, stereo=False):
         imgs = img
@@ -59,6 +63,34 @@ class ProtoOcc(BEVDet):
         voxel_feat, depth, pv_feat = self.extract_img_feat(img_inputs, img_metas, **kwargs)
         return voxel_feat, depth, pv_feat
 
+    def _split_encoder_output(self, encoder_output):
+        if isinstance(encoder_output, tuple):
+            return encoder_output
+        return encoder_output, None
+
+    def _normalize_map_targets(self, gt_masks_bev):
+        if gt_masks_bev is None:
+            return None
+
+        while isinstance(gt_masks_bev, (list, tuple)) and len(gt_masks_bev) == 1:
+            gt_masks_bev = gt_masks_bev[0]
+
+        if isinstance(gt_masks_bev, (list, tuple)):
+            if all(torch.is_tensor(item) for item in gt_masks_bev):
+                gt_masks_bev = torch.stack(list(gt_masks_bev), dim=0)
+            else:
+                return None
+
+        if not torch.is_tensor(gt_masks_bev):
+            return None
+
+        if gt_masks_bev.dim() == 5 and gt_masks_bev.size(0) == 1:
+            gt_masks_bev = gt_masks_bev[0]
+        if gt_masks_bev.dim() == 3:
+            gt_masks_bev = gt_masks_bev.unsqueeze(0)
+
+        return gt_masks_bev.float()
+
     def forward_train(self,
                       points=None,
                       img_metas=None,
@@ -71,13 +103,15 @@ class ProtoOcc(BEVDet):
                       mask_camera = None,
                       sa_gt_depth=None,
                       sa_gt_semantic=None,
+                      gt_masks_bev=None,
                       non_vis_semantic_voxel=None,
                       **kwargs):
         # 2D to 3D view transformation
         voxel_feat, depth, pv_feat = self.extract_feat(img_inputs=img_inputs, img_metas=img_metas, **kwargs)
 
         # Dual Branch Encoder (DBE)
-        comprehensive_voxel_feature = self.dual_branch_encoder(voxel_feat) 
+        encoder_output = self.dual_branch_encoder(voxel_feat)
+        comprehensive_voxel_feature, bev_feature = self._split_encoder_output(encoder_output)
 
         # 3d CNN for generating Prototype
         prototoype_occ_pred, mask_feat = self.cnn3d_decoder(comprehensive_voxel_feature.permute(0,1,4,2,3))
@@ -92,6 +126,15 @@ class ProtoOcc(BEVDet):
         losses.update(loss_prototype)
         loss_depth = self.depth_net.get_PV_loss(pv_feat, depth, sa_gt_depth, sa_gt_semantic)
         losses.update(loss_depth)
+
+        if self.bev_seg_head is not None:
+            if bev_feature is None:
+                raise ValueError('BEV segmentation head requires BEV features from Dual_Branch_Encoder.')
+            gt_masks_bev = self._normalize_map_targets(gt_masks_bev)
+            if gt_masks_bev is None:
+                raise ValueError('Expected `gt_masks_bev` when training ProtoOccMapGT with a BEV segmentation head.')
+            bev_seg_logits = self.bev_seg_head(bev_feature)
+            losses.update(self.bev_seg_head.loss(bev_seg_logits, gt_masks_bev))
         
         return losses
 
@@ -105,7 +148,8 @@ class ProtoOcc(BEVDet):
         voxel_feat, depth, pv_feat = self.extract_feat(img_inputs=img, img_metas=img_metas, **kwargs)
 
         # Dual Branch Encoder (DBE)
-        comprehensive_voxel_feature = self.dual_branch_encoder(voxel_feat)
+        encoder_output = self.dual_branch_encoder(voxel_feat)
+        comprehensive_voxel_feature, bev_feature = self._split_encoder_output(encoder_output)
 
         # Prototype Query Generator
         prototoype_occ_pred, mask_feat = self.cnn3d_decoder(comprehensive_voxel_feature.permute(0,1,4,2,3))
@@ -113,9 +157,29 @@ class ProtoOcc(BEVDet):
         # Prototype Query Decoder (PQD)
         B = comprehensive_voxel_feature.shape[0]
         img_metas_occ = [{"pc_range": self.pc_range, "occ_size":self.grid_size} for i in range(B)]
-        prototoype_occ_pred, mask_feat = self.cnn3d_decoder(comprehensive_voxel_feature.permute(0,1,4,2,3))
         occ_preds = self.prototype_query_decoder.simple_test(comprehensive_voxel_feature, img_metas_occ, mask_feat, prototoype_occ_pred)
-        return occ_preds
+
+        if self.bev_seg_head is None:
+            return occ_preds
+
+        if bev_feature is None:
+            raise ValueError('BEV segmentation head requires BEV features from Dual_Branch_Encoder.')
+
+        bev_seg_probs = self.bev_seg_head.predict(self.bev_seg_head(bev_feature)).detach().cpu().numpy()
+        gt_masks_bev = self._normalize_map_targets(kwargs.get('gt_masks_bev'))
+        if gt_masks_bev is not None:
+            gt_masks_bev = gt_masks_bev.detach().cpu().numpy()
+
+        results = []
+        for batch_index, occ_pred in enumerate(occ_preds):
+            sample_result = {
+                'occ_preds': occ_pred,
+                'masks_bev': bev_seg_probs[batch_index].astype(np.float32),
+            }
+            if gt_masks_bev is not None:
+                sample_result['gt_masks_bev'] = gt_masks_bev[batch_index].astype(np.int64)
+            results.append(sample_result)
+        return results
 
     def forward_dummy(self,
                       points=None,
