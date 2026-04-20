@@ -4,7 +4,7 @@
 
 ### 我們在做什麼
 
-把 BEV map segmentation 的預測 head，從 **Naive CNN head（BEVSegHead）** 升級為 **Scene-Aware Prototype Map Decoder（ProtoMapHead）**，讓 map 任務也採用 prototype query + dot-product mask decoding 的設計哲學。
+把 BEV map segmentation 的預測 head，從 **Naive CNN head（BEVSegHead）** 升級為 **Scene-Aware Prototype Map Decoder（ProtoMapHead）**，並在 decoder 前額外加入 **Prototype-Grounded BEV Refinement（PGBR）**，讓 prototype 不只參與最終 mask decoding，也先參與 map-oriented BEV grounding。
 
 ---
 
@@ -38,7 +38,7 @@ shared voxel feature
 
 ---
 
-## 我們攻擊的點（Step 1 本身即為貢獻）
+## 我們攻擊的點（Step 1 / Step 1.5）
 
 **攻擊點 1：Map 最終解碼機制**
 MAESTRO 的 map branch 仍走 task-specific feature → CNN dense predictor 這條路。Prototype 引導 feature transformation（TSFG），但 final mask 由 CNN 輸出，prototype 不是 mask 的直接解碼器。
@@ -53,6 +53,18 @@ MAESTRO 的 CPG 雖然會先生成 per-class prototype，但在 map branch 中�
 我們：6 個 map class 各有獨立的 prototype query 和獨立的 EMA，語意粒度更細，且直接對應最終 mask decoding。
 
 > **Step 1 的貢獻定位**：上述三個攻擊點在 Step 1 就已成立，不需要等到 Step 2（Shared Prototype Bank）。Step 1 本身是一個獨立的貢獻——「把 Scene-Aware Prototype Decoding 從 3D occupancy 延伸到 2D BEV map segmentation」。Step 2 是在此基礎上進一步挑戰 MAESTRO 的跨任務 prototype 獨立性。
+
+**新增的 Step 1.5：Prototype-Grounded BEV Refinement（PGBR）**
+
+在把 prototype 直接推進 final map decoder 之後，還有另一個缺口：`final_masks` 雖然已經是 prototype-guided decoder 的輸出，但 decoder 看到的 `mask_feat` 仍只是 shared BEV feature 經過淺層 CNN 轉出的 feature。也就是說，prototype 已經參與了「怎麼解碼」，但還沒有參與「哪些 BEV 區域應該先被 map-oriented grounding」。
+
+因此 PGBR 進一步挑戰兩個假設：
+1. **shared BEV feature 可以直接餵給 map decoder**：我們主張在 final decoding 前，應先做 prototype-guided spatial grounding
+2. **prototype 出現在單一階段就夠了**：我們主張 prototype 不該只停留在 feature prior 或只停留在 final decoder，而應該貫穿整個 map branch
+
+換句話說，更新後的方法定位不再只是「prototype direct map decoding」，而是：
+
+> **prototype-centric map branch = prototype-guided BEV grounding + prototype-based final decoding**
 
 ---
 
@@ -124,7 +136,36 @@ query_feat = for_query_embed(query_feat)              (6, 96)  ← Scene-Aware Q
 
 當 `use_scene_adaptive / use_ema_bank / use_learnable_query` 都啟用時，這裡保留了 ProtoOcc released code 的主幹思路：learnable query、global EMA prototype、local adaptive prototype 三路相加，再送入 `for_query_embed`。
 
-#### Step 5-6：Self-Attention + Dot Product（保留核心解碼，簡化 self-attn 模組）
+#### Step 5：Prototype-Grounded BEV Refinement（PGBR）
+
+在 scene-aware query 合成完成後，先用 `query_feat` 對 `mask_feat` 做 class-wise grounding，再把 prototype-guided enhancement / suppression 寫回 BEV feature：
+
+```
+ground_logits = < normalize(query_feat), normalize(mask_feat) > / temperature
+ground_weight = softmax(ground_logits, dim=class)    ← class mixture
+ground_map    = sigmoid(ground_logits)               ← absolute confidence
+
+proto_value = Linear(query_feat)
+enhance = sum_k ground_weight_k * proto_value_k
+enhance = enhance * max(ground_map)
+
+suppress = suppress_proj(mask_feat) * (1 - max(ground_map))
+
+refined_mask_feat = mask_feat + refine_fuse([mask_feat, enhance, suppress])
+```
+
+這裡刻意同時用 `softmax + sigmoid`：
+- `softmax` 決定每個 BEV cell 應該混入哪些 class prototype
+- `sigmoid` 保留絕對相似度，避免低相關位置也被硬分配到某種 prototype mixture
+
+正式版預設：
+- `use_bev_refinement=True`
+- `refinement_temperature=1.0`
+- `refinement_detach_query=True`
+
+其中 `refinement_detach_query=True` 代表第一版先用 `query_feat.detach()` 做 refinement，避免 refinement branch 在 early training 反向拉壞 scene-aware query，本質上是穩定性優先的選擇。
+
+#### Step 6-7：Self-Attention + Dot Product（保留核心解碼，簡化 self-attn 模組）
 
 ```
 query: (6, B, 96)  ← expand batch
@@ -133,7 +174,7 @@ query: (6, B, 96)  ← expand batch
     │
     └─ mask_embed MLP
     │
-    └─ einsum('bkc,bchw->bkhw', mask_embed, mask_feat)
+    └─ einsum('bkc,bchw->bkhw', mask_embed, refined_mask_feat)
            → final_masks (B, 6, 200, 200)
 ```
 
@@ -190,7 +231,7 @@ map_probs = self.proto_map_head.predict(final_masks)
 
 新增 `ProtoOccMultitask` 的 import / export。
 
-### 5. 新增 `projects/configs/ProtoOcc/ProtoOcc_proto_map_head.py`
+### 5. 新增 / 更新 `projects/configs/ProtoOcc/ProtoOcc_proto_map_head.py`
 
 與 `ProtoOcc_multi_cnn_head.py` 的差異：
 
@@ -199,7 +240,32 @@ map_probs = self.proto_map_head.predict(final_masks)
 | `model.type` | `'ProtoOccCnnSegHead'` | `'ProtoOccMultitask'` |
 | Map head key | `bev_seg_head` | `proto_map_head` |
 | Map head type | `'BEVSegHead'` | `'ProtoMapHead'` |
+| PGBR | — | `use_bev_refinement=True`（可關閉做 ablation） |
 | Loss | `loss_bce` + `loss_dice` | `loss_coarse_bce` + `loss_coarse_dice` + `loss_mask_focal` + `loss_mask_dice`（四項，其中 `loss_mask_focal` 為 `BinaryMaskFocalLoss`，不是 stock `FocalLoss`） |
+
+另外補一個最小 ablation config：
+
+- `projects/configs/ProtoOcc/ProtoOcc_proto_map_head_no_pgbr.py`
+
+這個 config 直接繼承 `ProtoOcc_proto_map_head.py`，只覆寫：
+
+```python
+model = dict(
+    proto_map_head=dict(
+        use_bev_refinement=False,
+    ))
+```
+
+因此你可以直接比較：
+
+- `ProtoOcc_proto_map_head.py`  → `ProtoMapHead + PGBR`
+- `ProtoOcc_proto_map_head_no_pgbr.py` → `ProtoMapHead`（無 PGBR）
+
+若不想另外換 config，也可以直接用：
+
+```bash
+--cfg-options model.proto_map_head.use_bev_refinement=False
+```
 
 ---
 
@@ -210,7 +276,7 @@ map_probs = self.proto_map_head.predict(final_masks)
 - `NuScenesDatasetMultitask.evaluate_map()` 會 sweep 多個 threshold（0.35 到 0.65），回報各類別 `iou@max` 與 `map/mean/iou@max`
 - 若需要輸出單張彩色 BEV 視覺化，必須另外定義 **display priority**；這個規則只用於顯示，不代表訓練 supervision 互斥，也不參與 loss / evaluator
 
-這代表 ProtoMapHead 的訓練和推論 protocol，和原本 `BEVSegHead` 一樣維持 **probability map first, threshold in evaluator** 的評估方式，只是 logits 的來源從 naive CNN predictor 改成 prototype decoder。
+這代表 ProtoMapHead 的訓練和推論 protocol，和原本 `BEVSegHead` 一樣維持 **probability map first, threshold in evaluator** 的評估方式，只是 logits 的來源從 naive CNN predictor 改成 prototype-centric map branch：先經 prototype-grounded refinement，再經 prototype decoder 產生 final mask。
 
 **目前使用的 display priority（對齊 `vis_occ_map_gt.py` 的 `MAP_DRAW_ORDER`）**：
 
@@ -237,16 +303,40 @@ stop_line > divider > ped_crossing > walkway > carpark_area > drivable_area
 |---|---|---|---|
 | ProtoOcc single-task | ~39.6 | — | 原始 ProtoOcc，僅 occ |
 | Naive MTL（CNN head） | TBD | TBD | `ProtoOccCnnSegHead` |
-| **Scene-Aware Proto Map（本次）** | TBD | TBD | `ProtoOccMultitask`，Step 1 |
+| ProtoMapHead | TBD | TBD | `ProtoOcc_proto_map_head_no_pgbr.py`，只有 prototype decoder |
+| **ProtoMapHead + PGBR** | TBD | TBD | `ProtoOcc_proto_map_head.py`，prototype grounding + prototype decoding |
 | Shared Prototype Bank（下一步） | TBD | TBD | Step 2，occ ↔ map prototype 共享 |
+
+### 最小 ablation 開關
+
+如果你要直接做 `ProtoMapHead` vs `ProtoMapHead + PGBR`，現在有兩種最小成本的切法：
+
+1. 直接換 config
+
+```bash
+# ProtoMapHead + PGBR
+bash tools/dist_train.sh projects/configs/ProtoOcc/ProtoOcc_proto_map_head.py 1
+
+# ProtoMapHead only
+bash tools/dist_train.sh projects/configs/ProtoOcc/ProtoOcc_proto_map_head_no_pgbr.py 1
+```
+
+2. 用同一份 config 直接覆寫開關
+
+```bash
+# 關掉 PGBR，保留 ProtoMapHead decoder
+bash tools/dist_train.sh projects/configs/ProtoOcc/ProtoOcc_proto_map_head.py 1 \
+  --cfg-options model.proto_map_head.use_bev_refinement=False
+```
 
 ---
 
-## 對 MAESTRO 的 challenge 總結
+## 對 MAESTRO / ProtoOcc 的 challenge 總結
 
-| 面向 | MAESTRO | 我們（Step 1）|
+| 面向 | MAESTRO / ProtoOcc | 我們（Step 1 / 1.5）|
 |---|---|---|
-| Map 最終預測 | downstream task head 產生 final mask（prototype 主要引導 feature） | Prototype 直接 dot product → mask |
+| Map 最終預測 | MAESTRO：downstream task head 產生 final mask（prototype 主要引導 feature） | Prototype 直接 dot product → mask |
+| Map feature grounding | MAESTRO：prototype 主要做 TSFG；ProtoOcc：map branch 不存在 | 在 map decoder 前先做 PGBR |
 | 跨場景 prototype 記憶 | 無（每場景重算） | EMA bank（AgnoPG） |
 | Per-class prototype 落地方式 | per-class prototype 先形成 group，再做 task-specific feature refinement | 每個 map class 獨立 prototype query + EMA，直接參與最終 decoding |
 | 下一步可擴展 | prototype 獨立於各任務 | 天然支援 Shared Prototype Bank（Step 2）|

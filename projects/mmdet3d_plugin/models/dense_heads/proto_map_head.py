@@ -17,8 +17,9 @@ class ProtoMapHead(BaseModule):
       2. AdaPG pools batch-shared local prototypes from confident map pixels
       3. AgnoPG maintains a class-wise EMA memory bank
       4. Scene-aware queries fuse learnable / global / local query sources
-      5. Class-fixed queries interact with self-attention
-      6. Final map masks come from `mask_embed(query) x mask_feat`
+      5. Prototype-grounded BEV refinement injects prototype-aware grounding
+      6. Class-fixed queries interact with self-attention
+      7. Final map masks come from `mask_embed(query) x refined_mask_feat`
 
     Compared with the 3-D occupancy decoder, the main differences are:
       - The spatial lattice is 2-D BEV instead of 3-D voxels.
@@ -39,6 +40,9 @@ class ProtoMapHead(BaseModule):
                  use_ema_bank=True,
                  use_learnable_query=True,
                  use_query_self_attn=True,
+                 use_bev_refinement=True,
+                 refinement_temperature=1.0,
+                 refinement_detach_query=True,
                  with_cp=False,
                  loss_coarse_bce=None,
                  loss_coarse_dice=None,
@@ -56,6 +60,9 @@ class ProtoMapHead(BaseModule):
         self.use_ema_bank       = use_ema_bank
         self.use_learnable_query = use_learnable_query
         self.use_query_self_attn = use_query_self_attn
+        self.use_bev_refinement = use_bev_refinement
+        self.refinement_temperature = refinement_temperature
+        self.refinement_detach_query = refinement_detach_query
         self.with_cp         = with_cp
 
         # ── 1. CNN Proto Generator ─────────────────────────────────────────
@@ -91,12 +98,28 @@ class ProtoMapHead(BaseModule):
             nn.Linear(hidden_channels, hidden_channels), nn.ReLU(inplace=True),
             nn.Linear(hidden_channels, hidden_channels))
 
-        # ── 5. Self-Attention ──────────────────────────────────────────────
+        # ── 5. Prototype-Grounded BEV Refinement ──────────────────────────
+        self.proto_value_proj = nn.Linear(hidden_channels, hidden_channels)
+        self.suppress_proj = ConvModule(
+            hidden_channels, hidden_channels, 3, padding=1, bias=False,
+            norm_cfg=dict(type='BN'),
+            act_cfg=dict(type='ReLU', inplace=True))
+        self.refine_fuse = nn.Sequential(
+            ConvModule(
+                hidden_channels * 3, hidden_channels, 1, padding=0, bias=False,
+                norm_cfg=dict(type='BN'),
+                act_cfg=dict(type='ReLU', inplace=True)),
+            ConvModule(
+                hidden_channels, hidden_channels, 3, padding=1, bias=False,
+                norm_cfg=dict(type='BN'),
+                act_cfg=dict(type='ReLU', inplace=True)))
+
+        # ── 6. Self-Attention ──────────────────────────────────────────────
         self.self_attn      = nn.MultiheadAttention(hidden_channels, attn_heads,
                                                      batch_first=False)
         self.self_attn_norm = nn.LayerNorm(hidden_channels)
 
-        # ── 6. Mask embed (query -> embedding for dot product) ─────────────
+        # ── 7. Mask embed (query -> embedding for dot product) ─────────────
         self.mask_embed = nn.Sequential(
             nn.Linear(hidden_channels, hidden_channels), nn.ReLU(inplace=True),
             nn.Linear(hidden_channels, hidden_channels), nn.ReLU(inplace=True),
@@ -227,7 +250,60 @@ class ProtoMapHead(BaseModule):
         return self.for_query_embed(query_feat)
 
     # ──────────────────────────────────────────────────────────────────────
-    # Steps 5-6 — Self-Attention + Dot Product
+    # Step 5 — Prototype-Grounded BEV Refinement
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _prototype_grounded_bev_refinement(self, mask_feat, query_feat):
+        """Refine BEV mask features with class-wise prototype grounding.
+
+        The refinement stage uses the scene-aware prototype queries twice:
+          1. softmax-normalized class weights decide which prototype mixture
+             should enhance each BEV location
+          2. sigmoid confidence decides whether that location deserves any
+             prototype-guided enhancement at all
+
+        Args:
+            mask_feat:  (B, hidden_channels, H, W)
+            query_feat: (num_classes, hidden_channels)
+        Returns:
+            refined_mask_feat: (B, hidden_channels, H, W)
+        """
+        if not self.use_bev_refinement:
+            return mask_feat
+
+        refine_query = query_feat.detach() if self.refinement_detach_query else query_feat
+        feat_norm = F.normalize(mask_feat, dim=1)
+        query_norm = F.normalize(refine_query, dim=1)
+
+        temperature = max(self.refinement_temperature, 1e-6)
+        ground_logits = torch.einsum('kc,bchw->bkhw', query_norm, feat_norm)
+        ground_logits = ground_logits / temperature
+
+        # softmax handles class-wise prototype mixing; sigmoid preserves
+        # absolute confidence so low-similarity pixels are not over-enhanced.
+        ground_map = torch.sigmoid(ground_logits)
+        ground_weight = F.softmax(ground_logits, dim=1)
+
+        proto_value = self.proto_value_proj(refine_query)            # (K, C)
+        enhance = torch.einsum('bkhw,kc->bchw', ground_weight, proto_value)
+        enhance_gate = ground_map.max(dim=1, keepdim=True)[0]
+        enhance = enhance * enhance_gate
+
+        if self.with_cp and self.training:
+            suppress_feat = checkpoint(self.suppress_proj, mask_feat)
+        else:
+            suppress_feat = self.suppress_proj(mask_feat)
+        suppress = suppress_feat * (1.0 - enhance_gate)
+
+        refine_input = torch.cat([mask_feat, enhance, suppress], dim=1)
+        if self.with_cp and self.training:
+            delta = checkpoint(self.refine_fuse, refine_input)
+        else:
+            delta = self.refine_fuse(refine_input)
+        return mask_feat + delta
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Steps 6-7 — Self-Attention + Dot Product
     # ──────────────────────────────────────────────────────────────────────
 
     def _forward_head(self, query_feat, mask_feat):
@@ -270,7 +346,7 @@ class ProtoMapHead(BaseModule):
         # 1. CNN → mask_feat + coarse_pred
         mask_feat, coarse_pred = self._cnn_proto_generator(bev_feat)
 
-        # 2. AdaPG — local scene-adaptive prototype
+        # 2. AdaPG — batch-shared local prototype
         for_query = self._adaPG(coarse_pred, mask_feat)
 
         # 3. AgnoPG — update EMA, get global prototype
@@ -279,8 +355,11 @@ class ProtoMapHead(BaseModule):
         # 4. Scene-Aware Query: learnable + global + local
         query_feat = self._scene_aware_queries(for_query, ema_query)
 
-        # 5-6. Self-attention + dot product → final masks
-        final_masks = self._forward_head(query_feat, mask_feat)
+        # 5. Prototype-grounded BEV refinement
+        refined_mask_feat = self._prototype_grounded_bev_refinement(mask_feat, query_feat)
+
+        # 6-7. Self-attention + dot product → final masks
+        final_masks = self._forward_head(query_feat, refined_mask_feat)
 
         return coarse_pred, final_masks
 
