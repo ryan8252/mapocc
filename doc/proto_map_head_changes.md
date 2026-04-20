@@ -77,7 +77,7 @@ bev_feature (B, 48, 200, 200)
 #### Step 2：AdaPG（Scene-Adaptive Prototype Generator）
 
 對應 ProtoOcc 的 argmax + confidence filtering。  
-Map 是 binary-independent（非 mutually exclusive），所以改用 **sigmoid > conf_thresh** 篩選 confident positive pixels：
+Map supervision 採用的是 **class-wise binary masks** `(B, C, H, W)`，因此這裡對每個 map class 獨立使用 **sigmoid > conf_thresh** 篩選 confident positive pixels，而不是在 6 個 class 之間做 softmax 互斥分類：
 
 ```
 soft_mask = sigmoid(coarse_map_pred)
@@ -88,7 +88,10 @@ for_query: (6, 96)  ← per-class local scene prototype
                        （概念上對應 scene-adaptive prototype；實作沿用 ProtoOcc released code 的 batch-level pooling 寫法）
 ```
 
-ProtoOcc 用 softmax argmax 是因為 occ 類別互斥；map 用 sigmoid 是因為每個 pixel 可同時屬於多個 class。
+ProtoOcc 用 softmax argmax，是因為 occ supervision 是互斥類別。  
+這裡用 sigmoid，較準確的理由不是「每個 pixel 一定應該同時屬於多個 class」，而是「目前的 map GT / loss / evaluation 都採 per-class binary mask 形式，不強制一個 `0.4m × 0.4m` 的 BEV cell 在 6 類之間互斥」。當不同 HD map layers 在 rasterization 後落進同一個 cell 時，該 cell 可以在多個 class channel 同時為 positive。
+
+進一步地，若某個 cell 對多個 class 都是 confident positive，它會同時參與那些 class 的 prototype pooling；這裡不是為每個 cell 從多個 class 中只選一個 prototype，而是每個 class 各自估計自己的 prototype query。
 
 **Empty-class fallback**：若某個 class 在當前 batch 完全沒有 confident pixel（`conf_mask.sum() == 0`），`for_query[k]` 退化為 zero vector，和 ProtoOcc released code 的處理方式完全一致（見 `Prototype_Query_Decoder_nuScenes.py` 第 362–367 行）。Zero vector 不更新 EMA（`cur_assign_flag[k] = False`），self-attn 後的影響由其他兩路 query（learnable + EMA）補償。
 
@@ -205,8 +208,26 @@ map_probs = self.proto_map_head.predict(final_masks)
 - `simple_test` 階段只使用 `final_masks`，再經 `sigmoid` 輸出 `map_probs`
 - `predict()` 回傳的是連續機率圖，不在 head 內硬閾值化
 - `NuScenesDatasetMultitask.evaluate_map()` 會 sweep 多個 threshold（0.35 到 0.65），回報各類別 `iou@max` 與 `map/mean/iou@max`
+- 若需要輸出單張彩色 BEV 視覺化，必須另外定義 **display priority**；這個規則只用於顯示，不代表訓練 supervision 互斥，也不參與 loss / evaluator
 
 這代表 ProtoMapHead 的訓練和推論 protocol，和原本 `BEVSegHead` 一樣維持 **probability map first, threshold in evaluator** 的評估方式，只是 logits 的來源從 naive CNN predictor 改成 prototype decoder。
+
+**目前使用的 display priority（對齊 `vis_occ_map_gt.py` 的 `MAP_DRAW_ORDER`）**：
+
+```
+drivable_area
+    → carpark_area
+    → walkway
+    → ped_crossing
+    → divider
+    → stop_line
+```
+
+這個順序代表繪圖時採「後畫覆蓋前畫」的 layer-style rendering；因此單張彩色圖上最終可見的優先權為：
+
+```
+stop_line > divider > ped_crossing > walkway > carpark_area > drivable_area
+```
 
 ---
 
