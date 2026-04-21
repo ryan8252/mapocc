@@ -9,10 +9,10 @@
 #SBATCH --account=MST113104      # 計畫帳號 (從教授的帳號中查)
 #SBATCH -p gp4d                             # 用可跑 2 天的分區
 #SBATCH -N 1                                # 申請 1 台主機
-#SBATCH --ntasks-per-node=8                 # 建議與 -N 一起使用，代表每台機器 8 個任務
-#SBATCH --gres=gpu:8                        # 申請 8 顆 V100 GPU
+#SBATCH --ntasks-per-node=4                 # 建議與 -N 一起使用，代表每台機器 8 個任務
+#SBATCH --gres=gpu:4                        # 申請 8 顆 V100 GPU
 #SBATCH --cpus-per-task=4                   # 每一顆 GPU 配 4 核 CPU
-#SBATCH --mem=128G                           # 申請 64GB 系統記憶體
+#SBATCH --mem=256G                           # 申請 64GB 系統記憶體
 #SBATCH -o %j.log                           # 訓練 Log 輸出位置
 #SBATCH -e %j.log                           # 錯誤 Log 輸出位置
 
@@ -39,7 +39,7 @@ PROTOOCC_DIR="/home/u2336262/Desktop/artc_2026/mapocc"
 CONFIG="projects/configs/ProtoOcc/ProtoOcc_proto_map_head.py"
 WORK_DIR="${PROTOOCC_DIR}/work_dirs/ProtoOcc_proto_map_head"
 PRETRAIN_CKPT="${PROTOOCC_DIR}/ckpts/bevdet-r50-4d-depth-cbgs_depthnet_modify.pth"
-GPUS=8
+GPUS=4
 
 if [ ! -f "${PRETRAIN_CKPT}" ]; then
     echo "[ERROR] Pretrained checkpoint not found:"
