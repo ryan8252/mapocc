@@ -18,6 +18,7 @@ class ProtoOccMultitask(BEVDet):
                  cnn3d_decoder=None,
                  prototype_query_decoder=None,
                  proto_map_head=None,
+                 map_loss_weight=1.0,
                  **kwargs):
         super(ProtoOccMultitask, self).__init__(**kwargs)
         self.pts_bbox_head = None  # useless
@@ -29,6 +30,7 @@ class ProtoOccMultitask(BEVDet):
         self.cnn3d_decoder            = build_head(cnn3d_decoder)
         self.prototype_query_decoder  = build_head(prototype_query_decoder)
         self.proto_map_head           = build_head(proto_map_head) if proto_map_head is not None else None
+        self.map_loss_weight          = map_loss_weight
 
     # ──────────────────────────────────────────────────────────────────────
     # Shared feature extraction (unchanged from ProtoOccCnnSegHead)
@@ -65,8 +67,37 @@ class ProtoOccMultitask(BEVDet):
 
     def _split_encoder_output(self, encoder_output):
         if isinstance(encoder_output, tuple):
-            return encoder_output
-        return encoder_output, None
+            if len(encoder_output) == 3:
+                return encoder_output
+            if len(encoder_output) == 2:
+                comprehensive_voxel_feature, bev_feature = encoder_output
+                return comprehensive_voxel_feature, bev_feature, None
+            raise ValueError(
+                'Expected Dual_Branch_Encoder to return 1, 2, or 3 outputs, '
+                f'but got {len(encoder_output)}.')
+        return encoder_output, None, None
+
+    def _select_map_feature(self, bev_feature, map_bev_feature):
+        map_feature = map_bev_feature if map_bev_feature is not None else bev_feature
+        if map_feature is None:
+            raise ValueError(
+                'proto_map_head requires either bev_feature or map_bev_feature '
+                'from Dual_Branch_Encoder.')
+        return map_feature
+
+    def _check_map_feature_size(self, map_feature, gt_masks_bev):
+        if gt_masks_bev is None:
+            return
+        if map_feature.shape[-2:] != gt_masks_bev.shape[-2:]:
+            raise ValueError(
+                f'map feature size {map_feature.shape[-2:]} does not match '
+                f'gt_masks_bev size {gt_masks_bev.shape[-2:]}.')
+
+    def _scale_map_losses(self, map_losses):
+        if self.map_loss_weight == 1.0:
+            return map_losses
+        return {name: loss * self.map_loss_weight
+                for name, loss in map_losses.items()}
 
     def _normalize_map_targets(self, gt_masks_bev):
         if gt_masks_bev is None:
@@ -111,7 +142,8 @@ class ProtoOccMultitask(BEVDet):
 
         # Dual Branch Encoder
         encoder_output = self.dual_branch_encoder(voxel_feat)
-        comprehensive_voxel_feature, bev_feature = self._split_encoder_output(encoder_output)
+        comprehensive_voxel_feature, bev_feature, map_bev_feature = \
+            self._split_encoder_output(encoder_output)
 
         # 3D CNN → coarse occ prediction + mask feature
         prototoype_occ_pred, mask_feat = self.cnn3d_decoder(
@@ -130,13 +162,14 @@ class ProtoOccMultitask(BEVDet):
 
         # ── Prototype Map Head ─────────────────────────────────────────────
         if self.proto_map_head is not None:
-            if bev_feature is None:
-                raise ValueError('proto_map_head requires bev_feature from Dual_Branch_Encoder.')
             gt_masks_bev = self._normalize_map_targets(gt_masks_bev)
             if gt_masks_bev is None:
                 raise ValueError('Expected gt_masks_bev when training ProtoOccMultitask with proto_map_head.')
-            coarse_pred, final_masks = self.proto_map_head(bev_feature)
-            losses.update(self.proto_map_head.loss(coarse_pred, final_masks, gt_masks_bev))
+            map_feature = self._select_map_feature(bev_feature, map_bev_feature)
+            self._check_map_feature_size(map_feature, gt_masks_bev)
+            coarse_pred, final_masks = self.proto_map_head(map_feature)
+            map_losses = self.proto_map_head.loss(coarse_pred, final_masks, gt_masks_bev)
+            losses.update(self._scale_map_losses(map_losses))
 
         return losses
 
@@ -156,7 +189,8 @@ class ProtoOccMultitask(BEVDet):
 
         # Dual Branch Encoder
         encoder_output = self.dual_branch_encoder(voxel_feat)
-        comprehensive_voxel_feature, bev_feature = self._split_encoder_output(encoder_output)
+        comprehensive_voxel_feature, bev_feature, map_bev_feature = \
+            self._split_encoder_output(encoder_output)
 
         # 3D CNN + Prototype Query Decoder (occupancy)
         prototoype_occ_pred, mask_feat = self.cnn3d_decoder(
@@ -170,14 +204,15 @@ class ProtoOccMultitask(BEVDet):
         if self.proto_map_head is None:
             return occ_preds
 
-        if bev_feature is None:
-            raise ValueError('proto_map_head requires bev_feature from Dual_Branch_Encoder.')
-
         # ── Prototype Map Head ─────────────────────────────────────────────
-        _, final_masks = self.proto_map_head(bev_feature)
+        map_feature = self._select_map_feature(bev_feature, map_bev_feature)
+        _, final_masks = self.proto_map_head(map_feature)
         map_probs = self.proto_map_head.predict(final_masks).detach().cpu().numpy()
 
         gt_masks_bev = self._normalize_map_targets(kwargs.get('gt_masks_bev'))
+        if gt_masks_bev is not None:
+            self._check_map_feature_size(map_feature, gt_masks_bev)
+
         if gt_masks_bev is not None:
             gt_masks_bev = gt_masks_bev.detach().cpu().numpy()
 

@@ -423,3 +423,27 @@ log_config = dict(
         dict(type='TextLoggerHook'),
         dict(type='TensorboardLoggerHook')
     ])
+
+
+# ===> per class IoU of 6019 samples:
+# ===> others - IoU = 6.94
+# ===> barrier - IoU = 40.92
+# ===> bicycle - IoU = 22.1
+# ===> bus - IoU = 39.19
+# ===> car - IoU = 45.96
+# ===> construction_vehicle - IoU = 20.82
+# ===> motorcycle - IoU = 22.49
+# ===> pedestrian - IoU = 23.4
+# ===> traffic_cone - IoU = 22.58
+# ===> trailer - IoU = 29.35
+# ===> truck - IoU = 34.25
+# ===> driveable_surface - IoU = 75.42
+# ===> other_flat - IoU = 26.28
+# ===> sidewalk - IoU = 40.9
+# ===> terrain - IoU = 42.8
+# ===> manmade - IoU = 33.44
+# ===> vegetation - IoU = 26.34
+# ===> mIoU of 6019 samples: 32.54
+
+# 實驗	Drivable	Ped. Cross.	Walkway	Stop Line	Carpark	Divider	Mean
+# Naive MTL CNN head, epoch 15	54.34	7.19	20.49	5.26	0.25	9.23	16.13

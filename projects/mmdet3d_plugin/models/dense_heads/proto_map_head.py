@@ -99,20 +99,23 @@ class ProtoMapHead(BaseModule):
             nn.Linear(hidden_channels, hidden_channels))
 
         # ── 5. Prototype-Grounded BEV Refinement ──────────────────────────
-        self.proto_value_proj = nn.Linear(hidden_channels, hidden_channels)
-        self.suppress_proj = ConvModule(
-            hidden_channels, hidden_channels, 3, padding=1, bias=False,
-            norm_cfg=dict(type='BN'),
-            act_cfg=dict(type='ReLU', inplace=True))
-        self.refine_fuse = nn.Sequential(
-            ConvModule(
-                hidden_channels * 3, hidden_channels, 1, padding=0, bias=False,
-                norm_cfg=dict(type='BN'),
-                act_cfg=dict(type='ReLU', inplace=True)),
-            ConvModule(
+        # Build these modules only when PGBR is enabled. Otherwise DDP sees
+        # permanently-unused parameters in no-PGBR ablations.
+        if self.use_bev_refinement:
+            self.proto_value_proj = nn.Linear(hidden_channels, hidden_channels)
+            self.suppress_proj = ConvModule(
                 hidden_channels, hidden_channels, 3, padding=1, bias=False,
                 norm_cfg=dict(type='BN'),
-                act_cfg=dict(type='ReLU', inplace=True)))
+                act_cfg=dict(type='ReLU', inplace=True))
+            self.refine_fuse = nn.Sequential(
+                ConvModule(
+                    hidden_channels * 3, hidden_channels, 1, padding=0, bias=False,
+                    norm_cfg=dict(type='BN'),
+                    act_cfg=dict(type='ReLU', inplace=True)),
+                ConvModule(
+                    hidden_channels, hidden_channels, 3, padding=1, bias=False,
+                    norm_cfg=dict(type='BN'),
+                    act_cfg=dict(type='ReLU', inplace=True)))
 
         # ── 6. Self-Attention ──────────────────────────────────────────────
         self.self_attn      = nn.MultiheadAttention(hidden_channels, attn_heads,

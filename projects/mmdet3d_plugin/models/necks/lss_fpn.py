@@ -128,7 +128,7 @@ class Custom_FPN_LSS(nn.Module):
         return [x4_out, x4_out, x4_out, x4_out]
 
     def _apply_checkpoint(self, module, *inputs):
-        if self.with_cp:
+        if self.with_cp and self.training:
             return checkpoint(module, *inputs)
         else:
             return module(*inputs)

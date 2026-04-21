@@ -43,12 +43,21 @@ class Dual_Branch_Encoder(nn.Module):
         with_cp=True,
         bev_encoder_backbone=None,
         bev_encoder_neck=None,
+        map_bev_encoder_neck=None,
         down_sample_for_3d_pooling=None,
         return_bev_feature=False,
+        return_map_feature=False,
+        detach_map_feature=False,
     ):
         super().__init__()
         self.with_cp = with_cp
         self.return_bev_feature = return_bev_feature
+        self.return_map_feature = return_map_feature
+        self.detach_map_feature = detach_map_feature
+        if self.return_map_feature and not self.return_bev_feature:
+            raise ValueError('return_map_feature=True requires return_bev_feature=True.')
+        if self.return_map_feature and map_bev_encoder_neck is None:
+            raise ValueError('return_map_feature=True requires map_bev_encoder_neck.')
         
         # BEV encoder
         self.down_sample_for_3d_pooling = \
@@ -82,6 +91,10 @@ class Dual_Branch_Encoder(nn.Module):
 
         # for high performance
         self.bev_encoder_neck = builder.build_neck(bev_encoder_neck)
+        self.map_bev_encoder_neck = (
+            builder.build_neck(map_bev_encoder_neck)
+            if map_bev_encoder_neck is not None else None
+        )
         self.voxelize_module = voxelize_module(
             in_dim = voxel_out_channels,
             )
@@ -155,6 +168,14 @@ class Dual_Branch_Encoder(nn.Module):
         pooled_x = self.down_sample_for_3d_pooling(pooled_x)
         multi_scale_bev = self.bev_encoder_backbone(pooled_x)
 
+        map_bev_feature = None
+        if self.map_bev_encoder_neck is not None:
+            map_source = multi_scale_bev
+            if self.detach_map_feature:
+                map_source = [feat.detach() for feat in multi_scale_bev]
+            map_bev = self.map_bev_encoder_neck(map_source)
+            map_bev_feature = map_bev[0] if isinstance(map_bev, (list, tuple)) else map_bev
+
         # Hierarchical Fusion Module
         B, C, Z, H, W = vox3.shape
         vox3 = vox3 + vox2 + self.bev_ch1(multi_scale_bev[2]).view(B, -1, Z, H, W).contiguous()
@@ -171,6 +192,9 @@ class Dual_Branch_Encoder(nn.Module):
         bev_feature = bev[0]
         vox = self.voxelize_module(bev_feature)
         comprehensive_voxel_feature = vox + vox_raw
+
+        if self.return_map_feature:
+            return comprehensive_voxel_feature, bev_feature, map_bev_feature
 
         if self.return_bev_feature:
             return comprehensive_voxel_feature, bev_feature
