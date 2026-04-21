@@ -12,7 +12,7 @@
 #SBATCH --ntasks-per-node=8                 # 建議與 -N 一起使用，代表每台機器 8 個任務
 #SBATCH --gres=gpu:8                        # 申請 8 顆 V100 GPU
 #SBATCH --cpus-per-task=4                   # 每一顆 GPU 配 4 核 CPU
-#SBATCH --mem=128G                           # 申請 64GB 系統記憶體
+#SBATCH --mem=256G                           # 申請 64GB 系統記憶體
 #SBATCH -o %j.log                           # 訓練 Log 輸出位置
 #SBATCH -e %j.log                           # 錯誤 Log 輸出位置
 

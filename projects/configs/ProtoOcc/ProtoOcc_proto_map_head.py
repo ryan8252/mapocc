@@ -396,7 +396,9 @@ test_data_config = dict(
 
 data = dict(
     samples_per_gpu=4,
-    workers_per_gpu=4,
+    # workers_per_gpu=4,
+    workers_per_gpu=1, #國網
+    persistent_workers=True, #國網
     train=dict(
         data_root=data_root,
         ann_file=data_root + 'bevdetv2-nuscenes_infos_train.pkl',
@@ -412,7 +414,8 @@ for key in ['val', 'train', 'test']:
     data[key].update(share_data_config)
 
 # Optimizer
-optimizer = dict(type='AdamW', lr=2e-4, weight_decay=1e-2)
+# optimizer = dict(type='AdamW', lr=2e-4, weight_decay=1e-2)
+optimizer = dict(type='AdamW', lr=4e-4, weight_decay=1e-2) #國網
 optimizer_config = dict(grad_clip=dict(max_norm=5, norm_type=2))
 lr_config = dict(
     policy='step',
