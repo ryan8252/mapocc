@@ -1,6 +1,7 @@
 #!/bin/bash
 
-# TWCC sbatch script for ProtoOcc + prototype-based map head + map BEV neck (with PGBR)
+# TWCC sbatch script for ProtoOcc + prototype-based map head + map BEV neck.
+# The canonical map-neck config omits pgbr_cfg, so PGBR is not instantiated.
 # Usage:
 #   sbatch train_proto_map_head_map_neck.sh
 
@@ -37,7 +38,7 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 PROTOOCC_DIR="/home/u2336262/Desktop/artc_2026/mapocc"
 
 CONFIG="projects/configs/ProtoOcc/ProtoOcc_proto_map_head_map_neck.py"
-WORK_DIR="${PROTOOCC_DIR}/work_dirs/ProtoOcc_proto_map_head_map_neck_pgbr"
+WORK_DIR="${PROTOOCC_DIR}/work_dirs/ProtoOcc_proto_map_head_map_neck"
 PRETRAIN_CKPT="${PROTOOCC_DIR}/ckpts/bevdet-r50-4d-depth-cbgs_depthnet_modify.pth"
 GPUS=8
 SAMPLES_PER_GPU=4

@@ -1,5 +1,7 @@
 # Prototype-Grounded BEV Refinement
 
+> 2026-04-23 update：PGBR 目前只保留為 ablation 用 optional submodule。canonical `ProtoMapHead` 不傳 `pgbr_cfg`，因此不會建立 PGBR。
+
 ## 這次新增了什麼
 
 在 [ProtoMapHead](/home/robot/Desktop/Ryan/ProtoOcc/projects/mmdet3d_plugin/models/dense_heads/proto_map_head.py) 裡新增了一個 **Prototype-Grounded BEV Refinement（PGBR）** stage，位置放在：
@@ -17,11 +19,13 @@ bev_feature
 
 它不是另外開一個新 detector，也不是把 `ProtoMapHead` 換掉，而是把 prototype 的作用從「只在 query 形成與 final decoding 出現」往前延伸到 **BEV feature grounding**。
 
-目前新增的 config 開關有：
+目前 PGBR 已被降級成 optional submodule。canonical config 不傳任何 PGBR 相關欄位；只有需要 ablation 時才提供：
 
-- `use_bev_refinement`
-- `refinement_temperature`
-- `refinement_detach_query`
+```python
+pgbr_cfg=dict(
+    temperature=1.0,
+    detach_query=True)
+```
 
 ---
 
@@ -61,9 +65,9 @@ query_feat = learnable_query
 
 這代表 refinement 用的 prototype 不是額外再算一套，而是直接使用目前 decoder 真正要拿去解碼的那組 **class-wise scene-aware queries**。
 
-第一版實作預設使用：
+PGBR ablation config 預設使用：
 
-- `refinement_detach_query=True`
+- `detach_query=True`
 
 也就是先用 `query_feat.detach()` 做 refinement，避免 refinement branch 在 early stage 反向把 query 本身拉壞。這是穩定性優先的選擇。
 
@@ -249,7 +253,7 @@ MAESTRO 告訴我們一件重要的事：
 
 ### 3. 先 detach query
 
-正式版預設 `refinement_detach_query=True`，是為了讓：
+PGBR ablation config 預設 `detach_query=True`，是為了讓：
 
 - `query_feat` 先穩定服務 decoder
 - refinement branch 先學會「怎麼利用 query」
@@ -257,7 +261,7 @@ MAESTRO 告訴我們一件重要的事：
 
 如果後面訓練穩定，可以再 ablate：
 
-- `refinement_detach_query=False`
+- `detach_query=False`
 
 ---
 
@@ -271,4 +275,4 @@ MAESTRO 告訴我們一件重要的事：
 - train 仍然回傳 `coarse_pred, final_masks`
 - test 仍然使用 `predict(final_masks)` 輸出 map probability
 
-因此 PGBR 是一個 **內聚在 `ProtoMapHead` 內部的 refinement stage**，不需要額外改 detector 的訓練與推論接口。
+因此 PGBR 是一個 **內聚在 `ProtoMapHead` 內部的 optional refinement submodule**，不需要額外改 detector 的訓練與推論接口。canonical `ProtoMapHead` 不提供 `pgbr_cfg`，所以不會建立這個 submodule。

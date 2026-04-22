@@ -874,7 +874,6 @@ prototype_pooling_scope='batch_local'
 新增 config：
 
 ```text
-projects/configs/ProtoOcc/ProtoOcc_proto_map_head_map_neck_no_pgbr_gt_soft.py
 projects/configs/ProtoOcc/ProtoOcc_proto_map_head_map_neck_gt_soft.py
 ```
 
@@ -949,7 +948,7 @@ weighted_class_prototypes_3d(feat, gt_label, pred_prob, mode)
 
 | 實驗 | Config | 重點 |
 | --- | --- | --- |
-| ProtoMapHead map neck no PGBR baseline | `ProtoOcc_proto_map_head_map_neck_no_pgbr.py` | prediction threshold mining |
+| ProtoMapHead map neck canonical baseline | `ProtoOcc_proto_map_head_map_neck.py` | prediction threshold mining, no `pgbr_cfg` |
 | GT-hard map mining | 新增 | 只用 GT mask mean pooling |
 | GT-soft map mining | 新增 | GT mask + prediction confidence weighting |
 | GT-soft + PGBR | 新增 | 測 reliable prototype 是否讓 PGBR 更有效 |

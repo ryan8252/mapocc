@@ -9,8 +9,8 @@
 | 實驗 | Config | Checkpoint | Occ mIoU | Map mIoU |
 | --- | --- | --- | ---: | ---: |
 | Naive MTL CNN map head | `projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head.py` | `work_dirs/ProtoOcc_multi_cnn_head_4090/epoch_15.pth` | 32.54 | 16.13 |
-| ProtoMapHead no PGBR | `projects/configs/ProtoOcc/ProtoOcc_proto_map_head_no_pgbr.py` | `work_dirs/ProtoOcc_proto_map_head_TWCC/epoch17.pth` | 36.77 | 32.03 |
-| ProtoMapHead no PGBR | `projects/configs/ProtoOcc/ProtoOcc_proto_map_head_no_pgbr.py` | `work_dirs/ProtoOcc_proto_map_head_TWCC/epoch_24.pth` | 37.61 | 32.95 |
+| ProtoMapHead canonical (no PGBR) | `projects/configs/ProtoOcc/ProtoOcc_proto_map_head.py` | `work_dirs/ProtoOcc_proto_map_head_TWCC/epoch17.pth` | 36.77 | 32.03 |
+| ProtoMapHead canonical (no PGBR) | `projects/configs/ProtoOcc/ProtoOcc_proto_map_head.py` | `work_dirs/ProtoOcc_proto_map_head_TWCC/epoch_24.pth` | 37.61 | 32.95 |
 
 外部參考數字：
 
@@ -111,7 +111,7 @@ Map 各類提升：
 
 4. Map 的主要瓶頸是小區域和線狀類別：`stop_line` 只有 15.22，`divider` 只有 21.50，`ped_crossing` 只有 24.52。這些類別遠低於 BEVFusion/MAESTRO。
 
-5. PGBR 可能能改善 map，但不太可能單獨補上 14 到 18 個 mIoU 的差距。下一步更應該優先檢查 map-specific feature branch、GT-guided prototype、coarse/final mask 融合，而不是只加 refinement。
+5. PGBR ablation 目前沒有改善 map，反而讓 Occ / Map 都下降。下一步更應該優先檢查 map-specific feature branch、GT-guided prototype、coarse/final mask 融合，而不是繼續把 PGBR 當主線。
 
 ## 建議下一步實驗
 
@@ -130,4 +130,3 @@ Map 各類提升：
 4. 保護 occupancy 主任務：
    - 可以先測 `bev_feature.detach()` 給 map head，避免 map loss 反向污染 occ backbone。
    - 目標先變成保持 Occ 接近 39.56，再逐步提升 Map。
-

@@ -158,12 +158,15 @@ refined_mask_feat = mask_feat + refine_fuse([mask_feat, enhance, suppress])
 - `softmax` 決定每個 BEV cell 應該混入哪些 class prototype
 - `sigmoid` 保留絕對相似度，避免低相關位置也被硬分配到某種 prototype mixture
 
-正式版預設：
-- `use_bev_refinement=True`
-- `refinement_temperature=1.0`
-- `refinement_detach_query=True`
+PGBR 現在不是 canonical default，而是 optional submodule。只有 config 明確提供 `pgbr_cfg` 時才會啟用：
 
-其中 `refinement_detach_query=True` 代表第一版先用 `query_feat.detach()` 做 refinement，避免 refinement branch 在 early training 反向拉壞 scene-aware query，本質上是穩定性優先的選擇。
+```python
+pgbr_cfg=dict(
+    temperature=1.0,
+    detach_query=True)
+```
+
+其中 `detach_query=True` 代表先用 `query_feat.detach()` 做 refinement，避免 refinement branch 在 early training 反向拉壞 scene-aware query，本質上是穩定性優先的選擇。
 
 #### Step 6-7：Self-Attention + Dot Product（保留核心解碼，簡化 self-attn 模組）
 
@@ -240,32 +243,28 @@ map_probs = self.proto_map_head.predict(final_masks)
 | `model.type` | `'ProtoOccCnnSegHead'` | `'ProtoOccMultitask'` |
 | Map head key | `bev_seg_head` | `proto_map_head` |
 | Map head type | `'BEVSegHead'` | `'ProtoMapHead'` |
-| PGBR | — | `use_bev_refinement=True`（可關閉做 ablation） |
+| PGBR | — | 預設不建立；只有提供 `pgbr_cfg` 時才啟用 |
 | Loss | `loss_bce` + `loss_dice` | `loss_coarse_bce` + `loss_coarse_dice` + `loss_mask_focal` + `loss_mask_dice`（四項，其中 `loss_mask_focal` 為 `BinaryMaskFocalLoss`，不是 stock `FocalLoss`） |
 
-另外補一個最小 ablation config：
+另外保留一個最小 PGBR ablation config：
 
-- `projects/configs/ProtoOcc/ProtoOcc_proto_map_head_no_pgbr.py`
+- `projects/configs/ProtoOcc/ProtoOcc_proto_map_head_pgbr.py`
 
-這個 config 直接繼承 `ProtoOcc_proto_map_head.py`，只覆寫：
+這個 config 直接繼承 canonical `ProtoOcc_proto_map_head.py`，只覆寫：
 
 ```python
 model = dict(
     proto_map_head=dict(
-        use_bev_refinement=False,
+        pgbr_cfg=dict(
+            temperature=1.0,
+            detach_query=True),
     ))
 ```
 
 因此你可以直接比較：
 
-- `ProtoOcc_proto_map_head.py`  → `ProtoMapHead + PGBR`
-- `ProtoOcc_proto_map_head_no_pgbr.py` → `ProtoMapHead`（無 PGBR）
-
-若不想另外換 config，也可以直接用：
-
-```bash
---cfg-options model.proto_map_head.use_bev_refinement=False
-```
+- `ProtoOcc_proto_map_head.py` → canonical `ProtoMapHead`（無 PGBR）
+- `ProtoOcc_proto_map_head_pgbr.py` → `ProtoMapHead + PGBR`
 
 ---
 
@@ -303,30 +302,20 @@ stop_line > divider > ped_crossing > walkway > carpark_area > drivable_area
 |---|---|---|---|
 | ProtoOcc single-task | ~39.6 | — | 原始 ProtoOcc，僅 occ |
 | Naive MTL（CNN head） | TBD | TBD | `ProtoOccCnnSegHead` |
-| ProtoMapHead | TBD | TBD | `ProtoOcc_proto_map_head_no_pgbr.py`，只有 prototype decoder |
-| **ProtoMapHead + PGBR** | TBD | TBD | `ProtoOcc_proto_map_head.py`，prototype grounding + prototype decoding |
+| ProtoMapHead | TBD | TBD | `ProtoOcc_proto_map_head.py`，只有 prototype decoder |
+| **ProtoMapHead + PGBR** | TBD | TBD | `ProtoOcc_proto_map_head_pgbr.py`，prototype grounding + prototype decoding |
 | Shared Prototype Bank（下一步） | TBD | TBD | Step 2，occ ↔ map prototype 共享 |
 
 ### 最小 ablation 開關
 
-如果你要直接做 `ProtoMapHead` vs `ProtoMapHead + PGBR`，現在有兩種最小成本的切法：
-
-1. 直接換 config
+如果你要直接做 `ProtoMapHead` vs `ProtoMapHead + PGBR`，最乾淨的切法是直接換 config：
 
 ```bash
-# ProtoMapHead + PGBR
+# ProtoMapHead only
 bash tools/dist_train.sh projects/configs/ProtoOcc/ProtoOcc_proto_map_head.py 1
 
-# ProtoMapHead only
-bash tools/dist_train.sh projects/configs/ProtoOcc/ProtoOcc_proto_map_head_no_pgbr.py 1
-```
-
-2. 用同一份 config 直接覆寫開關
-
-```bash
-# 關掉 PGBR，保留 ProtoMapHead decoder
-bash tools/dist_train.sh projects/configs/ProtoOcc/ProtoOcc_proto_map_head.py 1 \
-  --cfg-options model.proto_map_head.use_bev_refinement=False
+# ProtoMapHead + PGBR
+bash tools/dist_train.sh projects/configs/ProtoOcc/ProtoOcc_proto_map_head_pgbr.py 1
 ```
 
 ---

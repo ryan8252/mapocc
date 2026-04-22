@@ -13,11 +13,11 @@
 | `projects/mmdet3d_plugin/models/backbones/dual_branch_encoder.py` | 已修改 | 新增 `map_bev_encoder_neck`、`return_map_feature`、`detach_map_feature`，可從 `multi_scale_bev` 分出 map-specific feature |
 | `projects/mmdet3d_plugin/models/detectors/ProtoOccMultitask.py` | 已修改 | 支援 encoder 回傳 3 個值，map branch 優先使用 `map_bev_feature`，加入解析度檢查與 `map_loss_weight` |
 | `projects/mmdet3d_plugin/models/necks/lss_fpn.py` | 已修改 | `Custom_FPN_LSS` 的 checkpoint 改成只在 training 時啟用，避免 inference 時多餘 checkpoint |
-| `projects/mmdet3d_plugin/models/dense_heads/proto_map_head.py` | 已修改 | `use_bev_refinement=False` 時不再建立 PGBR modules，避免 no-PGBR ablation 在 DDP 中產生 unused parameters |
+| `projects/mmdet3d_plugin/models/dense_heads/proto_map_head.py` | 已修改 | PGBR 降級成 optional submodule；未提供 `pgbr_cfg` 時不建立 `pgbr_refiner` |
 | `projects/configs/ProtoOcc/ProtoOcc_proto_map_head_map_neck.py` | 已新增 | 128-channel map-specific neck 主實驗 |
 | `projects/configs/ProtoOcc/ProtoOcc_proto_map_head_map_neck_detach.py` | 已新增 | 128-channel map-specific neck + detach ablation |
 | `projects/configs/ProtoOcc/ProtoOcc_proto_map_head_map_neck_256.py` | 已新增 | 256-channel map-specific neck 高容量版本 |
-| `projects/configs/ProtoOcc/ProtoOcc_proto_map_head_map_neck_no_pgbr.py` | 已新增 | 128-channel map-specific neck + no PGBR ablation |
+| `projects/configs/ProtoOcc/ProtoOcc_proto_map_head_map_neck.py` | 已新增 | 128-channel map-specific neck 主實驗，繼承 canonical no-PGBR |
 | `projects/mmdet3d_plugin/models/detectors/ProtoOccCnnSegHead.py` | 已修改 | CNN head detector 支援 `map_bev_feature`、解析度檢查與 `map_loss_weight` |
 | `projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck.py` | 已新增 | 128-channel map-specific neck + CNN `BEVSegHead` 對照組 |
 
@@ -30,10 +30,10 @@
 | `conda run -n mapocc` 讀取 128-channel config | 通過，`return_map_feature=True`，map neck/head channel 為 128 |
 | `conda run -n mapocc` 讀取 detach config | 通過，`detach_map_feature=True`，map neck channel 為 128 |
 | `conda run -n mapocc` 讀取 256-channel config | 通過，map neck/head channel 為 256，`catconv_in_channels2=672` |
-| `conda run -n mapocc` 讀取 no-PGBR config | 通過，map neck/head channel 為 128，`use_bev_refinement=False` |
+| `conda run -n mapocc` 讀取 canonical map-neck config | 通過，map neck/head channel 為 128，`pgbr_refiner=None` |
 | `conda run -n mapocc` 讀取 CNN-head config | 通過，model type 為 `ProtoOccCnnSegHead`，map neck/head channel 為 128 |
-| no-PGBR head 參數檢查 | 通過，`proto_value_proj`、`suppress_proj`、`refine_fuse` 不再出現在 no-PGBR head 參數中 |
-| PGBR head 參數檢查 | 通過，PGBR 版本仍保留 11 個 refinement 相關參數 |
+| canonical head 參數檢查 | 通過，未提供 `pgbr_cfg` 時不出現 `pgbr_refiner.*` 參數 |
+| PGBR head 參數檢查 | 通過，PGBR 版本保留 `pgbr_refiner.*` refinement 相關參數 |
 | 小尺寸 encoder smoke test | 通過，輸出 `(occ_feature, bev_feature, map_bev_feature)`，shape 為 `(1,48,32,32,16)`、`(1,48,32,32)`、`(1,128,32,32)` |
 | 小尺寸 CNN-head smoke test | 通過，`map_bev_feature` shape 為 `(1,128,32,32)`，CNN map logits shape 為 `(1,6,32,32)` |
 

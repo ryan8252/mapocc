@@ -1,11 +1,12 @@
 #!/bin/bash
 
-# TWCC sbatch script for ProtoOcc + prototype-based map head (with PGBR)
+# TWCC sbatch script for ProtoOcc + canonical prototype-based map head.
+# The canonical config omits pgbr_cfg, so PGBR is not instantiated.
 # Usage:
 #   sbatch train_proto_map_head.sh
 
 
-#SBATCH -J mapocc_proto_map_head_pgbr               # 任務名稱 (隨便取)
+#SBATCH -J mapocc_proto_map_head                    # 任務名稱 (隨便取)
 #SBATCH --account=MST113104      # 計畫帳號 (從教授的帳號中查)
 #SBATCH -p gp4d                             # 用可跑 2 天的分區
 #SBATCH -N 1                                # 申請 1 台主機
@@ -37,7 +38,7 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 PROTOOCC_DIR="/home/u2336262/Desktop/artc_2026/mapocc"
 
 CONFIG="projects/configs/ProtoOcc/ProtoOcc_proto_map_head.py"
-WORK_DIR="${PROTOOCC_DIR}/work_dirs/ProtoOcc_proto_map_head_pgbr"
+WORK_DIR="${PROTOOCC_DIR}/work_dirs/ProtoOcc_proto_map_head"
 PRETRAIN_CKPT="${PROTOOCC_DIR}/ckpts/bevdet-r50-4d-depth-cbgs_depthnet_modify.pth"
 GPUS=8
 

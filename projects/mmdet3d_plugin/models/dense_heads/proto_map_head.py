@@ -8,6 +8,80 @@ from mmcv.runner import BaseModule
 from mmdet3d.models.builder import HEADS, build_loss
 
 
+class PrototypeGroundedBEVRefiner(nn.Module):
+    """Prototype-grounded BEV feature refiner used by PGBR ablations.
+
+    This module is intentionally separate from ProtoMapHead's main prototype
+    decoder. Canonical ProtoMapHead does not instantiate it unless `pgbr_cfg`
+    is provided.
+    """
+
+    def __init__(self,
+                 hidden_channels,
+                 temperature=1.0,
+                 detach_query=True,
+                 with_cp=False):
+        super().__init__()
+        self.temperature = temperature
+        self.detach_query = detach_query
+        self.with_cp = with_cp
+
+        self.proto_value_proj = nn.Linear(hidden_channels, hidden_channels)
+        self.suppress_proj = ConvModule(
+            hidden_channels, hidden_channels, 3, padding=1, bias=False,
+            norm_cfg=dict(type='BN'),
+            act_cfg=dict(type='ReLU', inplace=True))
+        self.refine_fuse = nn.Sequential(
+            ConvModule(
+                hidden_channels * 3, hidden_channels, 1, padding=0, bias=False,
+                norm_cfg=dict(type='BN'),
+                act_cfg=dict(type='ReLU', inplace=True)),
+            ConvModule(
+                hidden_channels, hidden_channels, 3, padding=1, bias=False,
+                norm_cfg=dict(type='BN'),
+                act_cfg=dict(type='ReLU', inplace=True)))
+
+    def forward(self, mask_feat, query_feat):
+        """Refine BEV mask features with class-wise prototype grounding.
+
+        Args:
+            mask_feat:  (B, hidden_channels, H, W)
+            query_feat: (num_classes, hidden_channels)
+        Returns:
+            refined_mask_feat: (B, hidden_channels, H, W)
+        """
+        refine_query = query_feat.detach() if self.detach_query else query_feat
+        feat_norm = F.normalize(mask_feat, dim=1)
+        query_norm = F.normalize(refine_query, dim=1)
+
+        temperature = max(self.temperature, 1e-6)
+        ground_logits = torch.einsum('kc,bchw->bkhw', query_norm, feat_norm)
+        ground_logits = ground_logits / temperature
+
+        # softmax handles class-wise prototype mixing; sigmoid preserves
+        # absolute confidence so low-similarity pixels are not over-enhanced.
+        ground_map = torch.sigmoid(ground_logits)
+        ground_weight = F.softmax(ground_logits, dim=1)
+
+        proto_value = self.proto_value_proj(refine_query)            # (K, C)
+        enhance = torch.einsum('bkhw,kc->bchw', ground_weight, proto_value)
+        enhance_gate = ground_map.max(dim=1, keepdim=True)[0]
+        enhance = enhance * enhance_gate
+
+        if self.with_cp and self.training:
+            suppress_feat = checkpoint(self.suppress_proj, mask_feat)
+        else:
+            suppress_feat = self.suppress_proj(mask_feat)
+        suppress = suppress_feat * (1.0 - enhance_gate)
+
+        refine_input = torch.cat([mask_feat, enhance, suppress], dim=1)
+        if self.with_cp and self.training:
+            delta = checkpoint(self.refine_fuse, refine_input)
+        else:
+            delta = self.refine_fuse(refine_input)
+        return mask_feat + delta
+
+
 @HEADS.register_module()
 class ProtoMapHead(BaseModule):
     """Prototype-based decoder for BEV map segmentation.
@@ -17,7 +91,8 @@ class ProtoMapHead(BaseModule):
       2. AdaPG pools batch-shared local prototypes from confident map pixels
       3. AgnoPG maintains a class-wise EMA memory bank
       4. Scene-aware queries fuse learnable / global / local query sources
-      5. Prototype-grounded BEV refinement injects prototype-aware grounding
+      5. (Optional) Prototype-grounded BEV refinement, enabled only when
+         `pgbr_cfg` is provided for PGBR ablations.
       6. Class-fixed queries interact with self-attention
       7. Final map masks come from `mask_embed(query) x refined_mask_feat`
 
@@ -40,7 +115,8 @@ class ProtoMapHead(BaseModule):
                  use_ema_bank=True,
                  use_learnable_query=True,
                  use_query_self_attn=True,
-                 use_bev_refinement=True,
+                 pgbr_cfg=None,
+                 use_bev_refinement=None,
                  refinement_temperature=1.0,
                  refinement_detach_query=True,
                  with_cp=False,
@@ -60,10 +136,13 @@ class ProtoMapHead(BaseModule):
         self.use_ema_bank       = use_ema_bank
         self.use_learnable_query = use_learnable_query
         self.use_query_self_attn = use_query_self_attn
-        self.use_bev_refinement = use_bev_refinement
-        self.refinement_temperature = refinement_temperature
-        self.refinement_detach_query = refinement_detach_query
         self.with_cp         = with_cp
+
+        pgbr_cfg = self._normalize_pgbr_cfg(
+            pgbr_cfg,
+            use_bev_refinement,
+            refinement_temperature,
+            refinement_detach_query)
 
         # ── 1. CNN Proto Generator ─────────────────────────────────────────
         blocks, cur_ch = [], in_channels
@@ -98,24 +177,14 @@ class ProtoMapHead(BaseModule):
             nn.Linear(hidden_channels, hidden_channels), nn.ReLU(inplace=True),
             nn.Linear(hidden_channels, hidden_channels))
 
-        # ── 5. Prototype-Grounded BEV Refinement ──────────────────────────
-        # Build these modules only when PGBR is enabled. Otherwise DDP sees
-        # permanently-unused parameters in no-PGBR ablations.
-        if self.use_bev_refinement:
-            self.proto_value_proj = nn.Linear(hidden_channels, hidden_channels)
-            self.suppress_proj = ConvModule(
-                hidden_channels, hidden_channels, 3, padding=1, bias=False,
-                norm_cfg=dict(type='BN'),
-                act_cfg=dict(type='ReLU', inplace=True))
-            self.refine_fuse = nn.Sequential(
-                ConvModule(
-                    hidden_channels * 3, hidden_channels, 1, padding=0, bias=False,
-                    norm_cfg=dict(type='BN'),
-                    act_cfg=dict(type='ReLU', inplace=True)),
-                ConvModule(
-                    hidden_channels, hidden_channels, 3, padding=1, bias=False,
-                    norm_cfg=dict(type='BN'),
-                    act_cfg=dict(type='ReLU', inplace=True)))
+        # ── 5. Optional PGBR submodule ────────────────────────────────────
+        self.pgbr_refiner = None
+        if pgbr_cfg is not None:
+            self.pgbr_refiner = PrototypeGroundedBEVRefiner(
+                hidden_channels=hidden_channels,
+                temperature=pgbr_cfg['temperature'],
+                detach_query=pgbr_cfg['detach_query'],
+                with_cp=with_cp)
 
         # ── 6. Self-Attention ──────────────────────────────────────────────
         self.self_attn      = nn.MultiheadAttention(hidden_channels, attn_heads,
@@ -133,6 +202,70 @@ class ProtoMapHead(BaseModule):
         self.loss_coarse_dice = build_loss(loss_coarse_dice) if loss_coarse_dice else None
         self.loss_mask_focal  = build_loss(loss_mask_focal)  if loss_mask_focal  else None
         self.loss_mask_dice   = build_loss(loss_mask_dice)   if loss_mask_dice   else None
+
+    def _normalize_pgbr_cfg(self,
+                            pgbr_cfg,
+                            use_bev_refinement,
+                            refinement_temperature,
+                            refinement_detach_query):
+        """Normalize new `pgbr_cfg` and legacy PGBR config keys."""
+        if use_bev_refinement is False and pgbr_cfg is not None:
+            raise ValueError(
+                'Conflicting ProtoMapHead config: `pgbr_cfg` enables PGBR, '
+                'but legacy `use_bev_refinement=False` disables it.')
+
+        # Backward compatibility for older configs / work_dirs.
+        if use_bev_refinement is True and pgbr_cfg is None:
+            pgbr_cfg = dict(
+                temperature=refinement_temperature,
+                detach_query=refinement_detach_query)
+
+        if pgbr_cfg is None:
+            return None
+
+        pgbr_cfg = dict(pgbr_cfg)
+        pgbr_type = pgbr_cfg.pop('type', 'pgbr')
+        if pgbr_type not in ('pgbr', 'PrototypeGroundedBEVRefiner'):
+            raise ValueError(f'Unsupported ProtoMapHead PGBR type: {pgbr_type}')
+
+        normalized_cfg = dict(
+            temperature=pgbr_cfg.pop('temperature', refinement_temperature),
+            detach_query=pgbr_cfg.pop('detach_query', refinement_detach_query))
+        if pgbr_cfg:
+            unknown_keys = ', '.join(sorted(pgbr_cfg.keys()))
+            raise ValueError(f'Unsupported ProtoMapHead pgbr_cfg keys: {unknown_keys}')
+        return normalized_cfg
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        """Load new PGBR submodule keys and legacy inline PGBR keys."""
+        legacy_prefixes = (
+            'proto_value_proj.',
+            'suppress_proj.',
+            'refine_fuse.',
+        )
+
+        if self.pgbr_refiner is not None:
+            for legacy_prefix in legacy_prefixes:
+                old_prefix = prefix + legacy_prefix
+                new_prefix = prefix + 'pgbr_refiner.' + legacy_prefix
+                for key in list(state_dict.keys()):
+                    if key.startswith(old_prefix):
+                        new_key = new_prefix + key[len(old_prefix):]
+                        if new_key not in state_dict:
+                            state_dict[new_key] = state_dict[key]
+                        state_dict.pop(key)
+        else:
+            for key in list(state_dict.keys()):
+                if key.startswith(prefix + 'pgbr_refiner.'):
+                    state_dict.pop(key)
+                elif any(key.startswith(prefix + legacy_prefix)
+                         for legacy_prefix in legacy_prefixes):
+                    state_dict.pop(key)
+
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs)
 
     # ──────────────────────────────────────────────────────────────────────
     # Step 1 — CNN Proto Generator
@@ -253,57 +386,13 @@ class ProtoMapHead(BaseModule):
         return self.for_query_embed(query_feat)
 
     # ──────────────────────────────────────────────────────────────────────
-    # Step 5 — Prototype-Grounded BEV Refinement
+    # Step 5 — Optional Prototype-Grounded BEV Refinement
     # ──────────────────────────────────────────────────────────────────────
 
-    def _prototype_grounded_bev_refinement(self, mask_feat, query_feat):
-        """Refine BEV mask features with class-wise prototype grounding.
-
-        The refinement stage uses the scene-aware prototype queries twice:
-          1. softmax-normalized class weights decide which prototype mixture
-             should enhance each BEV location
-          2. sigmoid confidence decides whether that location deserves any
-             prototype-guided enhancement at all
-
-        Args:
-            mask_feat:  (B, hidden_channels, H, W)
-            query_feat: (num_classes, hidden_channels)
-        Returns:
-            refined_mask_feat: (B, hidden_channels, H, W)
-        """
-        if not self.use_bev_refinement:
+    def _apply_pgbr(self, mask_feat, query_feat):
+        if self.pgbr_refiner is None:
             return mask_feat
-
-        refine_query = query_feat.detach() if self.refinement_detach_query else query_feat
-        feat_norm = F.normalize(mask_feat, dim=1)
-        query_norm = F.normalize(refine_query, dim=1)
-
-        temperature = max(self.refinement_temperature, 1e-6)
-        ground_logits = torch.einsum('kc,bchw->bkhw', query_norm, feat_norm)
-        ground_logits = ground_logits / temperature
-
-        # softmax handles class-wise prototype mixing; sigmoid preserves
-        # absolute confidence so low-similarity pixels are not over-enhanced.
-        ground_map = torch.sigmoid(ground_logits)
-        ground_weight = F.softmax(ground_logits, dim=1)
-
-        proto_value = self.proto_value_proj(refine_query)            # (K, C)
-        enhance = torch.einsum('bkhw,kc->bchw', ground_weight, proto_value)
-        enhance_gate = ground_map.max(dim=1, keepdim=True)[0]
-        enhance = enhance * enhance_gate
-
-        if self.with_cp and self.training:
-            suppress_feat = checkpoint(self.suppress_proj, mask_feat)
-        else:
-            suppress_feat = self.suppress_proj(mask_feat)
-        suppress = suppress_feat * (1.0 - enhance_gate)
-
-        refine_input = torch.cat([mask_feat, enhance, suppress], dim=1)
-        if self.with_cp and self.training:
-            delta = checkpoint(self.refine_fuse, refine_input)
-        else:
-            delta = self.refine_fuse(refine_input)
-        return mask_feat + delta
+        return self.pgbr_refiner(mask_feat, query_feat)
 
     # ──────────────────────────────────────────────────────────────────────
     # Steps 6-7 — Self-Attention + Dot Product
@@ -358,8 +447,8 @@ class ProtoMapHead(BaseModule):
         # 4. Scene-Aware Query: learnable + global + local
         query_feat = self._scene_aware_queries(for_query, ema_query)
 
-        # 5. Prototype-grounded BEV refinement
-        refined_mask_feat = self._prototype_grounded_bev_refinement(mask_feat, query_feat)
+        # 5. Optional PGBR submodule. Canonical configs leave this as identity.
+        refined_mask_feat = self._apply_pgbr(mask_feat, query_feat)
 
         # 6-7. Self-attention + dot product → final masks
         final_masks = self._forward_head(query_feat, refined_mask_feat)
