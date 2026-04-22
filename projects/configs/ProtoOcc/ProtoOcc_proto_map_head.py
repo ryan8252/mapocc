@@ -446,3 +446,38 @@ log_config = dict(
         dict(type='TextLoggerHook'),
         dict(type='TensorboardLoggerHook')
     ])
+
+
+# ===> per class IoU of 6019 samples:
+# ===> others - IoU = 10.9
+# ===> barrier - IoU = 44.4
+# ===> bicycle - IoU = 23.14
+# ===> bus - IoU = 39.72
+# ===> car - IoU = 48.68
+# ===> construction_vehicle - IoU = 20.89
+# ===> motorcycle - IoU = 23.44
+# ===> pedestrian - IoU = 26.61
+# ===> traffic_cone - IoU = 25.39
+# ===> trailer - IoU = 27.62
+# ===> truck - IoU = 33.87
+# ===> driveable_surface - IoU = 80.6
+# ===> other_flat - IoU = 43.12
+# ===> sidewalk - IoU = 51.48
+# ===> terrain - IoU = 54.28
+# ===> manmade - IoU = 39.45
+# ===> vegetation - IoU = 34.65
+# ===> mIoU of 6019 samples: 36.96
+
+
+# Map Head
+# 31.46 mIoU。
+
+# 各 map 類別：
+
+# class	best IoU
+# drivable_area	71.83
+# walkway	37.81
+# carpark_area	23.33
+# ped_crossing	21.86
+# divider	19.01
+# stop_line	14.92

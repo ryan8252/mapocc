@@ -16,3 +16,14 @@ model = dict(
 # loss_map_coarse_bce: 0.6354, loss_map_coarse_dice: 0.4403, 
 # loss_map_focal: 0.1101, loss_map_dice: 0.8813, 
 # loss: 46.8002, grad_norm: 31.4298
+
+# epoch_3 -> epoch_6
+# Occ mIoU: 33.75 -> 36.02   (+2.27)
+# Map mIoU: 27.03 -> 31.94   (+4.91)
+
+# drivable_area 67.29 -> 70.86
+# ped_crossing  15.13 -> 19.12
+# walkway       33.87 -> 38.17
+# stop_line     11.28 -> 13.07
+# carpark_area  15.13 -> 28.94   很大一跳
+# divider       19.48 -> 21.48

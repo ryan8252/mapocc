@@ -33,3 +33,32 @@ model = dict(
 # loss_segmentation: 1.1129, loss_depth: 8.4076, 
 # loss_map_bce: 0.9784, loss_map_dice: 0.8697, 
 # loss: 40.7282, grad_norm: 30.1793
+
+# epoch_3 
+# ===> per class IoU of 6019 samples:
+# ===> others - IoU = 7.19
+# ===> barrier - IoU = 39.01
+# ===> bicycle - IoU = 20.3
+# ===> bus - IoU = 38.48
+# ===> car - IoU = 46.28
+# ===> construction_vehicle - IoU = 16.25
+# ===> motorcycle - IoU = 21.46
+# ===> pedestrian - IoU = 23.87
+# ===> traffic_cone - IoU = 24.6
+# ===> trailer - IoU = 23.95
+# ===> truck - IoU = 31.86
+# ===> driveable_surface - IoU = 78.2
+# ===> other_flat - IoU = 40.91
+# ===> sidewalk - IoU = 47.83
+# ===> terrain - IoU = 50.11
+# ===> manmade - IoU = 35.37
+# ===> vegetation - IoU = 32.71
+# ===> mIoU of 6019 samples: 34.02
+
+# drivable_area    69.87
+# ped_crossing     16.73
+# walkway          35.85
+# stop_line        9.78
+# carpark_area     20.91
+# divider          19.78
+# mean             28.82
