@@ -172,7 +172,9 @@ Map 各類提升：
 
 8. Map 的主要瓶頸仍是小區域和線狀類別：`stop_line` 21.30，`divider` 28.05，`ped_crossing` 32.10。雖然已比 no-neck epoch 24 明顯上升，但仍遠低於 BEVFusion/MAESTRO。
 
-9. PGBR ablation 目前沒有改善 map，反而讓 Occ / Map 都下降。下一步更應該優先沿著 map-specific BEV neck、GT-guided prototype、coarse/final mask 融合前進，而不是繼續把 PGBR 當主線。
+9. PGBR ablation 目前沒有改善 map，反而讓 Occ / Map 都下降。下一步更應該優先沿著 map-specific BEV neck 與 GT-guided prototype 前進，而不是繼續把 PGBR 當主線。
+
+10. `ProtoMapHead` 的輸出 ablation 顯示，目前 inference 以 `coarse` 最好、`final` 次之、`coarse_final` 最差。以 `ProtoOcc_proto_map_head_map_neck_256.py` 的 `epoch_24_ema.pth` 為例，Occ mIoU 在三者下都維持 39.76 不變，但 Map mIoU 依序為 `39.44 > 39.09 > 38.89`。這表示目前 prototype dot-product head 還沒有穩定優於 coarse branch，而直接做 `coarse_pred + final_masks` 的融合也沒有帶來增益，反而造成些微退化。
 
 ## 建議下一步實驗
 

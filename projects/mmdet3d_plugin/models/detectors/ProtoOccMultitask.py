@@ -206,8 +206,9 @@ class ProtoOccMultitask(BEVDet):
 
         # ── Prototype Map Head ─────────────────────────────────────────────
         map_feature = self._select_map_feature(bev_feature, map_bev_feature)
-        _, final_masks = self.proto_map_head(map_feature)
-        map_probs = self.proto_map_head.predict(final_masks).detach().cpu().numpy()
+        coarse_pred, final_masks = self.proto_map_head(map_feature)
+        map_probs = self.proto_map_head.predict(
+            coarse_pred, final_masks).detach().cpu().numpy()
 
         gt_masks_bev = self._normalize_map_targets(kwargs.get('gt_masks_bev'))
         if gt_masks_bev is not None:

@@ -120,6 +120,7 @@ class ProtoMapHead(BaseModule):
                  refinement_temperature=1.0,
                  refinement_detach_query=True,
                  with_cp=False,
+                 test_output='final',
                  loss_coarse_bce=None,
                  loss_coarse_dice=None,
                  loss_mask_focal=None,
@@ -127,6 +128,10 @@ class ProtoMapHead(BaseModule):
         super().__init__()
         if not any([use_scene_adaptive, use_ema_bank, use_learnable_query]):
             raise ValueError('At least one query source must be enabled for ProtoMapHead.')
+        if test_output not in ('final', 'coarse', 'coarse_final'):
+            raise ValueError(
+                'Unsupported ProtoMapHead test_output: '
+                f'{test_output}. Expected one of final, coarse, coarse_final.')
 
         self.num_classes     = num_classes
         self.hidden_channels = hidden_channels
@@ -137,6 +142,7 @@ class ProtoMapHead(BaseModule):
         self.use_learnable_query = use_learnable_query
         self.use_query_self_attn = use_query_self_attn
         self.with_cp         = with_cp
+        self.test_output     = test_output
 
         pgbr_cfg = self._normalize_pgbr_cfg(
             pgbr_cfg,
@@ -472,5 +478,16 @@ class ProtoMapHead(BaseModule):
                 gt.reshape(-1, *gt.shape[2:]))
         return losses
 
-    def predict(self, final_masks):
-        return torch.sigmoid(final_masks)
+    def predict(self, coarse_pred, final_masks=None):
+        # Keep backward compatibility with older call sites that pass only
+        # final mask logits.
+        if final_masks is None:
+            return torch.sigmoid(coarse_pred)
+
+        if self.test_output == 'coarse':
+            logits = coarse_pred
+        elif self.test_output == 'coarse_final':
+            logits = coarse_pred + final_masks
+        else:
+            logits = final_masks
+        return torch.sigmoid(logits)
