@@ -167,7 +167,8 @@ class ProtoOccMultitask(BEVDet):
                 raise ValueError('Expected gt_masks_bev when training ProtoOccMultitask with proto_map_head.')
             map_feature = self._select_map_feature(bev_feature, map_bev_feature)
             self._check_map_feature_size(map_feature, gt_masks_bev)
-            coarse_pred, final_masks = self.proto_map_head(map_feature)
+            coarse_pred, final_masks = self.proto_map_head(
+                map_feature, gt_masks_bev=gt_masks_bev)
             map_losses = self.proto_map_head.loss(coarse_pred, final_masks, gt_masks_bev)
             losses.update(self._scale_map_losses(map_losses))
 

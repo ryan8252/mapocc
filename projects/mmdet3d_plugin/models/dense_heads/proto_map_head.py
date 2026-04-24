@@ -111,6 +111,9 @@ class ProtoMapHead(BaseModule):
                  attn_heads=8,
                  conf_thresh=0.5,
                  ema_weight=0.01,
+                 prototype_mining_mode='pred_threshold',
+                 prototype_mining_alpha=0.5,
+                 prototype_pooling_scope='batch_local',
                  use_scene_adaptive=True,
                  use_ema_bank=True,
                  use_learnable_query=True,
@@ -132,11 +135,30 @@ class ProtoMapHead(BaseModule):
         self.hidden_channels = hidden_channels
         self.conf_thresh     = conf_thresh
         self.ema_weight      = ema_weight
+        self.prototype_mining_mode = prototype_mining_mode
+        self.prototype_mining_alpha = prototype_mining_alpha
+        self.prototype_pooling_scope = prototype_pooling_scope
+        self.prototype_support_eps = 1e-6
         self.use_scene_adaptive = use_scene_adaptive
         self.use_ema_bank       = use_ema_bank
         self.use_learnable_query = use_learnable_query
         self.use_query_self_attn = use_query_self_attn
         self.with_cp         = with_cp
+
+        valid_mining_modes = ('pred_threshold', 'gt_hard', 'gt_soft')
+        if self.prototype_mining_mode not in valid_mining_modes:
+            raise ValueError(
+                'Unsupported ProtoMapHead prototype_mining_mode: '
+                f'{self.prototype_mining_mode}. '
+                f'Expected one of {valid_mining_modes}.')
+        if not 0.0 <= self.prototype_mining_alpha <= 1.0:
+            raise ValueError(
+                'ProtoMapHead prototype_mining_alpha must be in [0, 1], '
+                f'but got {self.prototype_mining_alpha}.')
+        if self.prototype_pooling_scope != 'batch_local':
+            raise NotImplementedError(
+                'ProtoMapHead currently supports only '
+                "prototype_pooling_scope='batch_local' for Step 1.")
 
         pgbr_cfg = self._normalize_pgbr_cfg(
             pgbr_cfg,
@@ -296,25 +318,72 @@ class ProtoMapHead(BaseModule):
 
         Returns:
             for_query: (num_classes, hidden_channels)
+            valid_mask: (num_classes,)
         """
         soft_masks     = torch.sigmoid(coarse_pred)        # (B, K, H, W)
         mask_feat_perm = mask_feat.permute(0, 2, 3, 1)    # (B, H, W, C)
 
         for_query = []
+        valid_mask = []
         for k in range(self.num_classes):
             conf_mask = soft_masks[:, k] > self.conf_thresh  # (B, H, W)
             if conf_mask.sum() == 0:
                 proto = mask_feat.new_zeros(self.hidden_channels)
+                valid = False
             else:
                 proto = mask_feat_perm[conf_mask].mean(0)    # (C,)
+                valid = True
             for_query.append(proto.unsqueeze(0))             # (1, C)
-        return torch.cat(for_query, dim=0)                   # (K, C)
+            valid_mask.append(valid)
+        return (
+            torch.cat(for_query, dim=0),
+            torch.tensor(valid_mask, dtype=torch.bool, device=mask_feat.device))
+
+    def _gt_guided_adaPG(self, coarse_pred, mask_feat, gt_masks_bev):
+        """Pool prototypes with GT support and optional confidence weighting.
+
+        Training-time GT guarantees sparse classes have positive support when
+        they exist. Prediction confidence only reweights GT-positive pixels and
+        is detached to avoid shortcut gradients through the pooling weights.
+
+        Returns:
+            for_query: (num_classes, hidden_channels)
+            valid_mask: (num_classes,)
+        """
+        prob = torch.sigmoid(coarse_pred).detach()         # (B, K, H, W)
+        feat = mask_feat.permute(0, 2, 3, 1)              # (B, H, W, C)
+        gt = gt_masks_bev.to(device=mask_feat.device, dtype=feat.dtype)
+
+        for_query = []
+        valid_mask = []
+        for k in range(self.num_classes):
+            gt_mask = gt[:, k]
+            if self.prototype_mining_mode == 'gt_hard':
+                weight = gt_mask
+            else:
+                weight = gt_mask * (
+                    self.prototype_mining_alpha
+                    + (1.0 - self.prototype_mining_alpha) * prob[:, k])
+
+            support = weight.sum()
+            valid = bool(support.item() > self.prototype_support_eps)
+            if valid:
+                proto = (feat * weight.unsqueeze(-1)).sum(dim=(0, 1, 2)) / support
+            else:
+                proto = mask_feat.new_zeros(self.hidden_channels)
+
+            for_query.append(proto.unsqueeze(0))
+            valid_mask.append(valid)
+
+        return (
+            torch.cat(for_query, dim=0),
+            torch.tensor(valid_mask, dtype=torch.bool, device=mask_feat.device))
 
     # ──────────────────────────────────────────────────────────────────────
     # Step 3 — AgnoPG  (Scene-Agnostic Prototype Generator / EMA bank)
     # ──────────────────────────────────────────────────────────────────────
 
-    def _agno_PG_update_and_get(self, for_query):
+    def _agno_PG_update_and_get(self, for_query, valid_mask=None):
         """Update EMA bank during training; return global prototype.
 
         Mirrors ProtoOcc's AgnoPG logic exactly:
@@ -327,9 +396,15 @@ class ProtoMapHead(BaseModule):
         if not self.use_ema_bank:
             return for_query.new_zeros(for_query.shape)
 
+        if valid_mask is None:
+            valid_mask = for_query.sum(1) != 0
+        else:
+            valid_mask = valid_mask.to(
+                device=self.proto_first_flag.device, dtype=torch.bool)
+
         if self.training:
             with torch.no_grad():
-                cur_assign_flag = for_query.sum(1) != 0     # (K,) bool
+                cur_assign_flag = valid_mask                # (K,) bool
 
                 # First-time init
                 init_flag = self.proto_first_flag & cur_assign_flag
@@ -427,10 +502,11 @@ class ProtoMapHead(BaseModule):
     # Public API
     # ──────────────────────────────────────────────────────────────────────
 
-    def forward(self, bev_feat):
+    def forward(self, bev_feat, gt_masks_bev=None):
         """
         Args:
             bev_feat: (B, in_channels, H, W)
+            gt_masks_bev: optional training-time GT map masks, (B, K, H, W)
         Returns:
             coarse_pred : (B, num_classes, H, W)
             final_masks : (B, num_classes, H, W)
@@ -439,10 +515,15 @@ class ProtoMapHead(BaseModule):
         mask_feat, coarse_pred = self._cnn_proto_generator(bev_feat)
 
         # 2. AdaPG — batch-shared local prototype
-        for_query = self._adaPG(coarse_pred, mask_feat)
+        if (self.training and gt_masks_bev is not None
+                and self.prototype_mining_mode in ('gt_hard', 'gt_soft')):
+            for_query, valid_mask = self._gt_guided_adaPG(
+                coarse_pred, mask_feat, gt_masks_bev)
+        else:
+            for_query, valid_mask = self._adaPG(coarse_pred, mask_feat)
 
         # 3. AgnoPG — update EMA, get global prototype
-        ema_query = self._agno_PG_update_and_get(for_query)
+        ema_query = self._agno_PG_update_and_get(for_query, valid_mask)
 
         # 4. Scene-Aware Query: learnable + global + local
         query_feat = self._scene_aware_queries(for_query, ema_query)
