@@ -421,6 +421,7 @@ lr_config = dict(
     warmup_ratio=0.001,
     step=[29, ])
 runner = dict(type='EpochBasedRunner', max_epochs=24)
+find_unused_parameters = True
 
 custom_hooks = [
     dict(
