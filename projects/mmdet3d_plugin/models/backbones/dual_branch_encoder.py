@@ -200,3 +200,42 @@ class Dual_Branch_Encoder(nn.Module):
             return comprehensive_voxel_feature, bev_feature
 
         return comprehensive_voxel_feature
+
+
+@BACKBONES.register_module()
+class MapOnly_BEV_Encoder(nn.Module):
+    """BEV encoder for map-only upper-bound experiments.
+
+    This keeps the BEV feature path used by `Dual_Branch_Encoder` but omits
+    the voxel branch, hierarchical 3D fusion, and occupancy BEV projection.
+    """
+
+    def __init__(self,
+                 down_sample_for_3d_pooling=None,
+                 bev_encoder_backbone=None,
+                 map_bev_encoder_neck=None,
+                 detach_map_feature=False):
+        super().__init__()
+        if down_sample_for_3d_pooling is None:
+            raise ValueError('MapOnly_BEV_Encoder requires down_sample_for_3d_pooling.')
+        if map_bev_encoder_neck is None:
+            raise ValueError('MapOnly_BEV_Encoder requires map_bev_encoder_neck.')
+
+        self.detach_map_feature = detach_map_feature
+        self.down_sample_for_3d_pooling = nn.Conv2d(
+            down_sample_for_3d_pooling[0],
+            down_sample_for_3d_pooling[1],
+            kernel_size=1,
+            padding=0,
+            stride=1)
+        self.bev_encoder_backbone = builder.build_backbone(bev_encoder_backbone)
+        self.map_bev_encoder_neck = builder.build_neck(map_bev_encoder_neck)
+
+    def forward(self, x):
+        pooled_x = torch.cat(x.unbind(dim=2), 1)
+        pooled_x = self.down_sample_for_3d_pooling(pooled_x)
+        multi_scale_bev = self.bev_encoder_backbone(pooled_x)
+        if self.detach_map_feature:
+            multi_scale_bev = [feat.detach() for feat in multi_scale_bev]
+        map_bev = self.map_bev_encoder_neck(multi_scale_bev)
+        return map_bev[0] if isinstance(map_bev, (list, tuple)) else map_bev

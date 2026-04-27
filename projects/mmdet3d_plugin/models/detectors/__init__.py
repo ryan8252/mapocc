@@ -1,6 +1,7 @@
 from .ProtoOcc_longterm import *
 from .ProtoOcc import *
 from .ProtoOccCnnSegHead import *
+from .ProtoOccMapOnly import *
 from .ProtoOccMultitask import *
 from .ProtoOcc_SemanticKITTI import *
 from .bevstereo4d import BEVStereo4D
@@ -11,6 +12,7 @@ from .bevdet4d import BEVDet4D
 __all__ = [
     'ProtoOcc',
     'ProtoOccCnnSegHead',
+    'ProtoOccMapOnly',
     'ProtoOccMultitask',
     'BEVStereo4D',
     'BEVDet',
