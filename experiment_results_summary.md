@@ -1,14 +1,15 @@
 # ProtoOcc 多任務實驗結果整理
 
-日期：2026-04-24
+日期：2026-04-25
 
 ## 實驗摘要
 
-目前整理六組已測結果：
+目前整理七組主要訓練結果，另補 output ablation：
 
 | 實驗 | Config | Checkpoint | Occ mIoU | Map mIoU |
 | --- | --- | --- | ---: | ---: |
 | Naive MTL CNN map head | `projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head.py` | `work_dirs/ProtoOcc_multi_cnn_head_4090/epoch_15.pth` | 32.54 | 16.13 |
+| CNN map head + 128ch map neck (EMA) | `projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck.py` | `work_dirs/ProtoOcc_multi_cnn_head_map_neck_TWCC/epoch_24_ema.pth` | 39.82 | 39.94 |
 | ProtoMapHead canonical (no PGBR) | `projects/configs/ProtoOcc/ProtoOcc_proto_map_head.py` | `work_dirs/ProtoOcc_proto_map_head_TWCC/epoch17.pth` | 36.77 | 32.03 |
 | ProtoMapHead canonical (no PGBR) | `projects/configs/ProtoOcc/ProtoOcc_proto_map_head.py` | `work_dirs/ProtoOcc_proto_map_head_TWCC/epoch_24.pth` | 37.61 | 32.95 |
 | ProtoMapHead + 128ch map neck (no PGBR) | `projects/configs/ProtoOcc/ProtoOcc_proto_map_head_map_neck.py` | `work_dirs/ProtoOcc_proto_map_head_map_neck_no_pgbr_TWCC/epoch_24.pth` | 37.04 | 37.14 |
@@ -30,36 +31,38 @@
 | 實驗 | Drivable | Ped. Cross. | Walkway | Stop Line | Carpark | Divider | Mean |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | Naive MTL CNN head, epoch 15 | 54.34 | 7.19 | 20.49 | 5.26 | 0.25 | 9.23 | 16.13 |
+| CNN head + 128ch map neck, epoch 24 EMA | 76.36 | 30.52 | 45.15 | 20.73 | 39.25 | 27.63 | 39.94 |
 | ProtoMapHead no PGBR, epoch 17 | 71.36 | 22.67 | 37.51 | 14.98 | 24.52 | 21.11 | 32.03 |
 | ProtoMapHead no PGBR, epoch 24 | 72.14 | 24.52 | 38.44 | 15.22 | 25.88 | 21.50 | 32.95 |
 | ProtoMapHead + 128ch map neck no PGBR, epoch 24 | 73.97 | 28.29 | 41.91 | 18.96 | 33.71 | 26.00 | 37.14 |
 | ProtoMapHead + 128ch map neck no PGBR, epoch 24 EMA | 75.43 | 30.50 | 44.55 | 20.54 | 35.47 | 27.62 | 39.02 |
-| ProtoMapHead + 256ch map neck no PGBR, epoch 24 EMA | 74.52 | 32.10 | 45.03 | 21.30 | 33.51 | 28.05 | 39.09 |
+| ProtoMapHead + 256ch map neck no PGBR, epoch 24 EMA (final) | 74.52 | 32.10 | 45.03 | 21.30 | 33.51 | 28.05 | 39.09 |
+| ProtoMapHead + 256ch map neck no PGBR, epoch 24 EMA (coarse) | 76.15 | 32.47 | 45.30 | 20.92 | 33.67 | 28.15 | 39.44 |
 | BEVFusion R50 | 78.00 | 42.80 | 49.70 | 31.30 | 43.10 | 37.80 | 47.10 |
 | MAESTRO R50 | 80.30 | 45.90 | 55.40 | 36.10 | 48.30 | 41.80 | 51.30 |
 
 ## Occupancy 分類結果
 
-| Class | Naive MTL CNN epoch 15 | ProtoMapHead no PGBR epoch 17 | ProtoMapHead no PGBR epoch 24 | 128ch map neck epoch 24 | 128ch map neck epoch 24 EMA | 256ch map neck epoch 24 EMA |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| others | 6.94 | 9.91 | 10.65 | 11.61 | 12.05 | 12.05 |
-| barrier | 40.92 | 43.87 | 43.87 | 44.59 | 47.73 | 48.24 |
-| bicycle | 22.10 | 21.36 | 21.52 | 23.51 | 25.81 | 24.88 |
-| bus | 39.19 | 42.05 | 43.31 | 36.46 | 44.52 | 44.20 |
-| car | 45.96 | 49.63 | 50.54 | 49.01 | 51.95 | 51.84 |
-| construction_vehicle | 20.82 | 20.65 | 20.87 | 20.39 | 22.86 | 23.48 |
-| motorcycle | 22.49 | 22.58 | 26.05 | 25.26 | 26.89 | 26.40 |
-| pedestrian | 23.40 | 26.59 | 25.29 | 25.79 | 27.10 | 27.85 |
-| traffic_cone | 22.58 | 25.84 | 26.66 | 26.04 | 28.26 | 28.09 |
-| trailer | 29.35 | 28.32 | 31.72 | 29.20 | 31.50 | 32.98 |
-| truck | 34.25 | 34.81 | 35.60 | 33.34 | 37.12 | 37.20 |
-| driveable_surface | 75.42 | 80.10 | 81.01 | 81.30 | 82.28 | 82.18 |
-| other_flat | 26.28 | 41.83 | 42.78 | 43.57 | 46.59 | 46.45 |
-| sidewalk | 40.90 | 50.24 | 51.17 | 51.80 | 53.66 | 53.46 |
-| terrain | 42.80 | 53.41 | 53.05 | 54.58 | 56.44 | 56.63 |
-| manmade | 33.44 | 40.27 | 40.87 | 38.03 | 43.51 | 42.97 |
-| vegetation | 26.34 | 33.63 | 34.37 | 35.14 | 36.86 | 37.06 |
-| mIoU | 32.54 | 36.77 | 37.61 | 37.04 | 39.71 | 39.76 |
+| Class | Naive MTL CNN epoch 15 | CNN head + 128ch neck epoch 24 EMA | ProtoMapHead no PGBR epoch 17 | ProtoMapHead no PGBR epoch 24 | 128ch map neck epoch 24 | 128ch map neck epoch 24 EMA | 256ch map neck epoch 24 EMA |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| others | 6.94 | 12.17 | 9.91 | 10.65 | 11.61 | 12.05 | 12.05 |
+| barrier | 40.92 | 47.95 | 43.87 | 43.87 | 44.59 | 47.73 | 48.24 |
+| bicycle | 22.10 | 26.34 | 21.36 | 21.52 | 23.51 | 25.81 | 24.88 |
+| bus | 39.19 | 44.81 | 42.05 | 43.31 | 36.46 | 44.52 | 44.20 |
+| car | 45.96 | 51.91 | 49.63 | 50.54 | 49.01 | 51.95 | 51.84 |
+| construction_vehicle | 20.82 | 23.47 | 20.65 | 20.87 | 20.39 | 22.86 | 23.48 |
+| motorcycle | 22.49 | 26.54 | 22.58 | 26.05 | 25.26 | 26.89 | 26.40 |
+| pedestrian | 23.40 | 27.64 | 26.59 | 25.29 | 25.79 | 27.10 | 27.85 |
+| traffic_cone | 22.58 | 28.26 | 25.84 | 26.66 | 26.04 | 28.26 | 28.09 |
+| trailer | 29.35 | 33.31 | 28.32 | 31.72 | 29.20 | 31.50 | 32.98 |
+| truck | 34.25 | 37.16 | 34.81 | 35.60 | 33.34 | 37.12 | 37.20 |
+| driveable_surface | 75.42 | 81.92 | 80.10 | 81.01 | 81.30 | 82.28 | 82.18 |
+| other_flat | 26.28 | 46.13 | 41.83 | 42.78 | 43.57 | 46.59 | 46.45 |
+| sidewalk | 40.90 | 53.28 | 50.24 | 51.17 | 51.80 | 53.66 | 53.46 |
+| terrain | 42.80 | 56.46 | 53.41 | 53.05 | 54.58 | 56.44 | 56.63 |
+| manmade | 33.44 | 42.89 | 40.27 | 40.87 | 38.03 | 43.51 | 42.97 |
+| vegetation | 26.34 | 36.67 | 33.63 | 34.37 | 35.14 | 36.86 | 37.06 |
+| mIoU | 32.54 | 39.82 | 36.77 | 37.61 | 37.04 | 39.71 | 39.76 |
 
 ## 主要比較
 
@@ -80,6 +83,47 @@ Map 各類差異：
 | stop_line | 20.54 | 21.30 | +0.76 |
 | carpark_area | 35.47 | 33.51 | -1.96 |
 | divider | 27.62 | 28.05 | +0.43 |
+
+### ProtoMapHead + 256ch map neck EMA coarse vs final output
+
+這是同一個 `ProtoOcc_proto_map_head_map_neck_256.py` epoch 24 EMA checkpoint 的 output ablation。`final` 是 prototype refinement 後輸出；`coarse` 是 map coarse branch 直接輸出。
+
+| 指標 | final output | coarse output | 差異 |
+| --- | ---: | ---: | ---: |
+| Map mIoU | 39.09 | 39.44 | +0.36 |
+
+Map 各類差異：
+
+| Class | final output | coarse output | 差異 |
+| --- | ---: | ---: | ---: |
+| drivable_area | 74.52 | 76.15 | +1.63 |
+| ped_crossing | 32.10 | 32.47 | +0.37 |
+| walkway | 45.03 | 45.30 | +0.28 |
+| stop_line | 21.30 | 20.92 | -0.39 |
+| carpark_area | 33.51 | 33.67 | +0.16 |
+| divider | 28.05 | 28.15 | +0.10 |
+
+Coarse output 整體比 final output 高 0.36 mIoU，主要來自 `drivable_area` +1.63。Final output 只有在 `stop_line` 明顯較好（+0.39），其餘類別都沒有超過 coarse。這表示 prototype refinement 目前沒有穩定提升 map segmentation，反而會犧牲大面積類別的校準。
+
+### CNN head + 128ch map neck EMA vs ProtoMapHead + 128ch map neck EMA
+
+| 指標 | ProtoMapHead + 128ch neck EMA | CNN head + 128ch neck EMA | 差異 |
+| --- | ---: | ---: | ---: |
+| Occ mIoU | 39.71 | 39.82 | +0.11 |
+| Map mIoU | 39.02 | 39.94 | +0.92 |
+
+Map 各類差異：
+
+| Class | ProtoMapHead + 128ch neck EMA | CNN head + 128ch neck EMA | 差異 |
+| --- | ---: | ---: | ---: |
+| drivable_area | 75.43 | 76.36 | +0.93 |
+| ped_crossing | 30.50 | 30.52 | +0.02 |
+| walkway | 44.55 | 45.15 | +0.60 |
+| stop_line | 20.54 | 20.73 | +0.19 |
+| carpark_area | 35.47 | 39.25 | +3.78 |
+| divider | 27.62 | 27.63 | +0.01 |
+
+這組 ablation 顯示 map-specific neck 才是主要增益來源。當 CNN head 也接上 128ch map neck 後，不只不輸 ProtoMapHead，反而達到目前最高 Map mIoU 39.94，主要多在 `carpark_area` +3.78。
 
 ### ProtoMapHead + 128ch map neck epoch 24 / EMA vs no-neck epoch 24
 
@@ -146,42 +190,46 @@ Map 各類提升：
 | carpark_area | 0.25 | 25.88 | +25.63 |
 | divider | 9.23 | 21.50 | +12.27 |
 
-### ProtoMapHead + 256ch map neck epoch 24 EMA vs 外部方法
+### 目前 best vs 外部方法
 
 | 對比方法 | Occ 差距 | Map 差距 |
 | --- | ---: | ---: |
-| 原始 ProtoOcc | +0.20 | - |
-| MAESTRO R50 | +1.16 | -12.21 |
-| BEVFusion R50 | - | -8.01 |
+| 原始 ProtoOcc | +0.26 using CNN head + 128ch neck EMA | - |
+| MAESTRO R50 | +1.22 using CNN head + 128ch neck EMA | -11.36 using CNN head + 128ch neck EMA |
+| BEVFusion R50 | - | -7.16 using CNN head + 128ch neck EMA |
 
 ## 目前結論
 
-1. Naive MTL CNN map head 表現很差：Occ mIoU 只有 32.54，Map mIoU 只有 16.13。這表示直接在目前 ProtoOcc BEV feature 上加淺層 CNN map head，會造成嚴重多任務退化。
+1. Naive MTL CNN map head 表現很差：Occ mIoU 只有 32.54，Map mIoU 只有 16.13。這表示直接在目前 ProtoOcc shared BEV feature 上加淺層 CNN map head，會造成嚴重多任務退化。
 
-2. ProtoMapHead 明顯優於 Naive MTL CNN head：canonical no PGBR epoch 24 達到 Occ 37.61 / Map 32.95，相比 Naive MTL CNN 分別提升 +5.07 / +16.82。這可以支撐「prototype map head 有效緩解 naive multitask 退化」。
+2. ProtoMapHead 明顯優於沒有 map neck 的 Naive MTL CNN head：canonical no PGBR epoch 24 達到 Occ 37.61 / Map 32.95，相比 Naive MTL CNN 分別提升 +5.07 / +16.82。但這不能證明 prototype head 本身優於 CNN head，因為 CNN head + 128ch map neck EMA 已達 Occ 39.82 / Map 39.94。
 
 3. 128ch map-specific BEV neck 是目前最有效的架構改動。non-EMA epoch 24 相比 no-neck epoch 24，Map mIoU 從 32.95 提升到 37.14（+4.19），六個 map 類別全部上升；Occ mIoU 小降 0.57。
 
 4. EMA 對 map neck 實驗非常重要。map neck epoch 24 EMA 達到 Occ 39.71 / Map 39.02，相比 non-EMA 分別提升 +2.67 / +1.88；相比 no-neck epoch 24 則提升 +2.10 / +6.07。
 
-5. 256ch map neck EMA 是目前數字上的 best，達到 Occ 39.76 / Map 39.09。不過相對 128ch map neck EMA 只提升 +0.05 / +0.07，屬於微幅提升，表示單純加寬 map branch 已接近 plateau。
+5. 目前數字上的 best 是 CNN head + 128ch map neck EMA，達到 Occ 39.82 / Map 39.94。256ch ProtoMapHead EMA 以 final output 計達到 Occ 39.76 / Map 39.09；同 checkpoint 的 coarse output 則達到 Map 39.44，但仍低於 CNN head + 128ch map neck EMA。
 
 6. 256ch 對小區域和線狀類別有幫助：`ped_crossing` +1.60，`stop_line` +0.76，`divider` +0.43；但 `drivable_area` -0.91、`carpark_area` -1.96 抵消了大部分提升。
 
-7. 目前 best 的 Occ mIoU 39.76 已經高於使用者提供的原始 ProtoOcc R50 39.56，也高於 MAESTRO R50 的 38.60；但 Map mIoU 39.09 仍距離 BEVFusion R50 47.10 差 8.01，距離 MAESTRO R50 51.30 差 12.21。
+7. 目前 best 的 Occ mIoU 39.82 已經高於使用者提供的原始 ProtoOcc R50 39.56，也高於 MAESTRO R50 的 38.60；但 Map mIoU 39.94 仍距離 BEVFusion R50 47.10 差 7.16，距離 MAESTRO R50 51.30 差 11.36。
 
-8. Map 的主要瓶頸仍是小區域和線狀類別：`stop_line` 21.30，`divider` 28.05，`ped_crossing` 32.10。雖然已比 no-neck epoch 24 明顯上升，但仍遠低於 BEVFusion/MAESTRO。
+8. Map 的主要瓶頸仍是小區域和線狀類別：目前 `stop_line` 約 20-21，`divider` 約 27-28，`ped_crossing` 約 30-32。雖然已比 no-neck epoch 24 明顯上升，但仍遠低於 BEVFusion/MAESTRO。
 
 9. PGBR ablation 目前沒有改善 map，反而讓 Occ / Map 都下降。下一步更應該優先沿著 map-specific BEV neck、GT-guided prototype、coarse/final mask 融合前進，而不是繼續把 PGBR 當主線。
+
+10. Coarse/final output ablation 已顯示 coarse output 高於 final output（39.44 vs 39.09）。Prototype refinement 目前只改善 `stop_line`，但壓低 `drivable_area`，因此後續不應直接假設 final mask 是最佳輸出，應測 coarse+final fusion 或 class-wise selection。
+
+11. 目前最強證據支持的是 map-specific feature branch，而不是 prototype refinement：同樣有 map neck 時，CNN head + 128ch neck EMA 的 Map 39.94 高於 ProtoMapHead + 128ch neck EMA 的 39.02，也高於 ProtoMapHead + 256ch neck EMA coarse 的 39.44。
 
 ## 建議下一步實驗
 
 1. 補測 `ProtoOcc_proto_map_head_map_neck_256.py` 的 `epoch_24.pth`：
    - 目前 256ch EMA 只比 128ch EMA 微幅提升，需要 non-EMA 結果確認 256ch 本身的效果，避免把 EMA 差異誤判成 channel 差異。
 
-2. 測 `ProtoMapHead` 的 coarse-only、final-only、coarse+final：
-   - 如果 coarse 比 final 好，代表 prototype dot-product head 正在破壞 map 預測。
-   - 如果 coarse+final 好，後續可以直接做融合。
+2. 繼續測 `ProtoMapHead` 的 coarse+final 融合：
+   - coarse-only / final-only 已測，coarse output 39.44 高於 final output 39.09。
+   - Final output 只在 `stop_line` 較好；後續可測 class-wise fusion，例如大面積類別用 coarse，線狀類別嘗試 final 或 weighted ensemble。
 
 3. 將 AdaPG 訓練階段改成 GT-guided prototype：
    - 現在 `_adaPG` 用 `sigmoid(coarse_pred) > 0.5` 抽 prototype。
@@ -189,8 +237,8 @@ Map 各類提升：
 
 4. 繼續改進 map-specific BEV branch：
    - 128ch branch 已證實比直接使用 48-channel shared `bev_feature` 更適合 map segmentation。
-   - 256ch 只有微幅提升，後續若要改 branch，應優先測 detach map feature 或更強的 map feature fusion，而不是只繼續加 channel。
+   - CNN head + 128ch map neck 已是目前 best，後續若要改 branch，應優先測 detach map feature 或更強的 map feature fusion，而不是只繼續加 channel。
 
 5. 保護 occupancy 主任務：
    - 可以先測 `bev_feature.detach()` 給 map head，避免 map loss 反向污染 occ backbone。
-   - 目前 256ch map neck + EMA 已可讓 Occ 達到 39.76，後續目標是保持 Occ 不低於原始 ProtoOcc 39.56，再逐步提升 Map。
+   - 目前 CNN head + 128ch map neck EMA 已可讓 Occ 達到 39.82，後續目標是保持 Occ 不低於原始 ProtoOcc 39.56，再逐步提升 Map。
