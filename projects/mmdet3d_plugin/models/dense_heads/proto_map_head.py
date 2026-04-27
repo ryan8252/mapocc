@@ -322,13 +322,14 @@ class ProtoMapHead(BaseModule):
         """
         soft_masks     = torch.sigmoid(coarse_pred)        # (B, K, H, W)
         mask_feat_perm = mask_feat.permute(0, 2, 3, 1)    # (B, H, W, C)
+        zero_proto = mask_feat.sum(dim=(0, 2, 3)) * 0.0
 
         for_query = []
         valid_mask = []
         for k in range(self.num_classes):
             conf_mask = soft_masks[:, k] > self.conf_thresh  # (B, H, W)
             if conf_mask.sum() == 0:
-                proto = mask_feat.new_zeros(self.hidden_channels)
+                proto = zero_proto
                 valid = False
             else:
                 proto = mask_feat_perm[conf_mask].mean(0)    # (C,)
@@ -353,6 +354,7 @@ class ProtoMapHead(BaseModule):
         prob = torch.sigmoid(coarse_pred).detach()         # (B, K, H, W)
         feat = mask_feat.permute(0, 2, 3, 1)              # (B, H, W, C)
         gt = gt_masks_bev.to(device=mask_feat.device, dtype=feat.dtype)
+        zero_proto = mask_feat.sum(dim=(0, 2, 3)) * 0.0
 
         for_query = []
         valid_mask = []
@@ -370,7 +372,7 @@ class ProtoMapHead(BaseModule):
             if valid:
                 proto = (feat * weight.unsqueeze(-1)).sum(dim=(0, 1, 2)) / support
             else:
-                proto = mask_feat.new_zeros(self.hidden_channels)
+                proto = zero_proto
 
             for_query.append(proto.unsqueeze(0))
             valid_mask.append(valid)
