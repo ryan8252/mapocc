@@ -1,15 +1,16 @@
 # ProtoOcc 多任務實驗結果整理
 
-日期：2026-04-27
+日期：2026-04-29
 
 ## 實驗摘要
 
-目前整理八組主要訓練結果，另補 output ablation：
+目前整理九組主要訓練結果，另補 output ablation：
 
 | 實驗 | Config | Checkpoint | Occ mIoU | Map mIoU |
 | --- | --- | --- | ---: | ---: |
 | Naive MTL CNN map head | `projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head.py` | `work_dirs/ProtoOcc_multi_cnn_head_4090/epoch_15.pth` | 32.54 | 16.13 |
 | CNN map head + 128ch map neck (EMA) | `projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck.py` | `work_dirs/ProtoOcc_multi_cnn_head_map_neck_TWCC/epoch_24_ema.pth` | 39.82 | 39.94 |
+| **CNN map head + 128ch map neck, map-only (EMA)** | `projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck_map_only.py` | `work_dirs/ProtoOcc_multi_cnn_head_map_neck_map_only/epoch_24_ema.pth` | - | **48.34** |
 | ProtoMapHead canonical (no PGBR) | `projects/configs/ProtoOcc/ProtoOcc_proto_map_head.py` | `work_dirs/ProtoOcc_proto_map_head_TWCC/epoch17.pth` | 36.77 | 32.03 |
 | ProtoMapHead canonical (no PGBR) | `projects/configs/ProtoOcc/ProtoOcc_proto_map_head.py` | `work_dirs/ProtoOcc_proto_map_head_TWCC/epoch_24.pth` | 37.61 | 32.95 |
 | ProtoMapHead + 128ch map neck (no PGBR) | `projects/configs/ProtoOcc/ProtoOcc_proto_map_head_map_neck.py` | `work_dirs/ProtoOcc_proto_map_head_map_neck_no_pgbr_TWCC/epoch_24.pth` | 37.04 | 37.14 |
@@ -40,6 +41,7 @@
 | ProtoMapHead + 128ch map neck GT-soft, epoch 24 EMA | 47.60 | 29.50 | 39.57 | 17.35 | 36.43 | 23.96 | 32.40 |
 | ProtoMapHead + 256ch map neck no PGBR, epoch 24 EMA (final) | 74.52 | 32.10 | 45.03 | 21.30 | 33.51 | 28.05 | 39.09 |
 | ProtoMapHead + 256ch map neck no PGBR, epoch 24 EMA (coarse) | 76.15 | 32.47 | 45.30 | 20.92 | 33.67 | 28.15 | 39.44 |
+| **CNN head + 128ch map neck, map-only, epoch 24 EMA** | **80.84** | **44.58** | **52.72** | **33.62** | **42.87** | **35.43** | **48.34** |
 | BEVFusion R50 | 78.00 | 42.80 | 49.70 | 31.30 | 43.10 | 37.80 | 47.10 |
 | MAESTRO R50 | 80.30 | 45.90 | 55.40 | 36.10 | 48.30 | 41.80 | 51.30 |
 
@@ -214,6 +216,28 @@ Map 各類提升：
 | carpark_area | 0.25 | 25.88 | +25.63 |
 | divider | 9.23 | 21.50 | +12.27 |
 
+### CNN head + 128ch map neck map-only EMA vs MTL EMA（MTL 代價量化）
+
+相同架構（CNN head + 128ch map neck EMA），只差是否同時訓練 occupancy：
+
+| 指標 | MTL (Occ+Map) | map-only | MTL 代價 |
+| --- | ---: | ---: | ---: |
+| Occ mIoU | 39.82 | - | - |
+| Map mIoU | 39.94 | 48.34 | **-8.40** |
+
+Map 各類差異（map-only minus MTL）：
+
+| Class | MTL EMA | map-only EMA | 差異 |
+| --- | ---: | ---: | ---: |
+| drivable_area | 76.36 | 80.84 | +4.48 |
+| ped_crossing | 30.52 | 44.58 | **+14.06** |
+| walkway | 45.15 | 52.72 | +7.57 |
+| stop_line | 20.73 | 33.62 | **+12.89** |
+| carpark_area | 39.25 | 42.87 | +3.62 |
+| divider | 27.63 | 35.43 | +7.80 |
+
+這是目前最直接的 MTL map 損耗量化。移除 occupancy 任務後，map-only 達到 **48.34**，超越 BEVFusion R50（47.10）+1.24，距離 MAESTRO R50（51.30）僅差 2.96。損耗最大的類別是 `ped_crossing`（-14.06）和 `stop_line`（-12.89），恰好是幾何複雜度最高、需要精細空間定位的線狀類別，說明 occupancy loss 的梯度會壓制 map 的細粒度空間學習。
+
 ### 目前 best vs 外部方法
 
 | 對比方法 | Occ 差距 | Map 差距 |
@@ -221,6 +245,8 @@ Map 各類提升：
 | 原始 ProtoOcc | +0.26 using CNN head + 128ch neck EMA | - |
 | MAESTRO R50 | +1.22 using CNN head + 128ch neck EMA | -11.36 using CNN head + 128ch neck EMA |
 | BEVFusion R50 | - | -7.16 using CNN head + 128ch neck EMA |
+| BEVFusion R50 | - | **+1.24 using map-only** |
+| MAESTRO R50 | - | **-2.96 using map-only** |
 
 ## 目前結論
 
@@ -232,19 +258,19 @@ Map 各類提升：
 
 4. EMA 對 map neck 實驗非常重要。map neck epoch 24 EMA 達到 Occ 39.71 / Map 39.02，相比 non-EMA 分別提升 +2.67 / +1.88；相比 no-neck epoch 24 則提升 +2.10 / +6.07。
 
-5. 目前數字上的 best 是 CNN head + 128ch map neck EMA，達到 Occ 39.82 / Map 39.94。256ch ProtoMapHead EMA 以 final output 計達到 Occ 39.76 / Map 39.09；同 checkpoint 的 coarse output 則達到 Map 39.44，但仍低於 CNN head + 128ch map neck EMA。
+5. MTL 本身對 map 造成 -8.40 mIoU 的顯著損耗（新結論，2026-04-29 量化）。相同架構 CNN head + 128ch map neck EMA，單任務 map-only 訓練達到 Map mIoU **48.34**，MTL 版本只有 39.94。損耗主要集中在線狀類別：`ped_crossing` -14.06、`stop_line` -12.89、`divider` -7.80。這是整個實驗序列最大的單一發現，說明 occupancy loss 梯度對 map 細粒度空間學習有強烈壓制。
 
-6. 256ch 對小區域和線狀類別有幫助：`ped_crossing` +1.60，`stop_line` +0.76，`divider` +0.43；但 `drivable_area` -0.91、`carpark_area` -1.96 抵消了大部分提升。
+6. Map-only 48.34 已超越 BEVFusion R50（47.10）+1.24，距離 MAESTRO R50（51.30）僅差 2.96。先前 MTL 版本最高 39.94 距離 BEVFusion R50 差 7.16，map-only 已將此差距幾乎歸零。
 
-7. 目前 best 的 Occ mIoU 39.82 已經高於使用者提供的原始 ProtoOcc R50 39.56，也高於 MAESTRO R50 的 38.60；但 Map mIoU 39.94 仍距離 BEVFusion R50 47.10 差 7.16，距離 MAESTRO R50 51.30 差 11.36。
+7. 目前 MTL best（Occ mIoU 39.82 / Map mIoU 39.94）Occ 已高於原始 ProtoOcc R50 39.56 和 MAESTRO R50 38.60；Map 仍低於 BEVFusion R50 47.10（差 7.16）和 MAESTRO R50 51.30（差 11.36）。
 
-8. Map 的主要瓶頸仍是小區域和線狀類別：目前 `stop_line` 約 20-21，`divider` 約 27-28，`ped_crossing` 約 30-32。雖然已比 no-neck epoch 24 明顯上升，但仍遠低於 BEVFusion/MAESTRO。
+8. Map 在 MTL 設定下的主要瓶頸是線狀類別：`stop_line` 約 20-21，`divider` 約 27-28，`ped_crossing` 約 30-32；map-only 設定下這些類別分別提升至 33.62 / 35.43 / 44.58，確認瓶頸主要來自 MTL 梯度衝突，而非架構能力上限。
 
 9. PGBR ablation 目前沒有改善 map，反而讓 Occ / Map 都下降。GT-soft epoch 24 EMA 也沒有改善 final map output：Occ 幾乎持平（39.52 vs 39.71），但 Map 從 39.02 掉到 32.40，主要是 `drivable_area` 大幅下降。下一步不應把目前這版 GT-soft 直接當主線，而要先診斷 train-test mismatch 和 probability calibration。
 
 10. Coarse/final output ablation 已顯示 coarse output 高於 final output（39.44 vs 39.09）。Prototype refinement 目前只改善 `stop_line`，但壓低 `drivable_area`。GT-soft final output 又出現所有 map 類別 `iou@max` 都在 threshold 0.35 的現象，因此後續不應直接假設 final mask 是最佳輸出，應測 coarse-only、coarse+final fusion 或 class-wise selection。
 
-11. 目前最強證據支持的是 map-specific feature branch，而不是 prototype refinement：同樣有 map neck 時，CNN head + 128ch neck EMA 的 Map 39.94 高於 ProtoMapHead + 128ch neck EMA 的 39.02，也高於 ProtoMapHead + 256ch neck EMA coarse 的 39.44。
+11. 目前最強證據支持的是 map-specific feature branch + 減少 MTL 梯度衝突：map-only 48.34 >> CNN head + 128ch neck MTL EMA 39.94 >> ProtoMapHead + 256ch neck EMA coarse 39.44。Prototype refinement 本身的貢獻目前無法和 MTL 損耗區分，需要在 map-only 設定下重測才能公平評估。
 
 ## 建議下一步實驗
 
@@ -265,5 +291,4 @@ Map 各類提升：
    - CNN head + 128ch map neck 已是目前 best，後續若要改 branch，應優先測 detach map feature 或更強的 map feature fusion，而不是只繼續加 channel。
 
 5. 保護 occupancy 主任務：
-   - 可以先測 `bev_feature.detach()` 給 map head，避免 map loss 反向污染 occ backbone。
    - 目前 CNN head + 128ch map neck EMA 已可讓 Occ 達到 39.82，後續目標是保持 Occ 不低於原始 ProtoOcc 39.56，再逐步提升 Map。
