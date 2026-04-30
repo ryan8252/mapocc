@@ -87,14 +87,16 @@ class ProtoMapHead(BaseModule):
     """Prototype-based decoder for BEV map segmentation.
 
     This head follows ProtoOcc's current query formation style:
-      1. CNN proto generator produces `mask_feat` and `coarse_pred`
+      1. CNN proto generator produces `mask_feature` (hidden_channels, dot-
+         product feature = PQD's `voxel_feats`) and `mask_feat` (proto_dim,
+         prototype-pool feature = PQD's `mask_feat`) and `coarse_pred`
       2. AdaPG pools batch-shared local prototypes from confident map pixels
       3. AgnoPG maintains a class-wise EMA memory bank
       4. Scene-aware queries fuse learnable / global / local query sources
       5. (Optional) Prototype-grounded BEV refinement, enabled only when
          `pgbr_cfg` is provided for PGBR ablations.
       6. Class-fixed queries interact with self-attention
-      7. Final map masks come from `mask_embed(query) x refined_mask_feat`
+      7. Final map masks come from `mask_embed(query) x mask_feature`
 
     Compared with the 3-D occupancy decoder, the main differences are:
       - The spatial lattice is 2-D BEV instead of 3-D voxels.
@@ -106,10 +108,11 @@ class ProtoMapHead(BaseModule):
     def __init__(self,
                  in_channels,
                  hidden_channels=96,
+                 proto_dim=32,
                  num_classes=6,
                  num_convs=2,
                  attn_heads=8,
-                 conf_thresh=0.5,
+                 prototype_mining_thresh=0.7,
                  ema_weight=0.01,
                  prototype_mining_mode='pred_threshold',
                  prototype_mining_alpha=0.5,
@@ -133,7 +136,8 @@ class ProtoMapHead(BaseModule):
 
         self.num_classes     = num_classes
         self.hidden_channels = hidden_channels
-        self.conf_thresh     = conf_thresh
+        self.proto_dim       = proto_dim
+        self.prototype_mining_thresh = prototype_mining_thresh
         self.ema_weight      = ema_weight
         self.prototype_mining_mode = prototype_mining_mode
         self.prototype_mining_alpha = prototype_mining_alpha
@@ -176,21 +180,34 @@ class ProtoMapHead(BaseModule):
             cur_ch = hidden_channels
         self.conv_layers      = nn.Sequential(*blocks)
         self.coarse_predictor = nn.Conv2d(hidden_channels, num_classes, 1)
+        # Prototype bottleneck. Mirrors ProtoOcc's split between cnn3d_decoder
+        # out_dim=32 (low-dim `mask_feat` for AdaPG / EMA / scene-aware query)
+        # and feat_channels=48 (higher-dim `mask_feature` / `voxel_feats` used
+        # in the final dot product). Without this split, prototype refinement
+        # gradients couple directly to the dot-product space and fail to
+        # converge cleanly, which is the suspected cause of `coarse>final`
+        # (39.44>39.09) on the 256ch ablation.
+        self.proto_bottleneck = nn.Conv2d(
+            hidden_channels, proto_dim, kernel_size=1)
 
         # ── 3. AgnoPG: EMA bank ────────────────────────────────────────────
-        # Dim = hidden_channels, matching mask_feat dim (same convention as ProtoOcc
-        # where prototype_EMA_feat dim == cnn3d_decoder out_dim == mask_feat last dim).
-        self.prototype_EMA_feat = nn.Embedding(num_classes, hidden_channels)
+        # Dim = proto_dim, mirroring ProtoOcc PQD where the EMA bank lives in
+        # the cnn3d_decoder out_dim=32 prototype space, NOT in feat_channels.
+        # This is the dim-bottleneck part of the P0 alignment fix.
+        self.prototype_EMA_feat = nn.Embedding(num_classes, proto_dim)
         # Registered as buffer so it is saved / loaded with checkpoints.
         self.register_buffer('proto_first_flag', torch.ones(num_classes, dtype=torch.bool))
 
         # ── 4. Scene-Aware Query combination (mirrors ProtoOcc exactly) ───
+        # Aggs project from proto_dim (low-dim prototype space) to
+        # hidden_channels (query / dot-product space). This mirrors PQD's
+        # `Linear(32, feat_channels=48)` first layer.
         self.global_protoEMA_agg = nn.Sequential(
-            nn.Linear(hidden_channels, hidden_channels), nn.ReLU(inplace=True),
+            nn.Linear(proto_dim, hidden_channels), nn.ReLU(inplace=True),
             nn.Linear(hidden_channels, hidden_channels), nn.ReLU(inplace=True),
             nn.Linear(hidden_channels, hidden_channels))
         self.local_protoEMA_agg = nn.Sequential(
-            nn.Linear(hidden_channels, hidden_channels), nn.ReLU(inplace=True),
+            nn.Linear(proto_dim, hidden_channels), nn.ReLU(inplace=True),
             nn.Linear(hidden_channels, hidden_channels), nn.ReLU(inplace=True),
             nn.Linear(hidden_channels, hidden_channels))
         self.learnable_query  = nn.Embedding(num_classes, hidden_channels)
@@ -209,9 +226,16 @@ class ProtoMapHead(BaseModule):
                 with_cp=with_cp)
 
         # ── 6. Self-Attention ──────────────────────────────────────────────
+        # Match PQD: MultiheadAttention(dropout=0.1) + residual + LayerNorm.
+        # PQD's transformer uses `operation_order=['self_attn', 'norm']` (no
+        # FFN), so we intentionally do NOT add an FFN block here.
         self.self_attn      = nn.MultiheadAttention(hidden_channels, attn_heads,
+                                                     dropout=0.1,
                                                      batch_first=False)
         self.self_attn_norm = nn.LayerNorm(hidden_channels)
+        # Final post_norm before the mask head, mirrors PQD `forward_head`'s
+        # first line `decoder_out = self.post_norm(decoder_out)`.
+        self.post_norm      = nn.LayerNorm(hidden_channels)
 
         # ── 7. Mask embed (query -> embedding for dot product) ─────────────
         self.mask_embed = nn.Sequential(
@@ -294,47 +318,71 @@ class ProtoMapHead(BaseModule):
     # ──────────────────────────────────────────────────────────────────────
 
     def _cnn_proto_generator(self, bev_feat):
+        """Produce both PQD-style features from a BEV input.
+
+        Naming mirrors ProtoOcc PQD's two decoder inputs:
+          - `mask_feature` (hidden_channels): high-dim feature for the final
+            dot product. Equivalent to PQD's `voxel_feats` (48-dim CVF).
+          - `mask_feat` (proto_dim): low-dim feature for AdaPG pooling and
+            EMA bank. Equivalent to PQD's `mask_feat` input (32-dim from
+            cnn3d_decoder).
+        """
         if self.with_cp and self.training:
-            mask_feat = checkpoint(self.conv_layers, bev_feat)
+            mask_feature = checkpoint(self.conv_layers, bev_feat)
         else:
-            mask_feat = self.conv_layers(bev_feat)
-        coarse_pred = self.coarse_predictor(mask_feat)   # (B, K, H, W)
-        return mask_feat, coarse_pred
+            mask_feature = self.conv_layers(bev_feat)
+        coarse_pred = self.coarse_predictor(mask_feature)        # (B, K, H, W)
+        mask_feat = self.proto_bottleneck(mask_feature)          # (B, proto_dim, H, W)
+        return mask_feature, mask_feat, coarse_pred
 
     # ──────────────────────────────────────────────────────────────────────
     # Step 2 — AdaPG  (Scene-Adaptive Prototype Generator)
     # ──────────────────────────────────────────────────────────────────────
 
     def _adaPG(self, coarse_pred, mask_feat):
-        """Pool batch-shared local prototypes over confident map pixels.
+        """Pool batch-shared local prototypes over CONFIDENT map pixels.
 
-        For occ (mutually exclusive classes), ProtoOcc uses softmax argmax +
-        confidence filtering (exclude voxels where top-2 margin < 0.1).
-        For map (binary-independent classes), we use sigmoid > conf_thresh,
-        which is the direct equivalent for per-class binary prediction.
+        ProtoOcc PQD filters voxels by top-2 softmax margin
+        (`scores = 1 - (top1 - top2); vis_mask = scores >= 0.9`), keeping
+        only voxels where the model is confident about the assigned class
+        AND no competing class is close.
 
-        Operates batch-level (all samples pooled together), following the
-        same convention as ProtoOcc's Prototype_Query_Decoder_nuScenes.
+        For map's per-class sigmoid (classes can overlap, so top-2 margin
+        does not directly apply), we approximate the same design intent
+        with a per-class threshold `prototype_mining_thresh` (default 0.7)
+        — keeping only pixels well inside the positive side of the sigmoid
+        decision boundary. This is NOT strictly equivalent (it cannot
+        exclude pixels where multiple classes simultaneously fire high),
+        but it carries the same intent of "use only high-confidence pixels
+        for the prototype pool".
+
+        Pools in proto_dim space (low-dim bottleneck `mask_feat`), NOT in
+        hidden_channels (`mask_feature`). Mirrors PQD where AdaPG pools
+        from the 32-dim `mask_feat` input.
 
         Returns:
-            for_query: (num_classes, hidden_channels)
+            for_query: (num_classes, proto_dim)
             valid_mask: (num_classes,)
         """
-        soft_masks     = torch.sigmoid(coarse_pred)        # (B, K, H, W)
-        mask_feat_perm = mask_feat.permute(0, 2, 3, 1)    # (B, H, W, C)
+        soft_masks     = torch.sigmoid(coarse_pred)            # (B, K, H, W)
+        mask_feat_perm = mask_feat.permute(0, 2, 3, 1)         # (B, H, W, proto_dim)
         zero_proto = mask_feat.sum(dim=(0, 2, 3)) * 0.0
 
         for_query = []
         valid_mask = []
         for k in range(self.num_classes):
-            conf_mask = soft_masks[:, k] > self.conf_thresh  # (B, H, W)
+            # Stricter confidence filter, approximates PQD's `~vis_mask`
+            # voxel filter under sigmoid supervision. Falls back to a
+            # `valid=False` zero prototype when no pixels qualify (sparse
+            # classes early in training).
+            conf_mask = soft_masks[:, k] > self.prototype_mining_thresh
             if conf_mask.sum() == 0:
                 proto = zero_proto
                 valid = False
             else:
-                proto = mask_feat_perm[conf_mask].mean(0)    # (C,)
+                proto = mask_feat_perm[conf_mask].mean(0)      # (proto_dim,)
                 valid = True
-            for_query.append(proto.unsqueeze(0))             # (1, C)
+            for_query.append(proto.unsqueeze(0))                # (1, proto_dim)
             valid_mask.append(valid)
         return (
             torch.cat(for_query, dim=0),
@@ -347,12 +395,14 @@ class ProtoMapHead(BaseModule):
         they exist. Prediction confidence only reweights GT-positive pixels and
         is detached to avoid shortcut gradients through the pooling weights.
 
+        Pools in proto_dim space (matches `_adaPG`).
+
         Returns:
-            for_query: (num_classes, hidden_channels)
+            for_query: (num_classes, proto_dim)
             valid_mask: (num_classes,)
         """
-        prob = torch.sigmoid(coarse_pred).detach()         # (B, K, H, W)
-        feat = mask_feat.permute(0, 2, 3, 1)              # (B, H, W, C)
+        prob = torch.sigmoid(coarse_pred).detach()              # (B, K, H, W)
+        feat = mask_feat.permute(0, 2, 3, 1)                    # (B, H, W, proto_dim)
         gt = gt_masks_bev.to(device=mask_feat.device, dtype=feat.dtype)
         zero_proto = mask_feat.sum(dim=(0, 2, 3)) * 0.0
 
@@ -429,34 +479,58 @@ class ProtoMapHead(BaseModule):
     # Step 4 — Scene-Aware Query synthesis
     # ──────────────────────────────────────────────────────────────────────
 
-    def _scene_aware_queries(self, for_query, ema_query):
+    def _scene_aware_queries(self, for_query, ema_query, valid_mask):
         """Combine enabled query sources into batch-shared scene-aware queries.
 
-        Exactly mirrors ProtoOcc:
+        Mirrors ProtoOcc PQD:
             query_feat = learnable_query
                        + global_protoEMA_agg(ema_query)
                        + local_protoEMA_agg(for_query)
             query_feat = for_query_embed(query_feat)
 
+        `for_query` and `ema_query` live in proto_dim space; aggs project
+        them up to hidden_channels, which is the query / dot-product space.
+
+        Map-specific safeguards (NOT in PQD): under per-class sigmoid +
+        a 0.7 threshold, sparse classes (ped_crossing, stop_line, divider)
+        can go many iterations without any pixel passing the filter. Two
+        contamination paths arise:
+          - EMA bank rows whose class has never been initialized still hold
+            random `nn.Embedding` init values; feeding them through
+            `global_protoEMA_agg` injects pure noise into the query.
+          - For classes that are uninitialized this iteration, `for_query`
+            is zero, so `local_protoEMA_agg(0)` is just the layer's bias —
+            also noise rather than signal.
+        Mask both contributions per-class so uninitialized classes fall
+        back cleanly to `learnable_query` only. PQD does not need this
+        because softmax + dense occ classes virtually always produce
+        confident voxels.
+
         Returns:
             query_feat: (num_classes, hidden_channels)
         """
-        query_feat = for_query.new_zeros(for_query.shape)
+        query_feat = for_query.new_zeros(
+            (for_query.shape[0], self.hidden_channels))
 
         if self.use_learnable_query:
             query_feat = query_feat + self.learnable_query.weight
 
         if self.use_ema_bank:
             if self.with_cp and self.training:
-                query_feat = query_feat + checkpoint(self.global_protoEMA_agg, ema_query)
+                ema_contrib = checkpoint(self.global_protoEMA_agg, ema_query)
             else:
-                query_feat = query_feat + self.global_protoEMA_agg(ema_query)
+                ema_contrib = self.global_protoEMA_agg(ema_query)
+            ema_init_mask = (~self.proto_first_flag).to(ema_contrib.dtype).unsqueeze(-1)
+            query_feat = query_feat + ema_contrib * ema_init_mask
 
         if self.use_scene_adaptive:
             if self.with_cp and self.training:
-                query_feat = query_feat + checkpoint(self.local_protoEMA_agg, for_query)
+                local_contrib = checkpoint(self.local_protoEMA_agg, for_query)
             else:
-                query_feat = query_feat + self.local_protoEMA_agg(for_query)
+                local_contrib = self.local_protoEMA_agg(for_query)
+            local_valid = valid_mask.to(
+                device=local_contrib.device, dtype=local_contrib.dtype).unsqueeze(-1)
+            query_feat = query_feat + local_contrib * local_valid
 
         if self.with_cp and self.training:
             return checkpoint(self.for_query_embed, query_feat)
@@ -466,25 +540,30 @@ class ProtoMapHead(BaseModule):
     # Step 5 — Optional Prototype-Grounded BEV Refinement
     # ──────────────────────────────────────────────────────────────────────
 
-    def _apply_pgbr(self, mask_feat, query_feat):
+    def _apply_pgbr(self, mask_feature, query_feat):
         if self.pgbr_refiner is None:
-            return mask_feat
-        return self.pgbr_refiner(mask_feat, query_feat)
+            return mask_feature
+        return self.pgbr_refiner(mask_feature, query_feat)
 
     # ──────────────────────────────────────────────────────────────────────
     # Steps 6-7 — Self-Attention + Dot Product
     # ──────────────────────────────────────────────────────────────────────
 
-    def _forward_head(self, query_feat, mask_feat):
-        """Self-attention among class queries then dot product with mask_feat.
+    def _forward_head(self, query_feat, mask_feature):
+        """Self-attention among class queries then dot product with mask_feature.
+
+        Mirrors PQD `forward_head(decoder_out, mask_feature)` exactly:
+        post_norm -> mask_embed MLP -> einsum with the high-dim feature
+        (analog of PQD's `voxel_feats`, called `mask_feature` inside its
+        `forward_head`).
 
         Args:
-            query_feat: (num_classes, hidden_channels)  — batch-shared query
-            mask_feat:  (B, hidden_channels, H, W)
+            query_feat:   (num_classes, hidden_channels)  — batch-shared query
+            mask_feature: (B, hidden_channels, H, W)
         Returns:
             final_masks: (B, num_classes, H, W)
         """
-        B, C, H, W = mask_feat.shape
+        B, C, H, W = mask_feature.shape
 
         # Expand to (K, B, C) — MultiheadAttention default (seq, batch, dim)
         q = query_feat.unsqueeze(1).expand(-1, B, -1)   # (K, B, C)
@@ -492,12 +571,15 @@ class ProtoMapHead(BaseModule):
             attn_out, _ = self.self_attn(q, q, q)
             q = self.self_attn_norm(q + attn_out)        # (K, B, C)
 
+        # Final post_norm before mask_embed, mirrors PQD `forward_head`'s
+        # first line `decoder_out = self.post_norm(decoder_out)`.
+        q = self.post_norm(q)
+
         # Dot product: einsum mirrors ProtoOcc's forward_head
         # mask_embed: (K, B, C) -> (B, K, C)
         q = q.permute(1, 0, 2)                           # (B, K, C)
         mask_embed  = self.mask_embed(q)                 # (B, K, C)
-        # mask_feat already (B, C, H, W); einsum equivalent to bmm
-        final_masks = torch.einsum('bkc,bchw->bkhw', mask_embed, mask_feat)
+        final_masks = torch.einsum('bkc,bchw->bkhw', mask_embed, mask_feature)
         return final_masks                               # (B, K, H, W)
 
     # ──────────────────────────────────────────────────────────────────────
@@ -513,10 +595,12 @@ class ProtoMapHead(BaseModule):
             coarse_pred : (B, num_classes, H, W)
             final_masks : (B, num_classes, H, W)
         """
-        # 1. CNN → mask_feat + coarse_pred
-        mask_feat, coarse_pred = self._cnn_proto_generator(bev_feat)
+        # 1. CNN → mask_feature (hidden, dot-product feat = PQD `voxel_feats`)
+        #         + mask_feat (proto_dim, prototype-pool feat = PQD `mask_feat`)
+        #         + coarse_pred
+        mask_feature, mask_feat, coarse_pred = self._cnn_proto_generator(bev_feat)
 
-        # 2. AdaPG — batch-shared local prototype
+        # 2. AdaPG — batch-shared local prototype, pooled in proto_dim space
         if (self.training and gt_masks_bev is not None
                 and self.prototype_mining_mode in ('gt_hard', 'gt_soft')):
             for_query, valid_mask = self._gt_guided_adaPG(
@@ -527,14 +611,16 @@ class ProtoMapHead(BaseModule):
         # 3. AgnoPG — update EMA, get global prototype
         ema_query = self._agno_PG_update_and_get(for_query, valid_mask)
 
-        # 4. Scene-Aware Query: learnable + global + local
-        query_feat = self._scene_aware_queries(for_query, ema_query)
+        # 4. Scene-Aware Query: learnable + global + local (with per-class
+        #    masking so uninitialized EMA / invalid local rows do not pollute
+        #    the query for sparse classes).
+        query_feat = self._scene_aware_queries(for_query, ema_query, valid_mask)
 
         # 5. Optional PGBR submodule. Canonical configs leave this as identity.
-        refined_mask_feat = self._apply_pgbr(mask_feat, query_feat)
+        refined_mask_feature = self._apply_pgbr(mask_feature, query_feat)
 
         # 6-7. Self-attention + dot product → final masks
-        final_masks = self._forward_head(query_feat, refined_mask_feat)
+        final_masks = self._forward_head(query_feat, refined_mask_feature)
 
         return coarse_pred, final_masks
 

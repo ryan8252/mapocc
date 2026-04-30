@@ -242,7 +242,6 @@ model = dict(
         num_classes=len(map_classes),           # 6
         num_convs=2,
         attn_heads=8,
-        conf_thresh=0.5,
         ema_weight=0.01,
         prototype_mining_mode='pred_threshold',
         prototype_mining_alpha=0.5,
