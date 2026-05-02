@@ -1,10 +1,10 @@
 # ProtoOcc 多任務實驗結果整理
 
-日期：2026-04-29
+日期：2026-05-02
 
 ## 實驗摘要
 
-目前整理九組主要訓練結果，另補 output ablation：
+目前整理十組主要訓練結果，另補 output ablation：
 
 | 實驗 | Config | Checkpoint | Occ mIoU | Map mIoU |
 | --- | --- | --- | ---: | ---: |
@@ -15,6 +15,7 @@
 | ProtoMapHead canonical (no PGBR) | `projects/configs/ProtoOcc/ProtoOcc_proto_map_head.py` | `work_dirs/ProtoOcc_proto_map_head_TWCC/epoch_24.pth` | 37.61 | 32.95 |
 | ProtoMapHead + 128ch map neck (no PGBR) | `projects/configs/ProtoOcc/ProtoOcc_proto_map_head_map_neck.py` | `work_dirs/ProtoOcc_proto_map_head_map_neck_no_pgbr_TWCC/epoch_24.pth` | 37.04 | 37.14 |
 | ProtoMapHead + 128ch map neck (no PGBR, EMA) | `projects/configs/ProtoOcc/ProtoOcc_proto_map_head_map_neck.py` | `work_dirs/ProtoOcc_proto_map_head_map_neck_no_pgbr_TWCC/epoch_24_ema.pth` | 39.71 | 39.02 |
+| ProtoMapHead + 128ch map neck PQD-align (EMA) | `projects/configs/ProtoOcc/ProtoOcc_proto_map_head_map_neck.py` | `work_dirs/ProtoOcc_proto_map_head_map_neck_pqd_align/epoch_24_ema.pth` | 39.78 | 38.75 |
 | ProtoMapHead + 128ch map neck GT-soft (EMA) | `projects/configs/ProtoOcc/ProtoOcc_proto_map_head_map_neck_gt_soft.py` | `work_dirs/ProtoOcc_proto_map_head_map_neck_gt_soft/epoch_24_ema.pth` | 39.52 | 32.40 |
 | ProtoMapHead + 256ch map neck (no PGBR, EMA) | `projects/configs/ProtoOcc/ProtoOcc_proto_map_head_map_neck_256.py` | `work_dirs/ProtoOcc_proto_map_head_map_neck_256/epoch_24_ema.pth` | 39.76 | 39.09 |
 
@@ -38,6 +39,8 @@
 | ProtoMapHead no PGBR, epoch 24 | 72.14 | 24.52 | 38.44 | 15.22 | 25.88 | 21.50 | 32.95 |
 | ProtoMapHead + 128ch map neck no PGBR, epoch 24 | 73.97 | 28.29 | 41.91 | 18.96 | 33.71 | 26.00 | 37.14 |
 | ProtoMapHead + 128ch map neck no PGBR, epoch 24 EMA | 75.43 | 30.50 | 44.55 | 20.54 | 35.47 | 27.62 | 39.02 |
+| ProtoMapHead + 128ch map neck PQD-align, epoch 24 EMA (final) | 75.82 | 31.19 | 44.17 | 20.55 | 33.12 | 27.63 | 38.75 |
+| ProtoMapHead + 128ch map neck PQD-align, epoch 24 EMA (coarse) | 75.89 | 31.45 | 44.48 | 20.47 | 34.10 | 27.69 | 39.01 |
 | ProtoMapHead + 128ch map neck GT-soft, epoch 24 EMA | 47.60 | 29.50 | 39.57 | 17.35 | 36.43 | 23.96 | 32.40 |
 | ProtoMapHead + 256ch map neck no PGBR, epoch 24 EMA (final) | 74.52 | 32.10 | 45.03 | 21.30 | 33.51 | 28.05 | 39.09 |
 | ProtoMapHead + 256ch map neck no PGBR, epoch 24 EMA (coarse) | 76.15 | 32.47 | 45.30 | 20.92 | 33.67 | 28.15 | 39.44 |
@@ -47,26 +50,26 @@
 
 ## Occupancy 分類結果
 
-| Class | Naive MTL CNN epoch 15 | CNN head + 128ch neck epoch 24 EMA | ProtoMapHead no PGBR epoch 17 | ProtoMapHead no PGBR epoch 24 | 128ch map neck epoch 24 | 128ch map neck epoch 24 EMA | 128ch map neck GT-soft epoch 24 EMA | 256ch map neck epoch 24 EMA |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| others | 6.94 | 12.17 | 9.91 | 10.65 | 11.61 | 12.05 | 12.31 | 12.05 |
-| barrier | 40.92 | 47.95 | 43.87 | 43.87 | 44.59 | 47.73 | 47.62 | 48.24 |
-| bicycle | 22.10 | 26.34 | 21.36 | 21.52 | 23.51 | 25.81 | 25.12 | 24.88 |
-| bus | 39.19 | 44.81 | 42.05 | 43.31 | 36.46 | 44.52 | 44.52 | 44.20 |
-| car | 45.96 | 51.91 | 49.63 | 50.54 | 49.01 | 51.95 | 51.94 | 51.84 |
-| construction_vehicle | 20.82 | 23.47 | 20.65 | 20.87 | 20.39 | 22.86 | 22.98 | 23.48 |
-| motorcycle | 22.49 | 26.54 | 22.58 | 26.05 | 25.26 | 26.89 | 26.43 | 26.40 |
-| pedestrian | 23.40 | 27.64 | 26.59 | 25.29 | 25.79 | 27.10 | 27.84 | 27.85 |
-| traffic_cone | 22.58 | 28.26 | 25.84 | 26.66 | 26.04 | 28.26 | 27.49 | 28.09 |
-| trailer | 29.35 | 33.31 | 28.32 | 31.72 | 29.20 | 31.50 | 32.09 | 32.98 |
-| truck | 34.25 | 37.16 | 34.81 | 35.60 | 33.34 | 37.12 | 37.03 | 37.20 |
-| driveable_surface | 75.42 | 81.92 | 80.10 | 81.01 | 81.30 | 82.28 | 81.82 | 82.18 |
-| other_flat | 26.28 | 46.13 | 41.83 | 42.78 | 43.57 | 46.59 | 45.90 | 46.45 |
-| sidewalk | 40.90 | 53.28 | 50.24 | 51.17 | 51.80 | 53.66 | 52.78 | 53.46 |
-| terrain | 42.80 | 56.46 | 53.41 | 53.05 | 54.58 | 56.44 | 56.47 | 56.63 |
-| manmade | 33.44 | 42.89 | 40.27 | 40.87 | 38.03 | 43.51 | 42.67 | 42.97 |
-| vegetation | 26.34 | 36.67 | 33.63 | 34.37 | 35.14 | 36.86 | 36.78 | 37.06 |
-| mIoU | 32.54 | 39.82 | 36.77 | 37.61 | 37.04 | 39.71 | 39.52 | 39.76 |
+| Class | Naive MTL CNN epoch 15 | CNN head + 128ch neck epoch 24 EMA | ProtoMapHead no PGBR epoch 17 | ProtoMapHead no PGBR epoch 24 | 128ch map neck epoch 24 | 128ch map neck epoch 24 EMA | 128ch map neck PQD-align epoch 24 EMA | 128ch map neck GT-soft epoch 24 EMA | 256ch map neck epoch 24 EMA |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| others | 6.94 | 12.17 | 9.91 | 10.65 | 11.61 | 12.05 | 12.34 | 12.31 | 12.05 |
+| barrier | 40.92 | 47.95 | 43.87 | 43.87 | 44.59 | 47.73 | 47.90 | 47.62 | 48.24 |
+| bicycle | 22.10 | 26.34 | 21.36 | 21.52 | 23.51 | 25.81 | 24.98 | 25.12 | 24.88 |
+| bus | 39.19 | 44.81 | 42.05 | 43.31 | 36.46 | 44.52 | 44.58 | 44.52 | 44.20 |
+| car | 45.96 | 51.91 | 49.63 | 50.54 | 49.01 | 51.95 | 52.06 | 51.94 | 51.84 |
+| construction_vehicle | 20.82 | 23.47 | 20.65 | 20.87 | 20.39 | 22.86 | 24.50 | 22.98 | 23.48 |
+| motorcycle | 22.49 | 26.54 | 22.58 | 26.05 | 25.26 | 26.89 | 26.35 | 26.43 | 26.40 |
+| pedestrian | 23.40 | 27.64 | 26.59 | 25.29 | 25.79 | 27.10 | 27.84 | 27.84 | 27.85 |
+| traffic_cone | 22.58 | 28.26 | 25.84 | 26.66 | 26.04 | 28.26 | 27.79 | 27.49 | 28.09 |
+| trailer | 29.35 | 33.31 | 28.32 | 31.72 | 29.20 | 31.50 | 32.23 | 32.09 | 32.98 |
+| truck | 34.25 | 37.16 | 34.81 | 35.60 | 33.34 | 37.12 | 36.63 | 37.03 | 37.20 |
+| driveable_surface | 75.42 | 81.92 | 80.10 | 81.01 | 81.30 | 82.28 | 82.15 | 81.82 | 82.18 |
+| other_flat | 26.28 | 46.13 | 41.83 | 42.78 | 43.57 | 46.59 | 46.56 | 45.90 | 46.45 |
+| sidewalk | 40.90 | 53.28 | 50.24 | 51.17 | 51.80 | 53.66 | 53.34 | 52.78 | 53.46 |
+| terrain | 42.80 | 56.46 | 53.41 | 53.05 | 54.58 | 56.44 | 56.93 | 56.47 | 56.63 |
+| manmade | 33.44 | 42.89 | 40.27 | 40.87 | 38.03 | 43.51 | 43.03 | 42.67 | 42.97 |
+| vegetation | 26.34 | 36.67 | 33.63 | 34.37 | 35.14 | 36.86 | 37.05 | 36.78 | 37.06 |
+| mIoU | 32.54 | 39.82 | 36.77 | 37.61 | 37.04 | 39.71 | 39.78 | 39.52 | 39.76 |
 
 ## 主要比較
 
@@ -87,6 +90,49 @@ Map 各類差異：
 | stop_line | 20.54 | 21.30 | +0.76 |
 | carpark_area | 35.47 | 33.51 | -1.96 |
 | divider | 27.62 | 28.05 | +0.43 |
+
+### ProtoMapHead PQD-align EMA vs 舊 128ch map neck EMA
+
+`pqd_align` 是把 ProtoMapHead 的 prototype 空間對齊 ProtoOcc PQD 後重新訓練的 128ch map neck 版本。測試使用 final output。
+
+| 指標 | 舊 128ch map neck EMA | PQD-align EMA | 差異 |
+| --- | ---: | ---: | ---: |
+| Occ mIoU | 39.71 | 39.78 | +0.07 |
+| Map mIoU | 39.02 | 38.75 | -0.27 |
+
+Map 各類差異：
+
+| Class | 舊 128ch map neck EMA | PQD-align EMA | 差異 |
+| --- | ---: | ---: | ---: |
+| drivable_area | 75.43 | 75.82 | +0.39 |
+| ped_crossing | 30.50 | 31.19 | +0.69 |
+| walkway | 44.55 | 44.17 | -0.38 |
+| stop_line | 20.54 | 20.55 | +0.01 |
+| carpark_area | 35.47 | 33.12 | -2.35 |
+| divider | 27.62 | 27.63 | +0.01 |
+
+PQD-align 沒有傷到 occupancy，Occ mIoU 小幅高於舊 128ch EMA，也高於原始 ProtoOcc R50 的 39.56。但 Map 沒有突破舊版，主要退步集中在 `carpark_area` -2.35；其他類別大多持平或小幅上升。這表示 PQD 對齊修掉了一部分 prototype 空間問題，但沒有解決 map branch 的主要瓶頸。
+
+### ProtoMapHead PQD-align EMA coarse vs final output
+
+這是同一個 `ProtoOcc_proto_map_head_map_neck.py` pqd_align epoch 24 EMA checkpoint 的 output ablation。`final` 是 prototype refinement 後輸出；`coarse` 是 map coarse branch 直接輸出。
+
+| 指標 | final output | coarse output | 差異 |
+| --- | ---: | ---: | ---: |
+| Map mIoU | 38.75 | 39.01 | +0.26 |
+
+Map 各類差異：
+
+| Class | final output | coarse output | 差異 |
+| --- | ---: | ---: | ---: |
+| drivable_area | 75.82 | 75.89 | +0.06 |
+| ped_crossing | 31.19 | 31.45 | +0.26 |
+| walkway | 44.17 | 44.48 | +0.30 |
+| stop_line | 20.55 | 20.47 | -0.07 |
+| carpark_area | 33.12 | 34.10 | +0.98 |
+| divider | 27.63 | 27.69 | +0.05 |
+
+PQD-align epoch 24 仍然是 coarse output 略高於 final output（+0.26 mIoU）。Final 只在 `stop_line` 小幅較好（+0.07），但 `carpark_area` 低於 coarse 0.98。這和舊 256ch ablation 的方向一致：prototype refinement 在後期沒有穩定帶來正貢獻，尤其會壓低部分大面積/區塊類別。
 
 ### ProtoMapHead + 256ch map neck EMA coarse vs final output
 
@@ -266,29 +312,40 @@ Map 各類差異（map-only minus MTL）：
 
 8. Map 在 MTL 設定下的主要瓶頸是線狀類別：`stop_line` 約 20-21，`divider` 約 27-28，`ped_crossing` 約 30-32；map-only 設定下這些類別分別提升至 33.62 / 35.43 / 44.58，確認瓶頸主要來自 MTL 梯度衝突，而非架構能力上限。
 
-9. PGBR ablation 目前沒有改善 map，反而讓 Occ / Map 都下降。GT-soft epoch 24 EMA 也沒有改善 final map output：Occ 幾乎持平（39.52 vs 39.71），但 Map 從 39.02 掉到 32.40，主要是 `drivable_area` 大幅下降。下一步不應把目前這版 GT-soft 直接當主線，而要先診斷 train-test mismatch 和 probability calibration。
+9. PQD-align epoch 24 EMA 達到 Occ 39.78 / Map 38.75。Occ 小幅高於舊 128ch EMA 的 39.71，但 Map 低 0.27，主要由 `carpark_area` -2.35 造成。這表示 PQD 對齊沒有造成 occupancy 退化，也修掉一部分 prototype 空間問題，但仍沒有讓 ProtoMapHead 超越 CNN head + 128ch map neck 的 39.94。
 
-10. Coarse/final output ablation 已顯示 coarse output 高於 final output（39.44 vs 39.09）。Prototype refinement 目前只改善 `stop_line`，但壓低 `drivable_area`。GT-soft final output 又出現所有 map 類別 `iou@max` 都在 threshold 0.35 的現象，因此後續不應直接假設 final mask 是最佳輸出，應測 coarse-only、coarse+final fusion 或 class-wise selection。
+10. PGBR ablation 目前沒有改善 map，反而讓 Occ / Map 都下降。GT-soft epoch 24 EMA 也沒有改善 final map output：Occ 幾乎持平（39.52 vs 39.71），但 Map 從 39.02 掉到 32.40，主要是 `drivable_area` 大幅下降。下一步不應把目前這版 GT-soft 直接當主線，而要先診斷 train-test mismatch 和 probability calibration。
 
-11. 目前最強證據支持的是 map-specific feature branch + 減少 MTL 梯度衝突：map-only 48.34 >> CNN head + 128ch neck MTL EMA 39.94 >> ProtoMapHead + 256ch neck EMA coarse 39.44。Prototype refinement 本身的貢獻目前無法和 MTL 損耗區分，需要在 map-only 設定下重測才能公平評估。
+11. Coarse/final output ablation 顯示兩個 epoch 24 EMA checkpoint 都是 coarse output 高於 final output：256ch 舊版為 39.44 vs 39.09（+0.36），128ch PQD-align 為 39.01 vs 38.75（+0.26）。Prototype refinement 目前只穩定保住或小幅改善 `stop_line`，但會壓低 `drivable_area` 或 `carpark_area` 等區塊類別，因此後續不應直接假設 final mask 是最佳輸出，應測 coarse-only、coarse+final fusion 或 class-wise selection。
+
+12. 目前最強證據支持的是 map-specific feature branch + 減少 MTL 梯度衝突：map-only 48.34 >> CNN head + 128ch neck MTL EMA 39.94 > ProtoMapHead + 256ch neck EMA coarse 39.44 > ProtoMapHead + 128ch PQD-align coarse 39.01。Prototype refinement 本身的貢獻目前仍不足，需要在 map-only 設定下重測才能公平評估。
 
 ## 建議下一步實驗
 
-1. 補測 `ProtoOcc_proto_map_head_map_neck_256.py` 的 `epoch_24.pth`：
-   - 目前 256ch EMA 只比 128ch EMA 微幅提升，需要 non-EMA 結果確認 256ch 本身的效果，避免把 EMA 差異誤判成 channel 差異。
-
-2. 繼續測 `ProtoMapHead` 的 coarse+final 融合：
-   - coarse-only / final-only 已測，coarse output 39.44 高於 final output 39.09。
-   - Final output 只在 `stop_line` 較好；後續可測 class-wise fusion，例如大面積類別用 coarse，線狀類別嘗試 final 或 weighted ensemble。
-   - GT-soft checkpoint 也應補測 coarse-only，確認 32.40 是 final prototype refinement 的問題，還是 coarse map prediction 本身已退化。
-
-3. 診斷 GT-soft prototype mining：
-   - 目前 GT-soft epoch 24 EMA 結果是 Occ 39.52 / Map 32.40，final map output 明顯低於 no-GT-soft EMA 的 39.02。
-   - 所有 map 類別最佳 IoU 都在 threshold 0.35，應檢查 probability histogram、coarse/final logit scale，以及 inference 時 prediction/EMA prototype fallback 是否和 training-time GT support 不一致。
-
-4. 繼續改進 map-specific BEV branch：
+1. 繼續改進 map-specific BEV branch：
    - 128ch branch 已證實比直接使用 48-channel shared `bev_feature` 更適合 map segmentation。
    - CNN head + 128ch map neck 已是目前 best，後續若要改 branch，應優先測 detach map feature 或更強的 map feature fusion，而不是只繼續加 channel。
 
-5. 保護 occupancy 主任務：
+2. 保護 occupancy 主任務：
    - 目前 CNN head + 128ch map neck EMA 已可讓 Occ 達到 39.82，後續目標是保持 Occ 不低於原始 ProtoOcc 39.56，再逐步提升 Map。
+
+
+## 目前試過但沒有用的方法
+
+1. 補測 `ProtoOcc_proto_map_head_map_neck_256.py` 的 `epoch_24.pth`：
+   - ema 一定比較好 不用去測non-EMA
+   - 目前 256ch EMA 只比 128ch EMA 微幅提升，需要 non-EMA 結果確認 256ch 本身的效果，避免把 EMA 差異誤判成 channel 差異。
+
+
+2. 繼續測 `ProtoMapHead` 的 coarse+final 融合：
+   - 結論 通常coarse output 比較好 ProtoMapHead屁用沒有
+   - 256ch 舊版 coarse output 39.44 高於 final output 39.09；128ch PQD-align coarse output 39.01 高於 final output 38.75。
+   - Final output 主要只在 `stop_line` 較好；後續可測 class-wise fusion，例如大面積類別用 coarse，線狀類別嘗試 final 或 weighted ensemble。
+   - GT-soft checkpoint 也應補測 coarse-only，確認 32.40 是 final prototype refinement 的問題，還是 coarse map prediction 本身已退化。
+
+3. 診斷 GT-soft prototype mining：
+   - 結論 根據smoke test 一開始訓練的時候 的確有比較多的prototype可以抓到 但是在做推論的時候沒有了GT的支持 反而都抓不到prototype 推論結果很差
+   - 目前 GT-soft epoch 24 EMA 結果是 Occ 39.52 / Map 32.40，final map output 明顯低於 no-GT-soft EMA 的 39.02。
+   - 所有 map 類別最佳 IoU 都在 threshold 0.35，應檢查 probability histogram、coarse/final logit scale，以及 inference 時 prediction/EMA prototype fallback 是否和 training-time GT support 不一致。
+   
+
