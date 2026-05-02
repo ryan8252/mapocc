@@ -272,3 +272,42 @@ P0 修完後,ProtoMapHead 內 `mask_feat` (hidden 96, dot product) 跟 `proto_fe
 1. Smoke test 1~2 epoch,iter 印 log 看每 class 過 `prototype_mining_thresh=0.7` 的 pixel 數,跟 `proto_first_flag` 何時 flip 成 False
 2. 如果 sparse 類前幾百 iter 大量 invalid → 可考慮 threshold ramp-up (0.5 → 0.7) 或前 N iter 走 `gt_hard` 預熱 EMA
 3. 修完上面幾項後再跑完整 24 epoch 對照 baseline
+
+#### Smoke test 實作方式
+
+`ProtoMapHead` 內已加 debug 開關,預設關閉。跑 smoke test 時用 CLI 覆寫打開:
+
+```bash
+cd Ryan/ProtoOcc
+
+PYTHONPATH=. python tools/train.py projects/configs/ProtoOcc/ProtoOcc_proto_map_head_map_neck.py \
+  --work-dir work_dirs/proto_map_head_smoke_debug \
+  --cfg-options \
+    runner.max_epochs=1 \
+    log_config.interval=20 \
+    model.proto_map_head.prototype_debug=True \
+    model.proto_map_head.prototype_debug_interval=20
+```
+
+看 256ch map neck 就把 config 換成:
+
+```bash
+projects/configs/ProtoOcc/ProtoOcc_proto_map_head_map_neck_256.py
+```
+
+debug log 會寫進 `work_dirs/.../*.log`。`*.log.json` 只記 scalar metrics,不會有這種文字訊息。log 會長這樣:
+
+```text
+[ProtoMapHead debug] iter=20 mode=pred_threshold thresh=0.70 support_pixels=drivable_area=..., ped_crossing=..., walkway=..., stop_line=..., carpark_area=..., divider=... valid=drivable_area=1, ped_crossing=0, ... proto_first_flag_false=drivable_area,walkway flipped_this_iter=walkway
+```
+
+判讀重點:
+- `support_pixels`:該 iter/batch 每個 class 的「prototype 池貢獻 pixel 數」。語意隨 `mode` 切換:
+  - `pred_threshold`(預設):coarse sigmoid 超過 `prototype_mining_thresh` 的 pixel 數
+  - `gt_hard` / `gt_soft`(GT 預熱模式):GT-positive pixel 數(`gt_mask.sum()`)
+  log header 已印 `mode=...`,對照解讀即可
+- `valid`:該 class 這次有沒有 local prototype 可用
+- `flipped_this_iter`:該 iter 哪些 class 的 EMA row 第一次被初始化,也就是 `proto_first_flag` 從 True 變 False
+- `proto_first_flag_false`:目前已經初始化過 EMA 的 class
+
+如果 `ped_crossing` / `stop_line` / `divider` 幾百 iter 都是 `support_pixels=0`、`valid=0`、也沒有出現在 `proto_first_flag_false`,代表 0.7 對 early training 太硬,再考慮 threshold ramp-up 或 `gt_hard` 預熱。

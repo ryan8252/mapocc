@@ -1,3 +1,5 @@
+import logging
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -125,6 +127,9 @@ class ProtoMapHead(BaseModule):
                  use_bev_refinement=None,
                  refinement_temperature=1.0,
                  refinement_detach_query=True,
+                 prototype_debug=False,
+                 prototype_debug_interval=50,
+                 prototype_debug_class_names=None,
                  with_cp=False,
                  loss_coarse_bce=None,
                  loss_coarse_dice=None,
@@ -148,6 +153,30 @@ class ProtoMapHead(BaseModule):
         self.use_learnable_query = use_learnable_query
         self.use_query_self_attn = use_query_self_attn
         self.with_cp         = with_cp
+        self.prototype_debug = prototype_debug
+        self.prototype_debug_interval = max(1, int(prototype_debug_interval))
+        default_map_class_names = (
+            'drivable_area',
+            'ped_crossing',
+            'walkway',
+            'stop_line',
+            'carpark_area',
+            'divider',
+        )
+        if prototype_debug_class_names is None:
+            if num_classes == len(default_map_class_names):
+                prototype_debug_class_names = default_map_class_names
+            else:
+                prototype_debug_class_names = [
+                    f'class_{idx}' for idx in range(num_classes)]
+        if len(prototype_debug_class_names) != num_classes:
+            raise ValueError(
+                'ProtoMapHead prototype_debug_class_names length must match '
+                f'num_classes={num_classes}, but got '
+                f'{len(prototype_debug_class_names)}.')
+        self.prototype_debug_class_names = tuple(prototype_debug_class_names)
+        self._proto_debug_iter = 0
+        self._proto_debug_last_init_flag = None
 
         valid_mining_modes = ('pred_threshold', 'gt_hard', 'gt_soft')
         if self.prototype_mining_mode not in valid_mining_modes:
@@ -313,6 +342,79 @@ class ProtoMapHead(BaseModule):
             state_dict, prefix, local_metadata, strict,
             missing_keys, unexpected_keys, error_msgs)
 
+    def _is_rank0(self):
+        if not torch.distributed.is_available():
+            return True
+        if not torch.distributed.is_initialized():
+            return True
+        return torch.distributed.get_rank() == 0
+
+    def _sync_proto_debug_counts(self, counts):
+        counts = counts.detach().to(dtype=torch.long)
+        if (torch.distributed.is_available()
+                and torch.distributed.is_initialized()):
+            counts = counts.clone()
+            torch.distributed.all_reduce(
+                counts, op=torch.distributed.ReduceOp.SUM)
+        return counts.cpu()
+
+    def _format_proto_debug_values(self, values):
+        return ', '.join(
+            f'{name}={int(value)}'
+            for name, value in zip(
+                self.prototype_debug_class_names,
+                values.detach().cpu().tolist()))
+
+    def _format_proto_debug_names(self, mask):
+        mask = mask.detach().cpu().tolist()
+        names = [
+            name for name, enabled in zip(
+                self.prototype_debug_class_names, mask) if enabled]
+        return ','.join(names) if names else 'none'
+
+    def _log_proto_debug(self, support_counts, valid_mask):
+        if not (self.prototype_debug and self.training):
+            return
+
+        self._proto_debug_iter += 1
+        init_flag = self._proto_debug_last_init_flag
+        if init_flag is None:
+            init_flag = torch.zeros_like(valid_mask)
+        init_counts = self._sync_proto_debug_counts(init_flag)
+
+        has_flip = bool(init_counts.any().item())
+        should_log = (
+            self._proto_debug_iter == 1
+            or has_flip
+            or self._proto_debug_iter % self.prototype_debug_interval == 0)
+        if not should_log:
+            return
+
+        support_counts = self._sync_proto_debug_counts(support_counts)
+        initialized_counts = self._sync_proto_debug_counts(
+            (~self.proto_first_flag.detach()).to(dtype=torch.long))
+        if not self._is_rank0():
+            return
+
+        initialized_mask = initialized_counts > 0
+        valid_from_support = support_counts > 0
+        init_flag = init_counts > 0
+        message = (
+            '[ProtoMapHead debug] '
+            f'iter={self._proto_debug_iter} '
+            f'mode={self.prototype_mining_mode} '
+            f'thresh={self.prototype_mining_thresh:.2f} '
+            f'support_pixels={self._format_proto_debug_values(support_counts)} '
+            f'valid={self._format_proto_debug_values(valid_from_support.long())} '
+            'proto_first_flag_false='
+            f'{self._format_proto_debug_names(initialized_mask)} '
+            f'flipped_this_iter={self._format_proto_debug_names(init_flag)}')
+        logger = logging.getLogger('mmdet')
+        if logger.handlers:
+            logger.info(message)
+        else:
+            print(message, flush=True)
+
     # ──────────────────────────────────────────────────────────────────────
     # Step 1 — CNN Proto Generator
     # ──────────────────────────────────────────────────────────────────────
@@ -363,6 +465,7 @@ class ProtoMapHead(BaseModule):
         Returns:
             for_query: (num_classes, proto_dim)
             valid_mask: (num_classes,)
+            support_counts: (num_classes,)
         """
         soft_masks     = torch.sigmoid(coarse_pred)            # (B, K, H, W)
         mask_feat_perm = mask_feat.permute(0, 2, 3, 1)         # (B, H, W, proto_dim)
@@ -370,23 +473,26 @@ class ProtoMapHead(BaseModule):
 
         for_query = []
         valid_mask = []
+        support_counts = []
         for k in range(self.num_classes):
             # Stricter confidence filter, approximates PQD's `~vis_mask`
             # voxel filter under sigmoid supervision. Falls back to a
             # `valid=False` zero prototype when no pixels qualify (sparse
             # classes early in training).
             conf_mask = soft_masks[:, k] > self.prototype_mining_thresh
-            if conf_mask.sum() == 0:
-                proto = zero_proto
-                valid = False
-            else:
+            support = conf_mask.sum()
+            valid = bool(support.item() > 0)
+            if valid:
                 proto = mask_feat_perm[conf_mask].mean(0)      # (proto_dim,)
-                valid = True
+            else:
+                proto = zero_proto
             for_query.append(proto.unsqueeze(0))                # (1, proto_dim)
             valid_mask.append(valid)
+            support_counts.append(support.detach().unsqueeze(0))
         return (
             torch.cat(for_query, dim=0),
-            torch.tensor(valid_mask, dtype=torch.bool, device=mask_feat.device))
+            torch.tensor(valid_mask, dtype=torch.bool, device=mask_feat.device),
+            torch.cat(support_counts, dim=0))
 
     def _gt_guided_adaPG(self, coarse_pred, mask_feat, gt_masks_bev):
         """Pool prototypes with GT support and optional confidence weighting.
@@ -400,6 +506,7 @@ class ProtoMapHead(BaseModule):
         Returns:
             for_query: (num_classes, proto_dim)
             valid_mask: (num_classes,)
+            support_counts: (num_classes,)
         """
         prob = torch.sigmoid(coarse_pred).detach()              # (B, K, H, W)
         feat = mask_feat.permute(0, 2, 3, 1)                    # (B, H, W, proto_dim)
@@ -408,6 +515,7 @@ class ProtoMapHead(BaseModule):
 
         for_query = []
         valid_mask = []
+        support_counts = []
         for k in range(self.num_classes):
             gt_mask = gt[:, k]
             if self.prototype_mining_mode == 'gt_hard':
@@ -426,10 +534,12 @@ class ProtoMapHead(BaseModule):
 
             for_query.append(proto.unsqueeze(0))
             valid_mask.append(valid)
+            support_counts.append(gt_mask.sum().detach().unsqueeze(0))
 
         return (
             torch.cat(for_query, dim=0),
-            torch.tensor(valid_mask, dtype=torch.bool, device=mask_feat.device))
+            torch.tensor(valid_mask, dtype=torch.bool, device=mask_feat.device),
+            torch.cat(support_counts, dim=0))
 
     # ──────────────────────────────────────────────────────────────────────
     # Step 3 — AgnoPG  (Scene-Agnostic Prototype Generator / EMA bank)
@@ -446,6 +556,10 @@ class ProtoMapHead(BaseModule):
             ema_query: (num_classes, hidden_channels)
         """
         if not self.use_ema_bank:
+            if self.prototype_debug:
+                self._proto_debug_last_init_flag = torch.zeros(
+                    for_query.shape[0], device=for_query.device,
+                    dtype=torch.bool)
             return for_query.new_zeros(for_query.shape)
 
         if valid_mask is None:
@@ -460,6 +574,8 @@ class ProtoMapHead(BaseModule):
 
                 # First-time init
                 init_flag = self.proto_first_flag & cur_assign_flag
+                if self.prototype_debug:
+                    self._proto_debug_last_init_flag = init_flag.detach().clone()
                 if init_flag.sum() > 0:
                     self.prototype_EMA_feat.weight.data[init_flag] = \
                         for_query[init_flag].detach()
@@ -472,6 +588,8 @@ class ProtoMapHead(BaseModule):
                         self.prototype_EMA_feat.weight[update_flag]
                         * (1 - self.ema_weight)
                         + for_query[update_flag].detach() * self.ema_weight)
+        elif self.prototype_debug:
+            self._proto_debug_last_init_flag = torch.zeros_like(valid_mask)
 
         return self.prototype_EMA_feat.weight   # (K, hidden_channels)
 
@@ -603,13 +721,15 @@ class ProtoMapHead(BaseModule):
         # 2. AdaPG — batch-shared local prototype, pooled in proto_dim space
         if (self.training and gt_masks_bev is not None
                 and self.prototype_mining_mode in ('gt_hard', 'gt_soft')):
-            for_query, valid_mask = self._gt_guided_adaPG(
+            for_query, valid_mask, support_counts = self._gt_guided_adaPG(
                 coarse_pred, mask_feat, gt_masks_bev)
         else:
-            for_query, valid_mask = self._adaPG(coarse_pred, mask_feat)
+            for_query, valid_mask, support_counts = self._adaPG(
+                coarse_pred, mask_feat)
 
         # 3. AgnoPG — update EMA, get global prototype
         ema_query = self._agno_PG_update_and_get(for_query, valid_mask)
+        self._log_proto_debug(support_counts, valid_mask)
 
         # 4. Scene-Aware Query: learnable + global + local (with per-class
         #    masking so uninitialized EMA / invalid local rows do not pollute
