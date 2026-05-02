@@ -311,3 +311,114 @@ debug log 會寫進 `work_dirs/.../*.log`。`*.log.json` 只記 scalar metrics,�
 - `proto_first_flag_false`:目前已經初始化過 EMA 的 class
 
 如果 `ped_crossing` / `stop_line` / `divider` 幾百 iter 都是 `support_pixels=0`、`valid=0`、也沒有出現在 `proto_first_flag_false`,代表 0.7 對 early training 太硬,再考慮 threshold ramp-up 或 `gt_hard` 預熱。
+
+### 7.7 Smoke test 結果紀錄 (2026-05-02)
+
+本節補記兩組 1 epoch smoke test 與 inference smoke。這裡的目的不是比較最終收斂 mIoU，而是確認 `ProtoMapHead` 的 prototype mining、EMA 初始化、loss path 與推論 contract 是否能正常跑完。
+
+#### 7.7.1 `pred_threshold` smoke
+
+- log: `work_dirs/proto_map_head_smoke_debug/20260502_030601.log`
+- mode: `pred_threshold`
+- threshold: `0.70`
+- debug interval: 每 20 iter 記一次，共 352 筆 debug sample
+- result: training 完成 1 epoch，存出 `epoch_1.pth` / `epoch_1_ema.pth` / `latest.pth`
+- stability: 無 crash / NaN / Inf / OOM
+- last train log: `loss=31.7193`, `grad_norm=33.2218`, memory `15061`
+- EMA init: iter=1 六個 map class 都有 `flipped_this_iter`，代表 prototype 不是沒有初始化
+
+| class | valid/total | zero pct | avg support | longest zero |
+| --- | ---: | ---: | ---: | --- |
+| drivable_area | 352/352 | 0.0% | 26193.3 | none |
+| ped_crossing | 52/352 | 85.2% | 30.0 | iter 140-5640 |
+| walkway | 305/352 | 13.4% | 2181.6 | iter 100-660 |
+| stop_line | 154/352 | 56.2% | 65.1 | iter 300-2180 |
+| carpark_area | 163/352 | 53.7% | 127.3 | iter 80-3180 |
+| divider | 224/352 | 36.4% | 238.4 | iter 140-2240 |
+
+Sparse class 的分段 valid/total:
+
+| iter range | ped_crossing | walkway | stop_line | carpark_area | divider |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1-1000 | 7/51 | 9/51 | 7/51 | 4/51 | 7/51 |
+| 1001-3000 | 0/100 | 95/100 | 14/100 | 0/100 | 23/100 |
+| 3001-5000 | 0/100 | 100/100 | 62/100 | 69/100 | 95/100 |
+| 5001-7020 | 45/101 | 101/101 | 71/101 | 90/101 | 99/101 |
+
+判讀:
+
+- EMA prototype 有初始化，不是「完全沒初始化」的問題。
+- `thresh=0.70` 對 early/mid training 的 sparse class 太硬，尤其 `ped_crossing` 在 iter 140-5640 之間連續沒有有效 support，代表 prototype 很長一段時間只能沿用早期 EMA。
+- `walkway` / `divider` 後半段逐步恢復，代表 prediction-based mining 本身能啟動，但 class-wise 難度差異很大。
+
+#### 7.7.2 `gt_hard` smoke
+
+- log: `work_dirs/proto_map_head_smoke_gt_hard/20260502_113639.log`
+- mode: `gt_hard`
+- debug interval: 每 20 iter 記一次，共 352 筆 debug sample
+- result: training 完成 1 epoch，存出 `epoch_1.pth` / `epoch_1_ema.pth` / `latest.pth`
+- stability: 無 crash / NaN / Inf / OOM
+- last train log: `loss=31.8263`, `grad_norm=34.2513`, memory `15061`
+- EMA init: iter=1 六個 map class 都有 `flipped_this_iter`
+
+注意: `gt_hard` log 仍會印出 `thresh=0.70`，但 support 來源是 GT-positive pixels，不是 prediction threshold。
+
+| class | valid/total | zero pct | avg support | longest zero |
+| --- | ---: | ---: | ---: | --- |
+| drivable_area | 352/352 | 0.0% | 42953.4 | none |
+| ped_crossing | 347/352 | 1.4% | 2597.6 | iter 2580 |
+| walkway | 352/352 | 0.0% | 14910.3 | none |
+| stop_line | 352/352 | 0.0% | 3341.4 | none |
+| carpark_area | 321/352 | 8.8% | 2577.2 | iter 3620-3640 |
+| divider | 352/352 | 0.0% | 5415.4 | none |
+
+Sparse class 的分段 valid/total:
+
+| iter range | ped_crossing | walkway | stop_line | carpark_area | divider |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1-1000 | 51/51 | 51/51 | 51/51 | 48/51 | 51/51 |
+| 1001-3000 | 99/100 | 100/100 | 100/100 | 91/100 | 100/100 |
+| 3001-5000 | 97/100 | 100/100 | 100/100 | 91/100 | 100/100 |
+| 5001-7020 | 100/101 | 101/101 | 101/101 | 91/101 | 101/101 |
+
+判讀:
+
+- `gt_hard` 幾乎完全解決 sparse class support 不足的 smoke 問題。
+- 但這只證明 training-time prototype 能被 GT 穩定更新，不代表 inference 會更好，因為 inference 沒有 GT mask 可用。
+
+#### 7.7.3 Inference smoke
+
+兩組 checkpoint 都使用同一個 config 跑:
+
+```bash
+bash tools/dist_test.sh \
+  projects/configs/ProtoOcc/ProtoOcc_proto_map_head_map_neck.py \
+  <checkpoint> \
+  1 \
+  --eval miou map-miou
+```
+
+結果:
+
+| checkpoint | Occ mIoU | map mean IoU@max | drivable | ped_crossing | walkway | stop_line | carpark | divider |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `proto_map_head_smoke_debug/epoch_1_ema.pth` | 35.01 | 24.89 | 65.36 | 13.17 | 30.11 | 10.75 | 12.08 | 17.87 |
+| `proto_map_head_smoke_gt_hard/epoch_1_ema.pth` | 34.91 | 20.75 | 63.20 | 11.50 | 17.06 | 5.94 | 11.83 | 15.00 |
+
+判讀:
+
+- 兩組都能正常完成 6019 samples 評估，代表 eval / result formatting / `map-miou` contract 沒有斷。
+- `gt_hard` 的 training support 明顯更健康，但 epoch 1 inference map mean 低於 `pred_threshold`，尤其 `walkway` 與 `stop_line` 掉得明顯。
+- 這和先前 `gt_soft` 效果很差的觀察一致: GT-based prototype mining 可能有 training/inference mismatch，不適合作為主要訓練策略。
+
+#### 7.7.4 結論與下一步
+
+目前 smoke test 支持以下判斷:
+
+1. `ProtoMapHead` 接到 ProtoOcc 的 forward / loss / inference path 是通的。
+2. EMA prototype 不是沒有初始化；六個 map class 在 iter=1 都有 init。
+3. `pred_threshold=0.70` 對 early training sparse class 太硬，特別是 `ped_crossing`。
+4. `gt_hard` 可以用來驗證 support coverage，但不建議直接當主訓練方案。
+5. 下一步較合理的方向是保留 prediction-based mining，但改成 threshold warmup 或 class-wise threshold，例如 sparse class early stage 用較低 threshold，再逐步拉回 `0.70`。
+
+因此 `gt_hard` / `gt_soft` 建議保留為 debug 或 ablation mode；主要實驗應優先測 `pred_threshold` 的 threshold schedule，而不是長訓 GT-based prototype。
