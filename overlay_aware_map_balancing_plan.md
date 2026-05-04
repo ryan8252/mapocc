@@ -324,7 +324,7 @@ Use `map_loss_weight=4` epoch 24, Occ 39.72 / Map 45.79, as the formal benchmark
   - 新增 V3 訓練 config，繼承 `ProtoOcc_multi_cnn_head_map_neck.py`。
   - 設定 `map_loss_weight=4.0`，所以比較基準是 V0 strong baseline，不是 weight1。
   - 啟用 `map_loss_balance_mode='overlay_dynamic'`，`overlay_class_indices=[1, 3, 5]`，`gamma=0.5`，weight clamp `[1.0, 5.0]`。
-  - 目前 `dynamic_overlay_ref_pos_ratio=[0.0166845, 0.0213629375, 0.033702125]` 是用 train split 400 個 evenly sampled frames 的 bootstrap 統計值，順序是 `[ped_crossing, stop_line, divider]`。正式長訓練前建議用完整 train split 重算一次再替換。
+  - 目前 `dynamic_overlay_ref_pos_ratio=[0.01651758531816566, 0.02156730536793459, 0.034080144863135445]` 已換成完整 train split 28130 frames 的統計值，順序是 `[ped_crossing, stop_line, divider]`，來源是 `tools/analysis_tools/map_pos_ratio_full.json`。
 
 - `tools/analysis_tools/compute_map_pos_ratio.py`
   - 新增 ref ratio 統計工具，直接使用同一個 `LoadBEVSegmentation` rasterizer，避免用 raw polygon area ratio。

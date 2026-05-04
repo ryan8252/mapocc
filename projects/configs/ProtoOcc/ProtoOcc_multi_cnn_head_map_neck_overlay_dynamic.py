@@ -2,13 +2,11 @@ _base_ = ['./ProtoOcc_multi_cnn_head_map_neck.py']
 
 # V3: MTL-aware batch-wise overlay-positive balancing.
 #
-# The ref ratios below are bootstrap values computed with:
+# The ref ratios below are full train split values computed with:
 #   conda run -n mapocc python tools/analysis_tools/compute_map_pos_ratio.py \
 #       projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck.py \
-#       --sample-count 400 --progress-interval 400 --progress-bar
-#
-# Before paper-level full training, recompute without --sample-count and update
-# this list with the full train split ratios.
+#       --progress-interval 1000 --progress-bar \
+#       --output tools/analysis_tools/map_pos_ratio_full.json
 map_classes = [
     'drivable_area',
     'ped_crossing',
@@ -19,9 +17,9 @@ map_classes = [
 ]
 overlay_class_indices = [1, 3, 5]
 dynamic_overlay_ref_pos_ratio = [
-    0.0166845,     # ped_crossing
-    0.0213629375,  # stop_line
-    0.033702125,   # divider
+    0.01651758531816566,   # ped_crossing
+    0.02156730536793459,   # stop_line
+    0.034080144863135445,  # divider
 ]
 
 model = dict(
