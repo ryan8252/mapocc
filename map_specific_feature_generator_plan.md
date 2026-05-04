@@ -2,6 +2,31 @@
 
 日期：2026-04-21
 
+## 2026-05-04 更新：本計劃的新定位
+
+這份計劃的第一階段已經完成，而且結果改變了後續方向。`CNN head + 128ch map neck` 證明 map-specific feature generator 是必要 baseline，但最新 evidence 顯示下一個主要瓶頸已經不是單純 head/neck capacity，而是 Occ+Map MTL 裡的 map task priority。
+
+最新關鍵結果：
+
+| Setting | Checkpoint | Occ mIoU | Map mIoU | 備註 |
+| --- | --- | ---: | ---: | --- |
+| CNN head + 128ch map neck, `map_loss_weight=1` | epoch 24 EMA | 39.82 | 39.94 | map-specific neck 的正式 MTL baseline |
+| CNN head + 128ch map neck, `map_loss_weight=4` | epoch 24 EMA | 39.72 | 45.79 | 新的 strong baseline |
+| CNN head + 128ch map neck, map-only | epoch 24 EMA | - | 48.34 | map-only upper bound |
+
+更新後的判斷：
+
+1. `map_loss_weight=4` 把 MTL map gap 從 `48.34 - 39.94 = 8.40` 縮到 `48.34 - 45.79 = 2.55`，且 OCC 只掉約 `0.10`。
+2. 因此 map-specific feature generator 已經從「待驗證想法」變成「下一階段方法的固定架構基底」。
+3. 後續主線不應再回到 PGBR / GT-soft / GT-guided AdaPG 作為主要方法；那些已經有 train-test mismatch 或效果不穩風險，只能留作後續 ablation。
+4. 下一步應該接到 `overlay_aware_map_balancing_plan.md`：以 `CNN head + 128ch map neck + map_loss_weight=4` 當 V0 strong baseline，再測 overlay/thin balancing 是否能補 `stop_line / divider / ped_crossing`。
+
+實作注意：
+
+- `map_loss_weight` 現在由 detector 的 `_scale_map_losses()` 統一乘上去。任何新 head/loss 實作都不應在 head 內再乘一次，否則 `map_loss_weight=4` 會變成實質 16 倍。
+- 手動 map loss 若要取代原本 `build_loss` path，必須保留現有 BCE/Dice 比例：BCE `loss_weight=5.0`，Dice `loss_weight=1.0`。
+- `experiment_results_summary.md` 需要同步加入 `map_loss_weight=4` epoch 5/11/24 rows，否則 canonical result table 仍會停在舊 baseline。
+
 ## 實作狀態
 
 已完成第一版 map-specific BEV neck 實作。
@@ -37,7 +62,7 @@
 | 小尺寸 encoder smoke test | 通過，輸出 `(occ_feature, bev_feature, map_bev_feature)`，shape 為 `(1,48,32,32,16)`、`(1,48,32,32)`、`(1,128,32,32)` |
 | 小尺寸 CNN-head smoke test | 通過，`map_bev_feature` shape 為 `(1,128,32,32)`，CNN map logits shape 為 `(1,6,32,32)` |
 
-第一個建議執行的實驗：
+歷史上的第一個建議實驗如下，這一步已經由後續 map-neck / CNN-head 實驗驗證完畢；現在不再把它當下一個 launch target：
 
 ```bash
 bash tools/dist_train.sh projects/configs/ProtoOcc/ProtoOcc_proto_map_head_map_neck.py 1
@@ -307,7 +332,7 @@ Occ mIoU 明顯下降
 
 不能立刻否定 map-specific neck。這可能只是 map loss 太強，需要調整 loss weight。
 
-建議在後續 config 中預留：
+舊版計劃原本建議先從 `map_loss_weight=1.0` 附近調整：
 
 ```python
 map_loss_weight = 1.0
@@ -320,6 +345,16 @@ map_loss_weight = 1.0
 | default | 1.0 | baseline |
 | weaker map | 0.5 | 保護 occupancy |
 | stronger map | 2.0 | 若 map 學不動再測 |
+
+但 2026-05-04 的 weight4 結果已經更新這個判斷。`map_loss_weight=4` epoch 24 達到 Occ 39.72 / Map 45.79，OCC 幾乎沒有被犧牲，因此現在的正式 baseline 應該改成：
+
+| 實驗 | map_loss_weight | 目的 |
+| --- | ---: | --- |
+| V0 strong baseline | 4.0 | 修正 task-level map suppression |
+| V1/V2/V3 overlay-aware | 4.0 | 在 strong baseline 上補 thin overlay classes |
+| Pareto diagnostic | 2.0 | 只有當 V1/V2/V3 讓 OCC 明顯下降時才測 |
+
+這代表 `map_loss_weight=0.5/1/2` 不再是主線 sweep，而是回頭分析 OCC-map trade-off 時才需要。後續任何 loss 改法都必須跟 `map_loss_weight=4` 比，而不是只跟 weight1 比。
 
 ### 3. 解析度必須對齊
 
@@ -619,12 +654,12 @@ projects/mmdet3d_plugin/models/dense_heads/proto_map_head.py
 
 第一階段不一定要改。只要把 `in_channels` 和 `hidden_channels` 改成 256，它理論上可以直接接新的 map feature。
 
-後續可改項目：
+後續可改項目需要降級處理：
 
-1. 訓練階段加入 GT-guided AdaPG。
-2. 加入 soft/top-k prototype pooling，避免 `sigmoid > 0.5` 對稀疏類別太嚴格。
-3. 加入 coarse/final mask fusion。
-4. 將 PGBR 放在 256-channel map feature 上，而不是 48-channel bottleneck 上。
+1. 加入 soft/top-k prototype pooling，避免 `sigmoid > 0.5` 對稀疏類別太嚴格。
+2. 加入 coarse/final mask fusion。
+3. 若要重測 PGBR，只能放在 256-channel map feature 上作 ablation，不應在 48-channel bottleneck 上補救。
+4. GT-guided AdaPG / GT-soft 不作為下一步主線，因為先前已暴露 train-test mismatch 和 calibration regression 風險。
 
 ## 實作順序
 
@@ -673,47 +708,70 @@ Occ mIoU 不應該比目前 37.61 掉太多
 
 如果 detach 版本 map 仍然大幅提升，代表主要問題是 map head input feature 太弱，而不是 joint training。
 
-### Step 4：再加 PGBR / GT-guided AdaPG
+### Step 4：不要把 PGBR / GT-guided AdaPG 當下一個主線
 
-目的：在更強的 map feature 上測 prototype refinement。
+舊版計劃把 PGBR / GT-guided AdaPG 放在 map-specific neck 之後，但後續實驗已經顯示 GT-soft / PGBR 類方向有明顯 train-test mismatch 或 map regression 風險。因此這一步不再是下一個主線。
 
-這一步才是比較公平的 PGBR 實驗，因為 PGBR 不應該只在 48-channel bottleneck 上補救。
+更新後順序：
+
+```text
+1. 固定 CNN head + 128ch map neck
+2. 使用 map_loss_weight=4 建立 V0 strong baseline
+3. 實作 overlay-aware map balancing
+4. 如果 overlay-aware 在 CNN head 上有效，再考慮轉移到 ProtoMapHead coarse output
+5. PGBR / GT-guided AdaPG 只作為後續 ablation，不作為 paper mainline
+```
+
+理由是目前最強證據指向 task-level map suppression，而不是 prototype refinement 不足。若主線回到 GT-guided prototype mining，會偏離 end-to-end Occ+Map MTL 的核心問題。
 
 ## 預期實驗表
 
 | 實驗 | Occ mIoU | Map mIoU | 目的 |
 | --- | ---: | ---: | --- |
 | current ProtoMapHead no PGBR | 37.61 | 32.95 | baseline |
-| CNN head + map neck 128ch | TBD | TBD | 檢查 map-specific feature 對 naive CNN head 是否也有效 |
+| CNN head + map neck 128ch, weight1 | 39.82 | 39.94 | 已完成，證明 map-specific feature 對 naive CNN head 有效 |
+| CNN head + map neck 128ch, map-only | - | 48.34 | 已完成，建立 map-only upper bound |
+| CNN head + map neck 128ch, weight4 | 39.72 | 45.79 | 已完成，新的 V0 strong baseline |
 | 48->128/256 map adapter | TBD | TBD | 單純升維對照 |
 | widened shared neck + occ projection | TBD | TBD | channel vs decoupling 對照 |
 | map neck 128ch | TBD | TBD | 檢查 channel capacity |
 | map neck 256ch | TBD | TBD | 對齊 BEVFusion / BEVerse |
 | map neck 256ch detach | TBD | TBD | 檢查 map loss 干擾 |
-| map neck 256ch + PGBR | TBD | TBD | 測 prototype-guided refinement |
-| map neck 256ch + GT-guided AdaPG | TBD | TBD | 改善稀疏 map class prototype |
+| map neck 128ch + overlay-aware loss | TBD | TBD | 下一個主線，測 thin overlay balancing 是否能超過 weight4 |
+| map neck 256ch + PGBR | TBD | TBD | 後續 ablation，不是主線 |
+| map neck 256ch + GT-guided AdaPG | TBD | TBD | 後續 ablation，不是主線 |
 
 ## 成功標準
 
-短期成功：
+短期成功已達成：
 
 ```text
-Map mIoU 從 32.95 提升到 38+
-Occ mIoU 維持在 37 附近
+Map mIoU 從 ProtoMapHead no PGBR 32.95 提升到 CNN head + 128ch map neck 39.94
+Occ mIoU 從 37.61 提升到 39.82
 ```
 
-中期成功：
+中期成功已部分達成：
 
 ```text
-Map mIoU 接近或超過 42
-Occ mIoU 回到 38+
+map_loss_weight=4 達到 Occ 39.72 / Map 45.79
+距離 map-only 48.34 只剩 2.55
+```
+
+新的下一步成功標準：
+
+```text
+以 weight4 45.79 為正式 V0 baseline
+overlay-aware loss 至少維持 mean Map mIoU 45.79 附近
+優先提升 stop_line 28.32，理想上超過 30
+OCC 維持 39.0 以上，最好不要比 V0 39.72 低超過 0.3
+若只能打敗 weight1 39.94，不能算主線成功
 ```
 
 長期目標：
 
 ```text
-Map mIoU 接近 BEVFusion R50 47.10
-Occ mIoU 接近原始 ProtoOcc 39.56 或 MAESTRO R50 38.60
+Map mIoU 接近或超過 map-only upper bound 48.34
+Occ mIoU 接近原始 ProtoOcc 39.56 或維持在 weight4 的 39.72 附近
 ```
 
 ## 一句話總結
