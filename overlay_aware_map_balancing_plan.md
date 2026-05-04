@@ -307,3 +307,41 @@ Use `map_loss_weight=4` epoch 24, Occ 39.72 / Map 45.79, as the formal benchmark
 - If the method works on CNN head + 128ch map neck, test transfer to ProtoMapHead later with no-PGBR / no-GT-soft first, preferably on coarse map output before involving final prototype refinement.
 - Do not use epoch 11 weight4 as the formal benchmark. It can guide early decisions, but all claims should be checked against weight4 epoch 24: Occ 39.72 / Map 45.79.
 - If writing the MTL suppression story for a paper, include a paired baseline table with original ProtoOcc / occ-only, map-only, Occ+Map weight1, Occ+Map weight4, and ours.
+
+## 2026-05-04 V3 Implementation Update
+
+這次已經先把 V3 dynamic overlay-positive balancing 寫進 CNN map head 主線，改動重點如下：
+
+- `projects/mmdet3d_plugin/models/dense_heads/bev_seg_head.py`
+  - 新增 `map_loss_balance_mode`，預設 `none` 會完全走原本 `build_loss` BCE/Dice path，保持 baseline 行為不變。
+  - 新增 `overlay_dynamic` 模式：根據 batch 內 `ped_crossing / stop_line / divider` 的 positive ratio 和 `dynamic_overlay_ref_pos_ratio` 算 dynamic weight。
+  - Dynamic weight 只作用在 present overlay class 的 GT-positive BCE pixels，以及該 present overlay class 的 Dice class weight。
+  - Absent overlay class 不加 boost，但仍保留正常 negative BCE 和正常 Dice，避免 false positive 懲罰被關掉。
+  - 手寫 BCE/Dice path 保留既有比例：BCE `loss_weight=5.0`、Dice `loss_weight=1.0`；global `map_loss_weight=4.0` 仍只由 detector 端 `_scale_map_losses()` 負責，不在 head 內重複相乘。
+  - 新增 debug log：會定期印出 per-class positive pixels、positive ratio、overlay weight、BCE contribution、Dice contribution，方便確認 V3 是否只在 present sparse overlay classes 啟動。
+
+- `projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck_overlay_dynamic.py`
+  - 新增 V3 訓練 config，繼承 `ProtoOcc_multi_cnn_head_map_neck.py`。
+  - 設定 `map_loss_weight=4.0`，所以比較基準是 V0 strong baseline，不是 weight1。
+  - 啟用 `map_loss_balance_mode='overlay_dynamic'`，`overlay_class_indices=[1, 3, 5]`，`gamma=0.5`，weight clamp `[1.0, 5.0]`。
+  - 目前 `dynamic_overlay_ref_pos_ratio=[0.0166845, 0.0213629375, 0.033702125]` 是用 train split 400 個 evenly sampled frames 的 bootstrap 統計值，順序是 `[ped_crossing, stop_line, divider]`。正式長訓練前建議用完整 train split 重算一次再替換。
+
+- `tools/analysis_tools/compute_map_pos_ratio.py`
+  - 新增 ref ratio 統計工具，直接使用同一個 `LoadBEVSegmentation` rasterizer，避免用 raw polygon area ratio。
+  - 可先用 `--sample-count` 做跨 split 的 bootstrap estimate，也可不加 `--sample-count` 跑完整 train split 統計。
+  - 完整重算命令：
+
+```bash
+conda run -n mapocc python tools/analysis_tools/compute_map_pos_ratio.py \
+    projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck.py \
+    --progress-interval 1000 \
+    --progress-bar
+```
+
+已做的 smoke check：
+
+- `python -m py_compile` 通過 `bev_seg_head.py` 和 `compute_map_pos_ratio.py`。
+- `mmcv.Config.fromfile(...)` 可正確讀取 V3 config，確認 `map_loss_weight=4.0`、`map_loss_balance_mode='overlay_dynamic'`、ref ratio list 正常。
+- 補 plugin registry import 後，`build_head(cfg.model.bev_seg_head)` 可成功建立 V3 `BEVSegHead`，toy tensor forward loss 可得到 `loss_map_bce / loss_map_dice`。
+- 用 toy tensor 測過 `class_static` 全 1 權重和原本 loss path 的 BCE/Dice 數值一致，確認手寫 loss path 在全 1 權重下不改 loss scale。
+- 針對 Claude 提醒的 V3 branch，已在 `mapocc` 環境用 `overlay_dynamic` 且 `dynamic_overlay_min_weight=dynamic_overlay_max_weight=1.0` 測過：`loss_map_bce` / `loss_map_dice` 和 V0 `map_loss_balance_mode='none'` 完全一致，包含一個 absent overlay class 的 case。
