@@ -158,7 +158,7 @@ OCC layout target group = [
 ]
 ```
 
-第一版 relation mask 建議已用 full train split GT 統計校正。統計來源是 `work_dirs/occ_map_overlap_z0_3_train_non_free.md`，Z=0~3 weighted 的 `Map -> OCC` 顯示：`drivable_area / ped_crossing / stop_line / divider` 主要落在 `driveable_surface`，`walkway` 主要落在 `sidewalk`，`carpark_area` 主要也是 `driveable_surface` 而不是 `other_flat`。
+第一版 relation mask 建議已用 full train split GT 統計校正。統計來源是 `work_dirs/occ_map_overlap_z0_3_train_non_free.md`，Z=0~3 weighted 的 `Map -> OCC` 顯示：`drivable_area / ped_crossing / stop_line / divider` 主要落在 `driveable_surface`，`walkway` 主要落在 `sidewalk`，`carpark_area` 主要是 `driveable_surface`，但對 `sidewalk` 也有 6.10% 的弱關聯，因此第一版允許 `carpark_area -> sidewalk`。
 
 | Map class | Allowed OCC background queries |
 | --- | --- |
@@ -166,10 +166,12 @@ OCC layout target group = [
 | `ped_crossing` | `driveable_surface`, `sidewalk` |
 | `walkway` | `sidewalk`, `terrain`, `manmade` |
 | `stop_line` | `driveable_surface` |
-| `carpark_area` | `driveable_surface` |
+| `carpark_area` | `driveable_surface`, `sidewalk` |
 | `divider` | `driveable_surface` |
 
 不把 `other_flat` 和 `vegetation` 放進第一版主 mask。雖然 `other_flat -> drivable_area` 在反向 coverage 裡有一定比例，但 Map -> OCC 的 `drivable_area / carpark_area` 對 `other_flat` 只有弱比例；`vegetation` 也沒有穩定對應的 map class。第一版應保持 relation mask 窄一點，這兩類的 `query_residual` 預設固定為 0；`other_flat` 可以放到 weak-relation ablation，`vegetation` 只在後續有明確統計或 class-level need 時再打開。
+
+另外，full train weighted 裡 `walkway -> driveable_surface` 約 6.99%，但主設定故意不開。原因是 `walkway` 和 `driveable_surface` 是邊界上容易互相污染的類別，讓 walkway token 直接推 driveable query 可能把道路/行人區分界拉糊；這條 relation 應放到 weak-relation ablation，而不是 Stage 1 main setting。
 
 5. 在這個 semantic mask 內學 relation weight，mask 外權重固定為 0：
 
@@ -183,7 +185,7 @@ Delta_Q_fg = 0                                                # foreground / dyn
 6. 用 zero-residual gate 加到 background OCC query，而不是加到 comprehensive voxel feature：
 
 ```text
-Q_occ_layout' = Q_occ_layout + alpha_m2o * Gate_m2o(Q_occ_layout, T_map) * Delta_Q_bg
+Q_occ_layout' = Q_occ_layout + alpha_m2o * Gate_source(Delta_Q_bg) * Delta_Q_bg
 Q_occ_other_background' = Q_occ_other_background
 Q_occ_fg' = Q_occ_fg
 ```
@@ -194,6 +196,7 @@ Q_occ_fg' = Q_occ_fg
 - 第一版 `T_map` 預設 detach，只阻斷 OCC loss 回頭改 map side-path；但 map 主路徑仍正常由 map loss 更新。
 - 不使用 GT map mask，不做 GT-guided support mining。
 - `MaskedAvgPool` 對 absent / low-confidence map class 使用 zero-token fallback，並讓 gate 根據 zero token 自然壓低該 class 的 residual。
+- Stage 1 實作使用 `source_only` gate，只根據 `Delta_Q_bg` 做 sigmoid gating，不讀取 PQD 內部的 `Q_occ_layout`。這讓 adapter 能維持在 detector-side side path，避免第一版大幅改 PQD query synthesis；`target_aware` gate 留到 Stage 5 ablation。
 - 不讓 layout prior 直接改 dynamic foreground OCC queries，避免 map layout 把車、人等 movable object prototypes 拉壞。
 - Relation 是 **masked learnable**：比純手工 mapping 更有學習能力，也比完全自由 relation 更不容易學到錯誤跨類別捷徑。
 - PQD training 有 RPL padding queries。訓練時 PQD 會先把 `RPL_Groups * num_classes` 個 RPL query 放在前面，再接原本 18 個 semantic queries。`query_residual` 只能加在後段真正 semantic queries 的 background indices；RPL query residual 必須固定為 0，避免把 layout prior 加到 augmentation/noise query 上。
@@ -291,7 +294,7 @@ stop criterion：
 設計：
 
 - `alpha_m2o`、`beta_o2m`、`alpha_o2m` 為 residual scalar，初始化 0 或由 schedule 從 0 開始；其中 `alpha_o2m` 只用於高風險 feature residual ablation。Adapter / projection 層正常初始化，避免 residual scalar 和 adapter output 同時為 0。
-- Gate 使用 sigmoid，輸入是 target feature + source prior 的簡單 concat/projection。
+- Gate 使用 sigmoid。Stage 1 先採 `source_only` gate，輸入只有 source prior `Delta_Q_bg`；`target_aware` gate 需要讀取 PQD 的 target semantic query，會改動更深，因此留作 Stage 5 ablation。
 - Source prior 預設走 stop-gradient side path，之後做 no-detach ablation。
 - 所有 adapter 都是 residual；第一版 Occ-to-Map 不改原本 map feature，只改 logits 或 gate。
 
@@ -357,6 +360,7 @@ map_feature -> map head -> map loss -> 正常更新 map 主路徑
 - `CNN head + 128ch map neck + map_loss_weight=4`: Occ 39.72 / Map 45.79
 - `overlay_dynamic` epoch 24 已完成：Occ 39.52 / Map 46.00。它是 map protection loss 的目前 best map score，但 OCC 比 weight4 低 0.20；LGMG 主線仍先和 weight4 比 OCC recovery，再檢查是否能和 overlay_dynamic 組合。
 - `overlay_dynamic` epoch 5/11 只能當 early signal，不當 paper-level acceptance criterion。
+- Stage 0 已完成
 
 ### Stage 1: Map-to-Occ only, semantic-masked learnable relation
 
@@ -368,6 +372,7 @@ map_feature -> map head -> map loss -> 正常更新 map 主路徑
 relation_mode = "semantic_masked_learnable"
 target_occ_group = "background_only"
 map_prior_detach = True
+gate_mode = "source_only"
 alpha_m2o init = 0
 adapter projection normal init
 RPL query residual = 0
@@ -383,6 +388,18 @@ RPL query residual = 0
 
 - Occ > 39.72，或至少 layout-related classes 有明確 class-level gain。
 - Map >= 45.79 附近，不應因為 OCC loss 透過 side path 回頭影響 map branch。
+
+實作狀態（2026-05-06）：
+
+- 已新增 `MapToOccLayoutAdapter`，位置在 `projects/mmdet3d_plugin/models/task_modules/layout_geometry_guidance.py`。
+- Stage 1 adapter 會用 predicted `map_logits.sigmoid()` 對 `map_feature` 做 masked average pooling，產生 `[B, 6, 128]` layout tokens；absent / low-confidence map class 走 zero-token fallback。
+- Adapter 先用 `Linear(128 -> D_occ)` 對齊 PQD query channel，再用 semantic-masked learnable relation 產生 `[B, 4, D_occ]` layout target residual。第一版只寫入 OCC query indices `[11, 13, 14, 15]`，也就是 `driveable_surface / sidewalk / terrain / manmade`；`other_flat / vegetation / foreground` residual 固定為 0。
+- `alpha_m2o` 以 learnable scalar 實作，初始為 0；relation / channel projection / `source_only` gate 正常初始化，避免 residual branch 完全無學習訊號。初始 forward 等價 baseline。
+- `ProtoOccCnnSegHead` 新增 optional `map_to_occ_adapter`。只有 adapter 開啟時才把 `BEVSegHead` 前移到 PQD 前；adapter 關閉時 baseline 路徑維持原本順序。
+- `Prototype_Query_Decoder_nuScenes` 新增 optional `query_residual=None` hook，位置在 `for_query_embed(...)` 之後、`query_self_attn` 之前。`query_residual` 固定使用 `[B, num_queries, C]`，PQD 內部轉成 `[num_queries, B, C]`；訓練時會自動在前面補 `RPL_pad_size` 個 zero residual，確保 RPL padding queries 不吃 layout prior。
+- 已新增 Stage 1 config：`projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck_lgmg_m2o_masked_relation.py`，繼承 map-neck baseline，設定 `map_loss_weight=4.0` 與 semantic relation mask。
+- `MapToOccLayoutAdapter` 已加入 `target_occ_indices` duplicate check，避免 config 重複 index 造成 silent overwrite。
+- 已完成 smoke 檢查：`py_compile`、adapter tensor smoke、config/registry smoke、PQD residual/RPL padding smoke、`git diff --check`。本機環境顯示 `No CUDA runtime is found`，所以尚未跑完整 training smoke。
 
 ### Stage 2: Relation 設計 ablation
 
@@ -444,7 +461,9 @@ stop criterion：
 | raw concat fusion | 證明直接 fusion 比受控 side path 差 |
 | fixed relation vs semantic-masked learnable relation | 檢查 relation 是否需要學習 |
 | free relation vs semantic-masked learnable relation | 檢查語意遮罩是否必要 |
+| weak relation enabled | 檢查 `walkway -> driveable_surface`、`other_flat` 等弱關聯是否真的有幫助，或只是造成邊界污染 |
 | foreground relation enabled | 證明 dynamic foreground prototypes 不應被 map layout 改 |
+| source-only gate vs target-aware gate | 檢查是否需要讓 PQD target semantic query 參與 gate；Stage 1 主設定先用 source-only |
 | Occ->Map logits residual vs gate conditioning | 找較安全的 O2M 注入方式 |
 | Occ->Map feature residual | 高風險 ablation；目前 code 只有 map-specific BEV neck + BEVSegHead，未來若加入 MSFP，要檢查直接改 map feature 是否和 MSFP/BEVSegHead 打架 |
 | no warmup Occ-to-Map | negative ablation；檢查 early noisy OCC 是否傷 map |

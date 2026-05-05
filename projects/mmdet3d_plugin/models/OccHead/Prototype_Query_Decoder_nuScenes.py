@@ -315,6 +315,40 @@ class Prototype_Query_Decoder_nuScenes(MaskHead):
         mask_pred = torch.einsum('bqc,bcxyz->bqxyz', mask_embed, mask_feature)
         return cls_pred, mask_pred
 
+    def _apply_query_residual(self, query_feat, query_residual, RPL_pad_size,
+                              batch_size):
+        if query_residual is None:
+            return query_feat
+
+        if query_residual.dim() != 3:
+            raise ValueError(
+                'query_residual must have shape [B, num_queries, C], got '
+                f'{tuple(query_residual.shape)}.')
+        if (query_residual.size(0) != batch_size or
+                query_residual.size(1) != self.num_queries):
+            raise ValueError(
+                'query_residual must have shape [B, num_queries, C], got '
+                f'{tuple(query_residual.shape)} with '
+                f'batch_size={batch_size}, num_queries={self.num_queries}.')
+
+        if query_residual.size(2) != self.feat_channels:
+            raise ValueError(
+                f'query_residual channels must be {self.feat_channels}, got '
+                f'{query_residual.size(2)}.')
+
+        query_residual = query_residual.to(
+            device=query_feat.device, dtype=query_feat.dtype).transpose(0, 1)
+        if RPL_pad_size > 0:
+            rpl_pad = query_residual.new_zeros(
+                (RPL_pad_size, batch_size, self.feat_channels))
+            query_residual = torch.cat((rpl_pad, query_residual), dim=0)
+
+        if query_residual.shape != query_feat.shape:
+            raise ValueError(
+                'query_residual shape after RPL padding must match query_feat: '
+                f'{tuple(query_residual.shape)} vs {tuple(query_feat.shape)}.')
+        return query_feat + query_residual
+
     def preprocess_gt(self, gt_occ, img_metas):
         num_class_list = [self.num_occupancy_classes] * len(img_metas)
         labels, masks, binary_mask = multi_apply(self.preprocess_occupancy_gt, gt_occ, num_class_list)
@@ -327,10 +361,13 @@ class Prototype_Query_Decoder_nuScenes(MaskHead):
             mask_camera,
             mask_feat,
             occ_pred,
+            query_residual=None,
             **kwargs,
         ):
         gt_labels, gt_masks, gt_binaries = self.preprocess_gt(gt_occ, img_metas, )
-        all_cls_scores, all_mask_preds, RPL_args = self(voxel_feats, img_metas, mask_feat, occ_pred, )
+        all_cls_scores, all_mask_preds, RPL_args = self(
+            voxel_feats, img_metas, mask_feat, occ_pred,
+            query_residual=query_residual)
         losses = self.loss(all_cls_scores, all_mask_preds, gt_labels, gt_masks, gt_binaries, gt_occ, mask_camera, img_metas, RPL_args)
 
         return losses
@@ -340,6 +377,7 @@ class Prototype_Query_Decoder_nuScenes(MaskHead):
             img_metas,
             mask_feat,
             occ_pred=None,
+            query_residual=None,
             **kwargs,
         ):
         batch_size = len(img_metas)
@@ -425,6 +463,8 @@ class Prototype_Query_Decoder_nuScenes(MaskHead):
             query_feat = learnable_query + global_for_query_ + local_for_query_
             query_feat = self.for_query_embed(query_feat).unsqueeze(1).repeat((1, batch_size, 1))
 
+        query_feat = self._apply_query_residual(
+            query_feat, query_residual, RPL_pad_size, batch_size)
         query_feat = self.query_self_attn(query_feat, [self_attn_mask])
         
 
@@ -463,9 +503,12 @@ class Prototype_Query_Decoder_nuScenes(MaskHead):
             img_metas,
             mask_feat,
             occ_pred=None,
+            query_residual=None,
             **kwargs,
         ):
-        all_cls_scores, all_mask_preds, _ = self(voxel_feats, img_metas, mask_feat, occ_pred)
+        all_cls_scores, all_mask_preds, _ = self(
+            voxel_feats, img_metas, mask_feat, occ_pred,
+            query_residual=query_residual)
         mask_cls_results = all_cls_scores[-1]
         mask_pred_results = all_mask_preds[-1]
         

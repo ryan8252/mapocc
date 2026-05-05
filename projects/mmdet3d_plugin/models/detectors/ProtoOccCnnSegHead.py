@@ -18,6 +18,7 @@ class ProtoOccCnnSegHead(BEVDet):
                  cnn3d_decoder=None,
                  prototype_query_decoder=None,
                  bev_seg_head=None,
+                 map_to_occ_adapter=None,
                  map_loss_weight=1.0,
                  **kwargs):
         super(ProtoOccCnnSegHead, self).__init__(**kwargs)
@@ -31,6 +32,13 @@ class ProtoOccCnnSegHead(BEVDet):
         self.cnn3d_decoder = build_head(cnn3d_decoder)
         self.prototype_query_decoder = build_head(prototype_query_decoder)
         self.bev_seg_head = build_head(bev_seg_head) if bev_seg_head is not None else None
+        self.map_to_occ_adapter = (
+            build_head(map_to_occ_adapter)
+            if map_to_occ_adapter is not None else None)
+        if self.map_to_occ_adapter is not None and self.bev_seg_head is None:
+            raise ValueError(
+                'map_to_occ_adapter requires bev_seg_head to produce '
+                'predicted map logits.')
         self.map_loss_weight = map_loss_weight
 
     def image_encoder(self, img, stereo=False):
@@ -122,6 +130,17 @@ class ProtoOccCnnSegHead(BEVDet):
 
         return gt_masks_bev.float()
 
+    def _forward_bev_seg(self, bev_feature, map_bev_feature,
+                         gt_masks_bev=None):
+        if self.bev_seg_head is None:
+            return None, None
+
+        map_feature = self._select_map_feature(bev_feature, map_bev_feature)
+        if gt_masks_bev is not None:
+            self._check_map_feature_size(map_feature, gt_masks_bev)
+        bev_seg_logits = self.bev_seg_head(map_feature)
+        return map_feature, bev_seg_logits
+
     def forward_train(self,
                       points=None,
                       img_metas=None,
@@ -145,13 +164,28 @@ class ProtoOccCnnSegHead(BEVDet):
         comprehensive_voxel_feature, bev_feature, map_bev_feature = \
             self._split_encoder_output(encoder_output)
 
+        gt_masks_bev = self._normalize_map_targets(gt_masks_bev)
+        map_feature = None
+        bev_seg_logits = None
+        if self.map_to_occ_adapter is not None:
+            map_feature, bev_seg_logits = self._forward_bev_seg(
+                bev_feature, map_bev_feature, gt_masks_bev)
+
         # 3d CNN for generating Prototype
         prototoype_occ_pred, mask_feat = self.cnn3d_decoder(comprehensive_voxel_feature.permute(0,1,4,2,3))
+
+        query_residual = None
+        if self.map_to_occ_adapter is not None:
+            query_residual = self.map_to_occ_adapter(
+                map_feature, bev_seg_logits)
             
         # Prototype Query Decoder (PQD)
         B = comprehensive_voxel_feature.shape[0]
         img_metas = [{"pc_range": self.pc_range, "occ_size":self.grid_size} for i in range(B)]
-        losses = self.prototype_query_decoder.forward_train(comprehensive_voxel_feature, img_metas, voxel_semantics, mask_camera, mask_feat, prototoype_occ_pred)
+        losses = self.prototype_query_decoder.forward_train(
+            comprehensive_voxel_feature, img_metas, voxel_semantics,
+            mask_camera, mask_feat, prototoype_occ_pred,
+            query_residual=query_residual)
         
         # aggregate loss values
         loss_prototype = self.cnn3d_decoder.loss(prototoype_occ_pred, voxel_semantics, mask_camera)
@@ -160,12 +194,11 @@ class ProtoOccCnnSegHead(BEVDet):
         losses.update(loss_depth)
 
         if self.bev_seg_head is not None:
-            gt_masks_bev = self._normalize_map_targets(gt_masks_bev)
             if gt_masks_bev is None:
                 raise ValueError('Expected `gt_masks_bev` when training ProtoOccCnnSegHead with a BEV segmentation head.')
-            map_feature = self._select_map_feature(bev_feature, map_bev_feature)
-            self._check_map_feature_size(map_feature, gt_masks_bev)
-            bev_seg_logits = self.bev_seg_head(map_feature)
+            if bev_seg_logits is None:
+                map_feature, bev_seg_logits = self._forward_bev_seg(
+                    bev_feature, map_bev_feature, gt_masks_bev)
             map_losses = self.bev_seg_head.loss(bev_seg_logits, gt_masks_bev)
             losses.update(self._scale_map_losses(map_losses))
         
@@ -185,19 +218,35 @@ class ProtoOccCnnSegHead(BEVDet):
         comprehensive_voxel_feature, bev_feature, map_bev_feature = \
             self._split_encoder_output(encoder_output)
 
+        map_feature = None
+        bev_seg_logits = None
+        if self.map_to_occ_adapter is not None:
+            map_feature, bev_seg_logits = self._forward_bev_seg(
+                bev_feature, map_bev_feature)
+
         # Prototype Query Generator
         prototoype_occ_pred, mask_feat = self.cnn3d_decoder(comprehensive_voxel_feature.permute(0,1,4,2,3))
+
+        query_residual = None
+        if self.map_to_occ_adapter is not None:
+            query_residual = self.map_to_occ_adapter(
+                map_feature, bev_seg_logits)
 
         # Prototype Query Decoder (PQD)
         B = comprehensive_voxel_feature.shape[0]
         img_metas_occ = [{"pc_range": self.pc_range, "occ_size":self.grid_size} for i in range(B)]
-        occ_preds = self.prototype_query_decoder.simple_test(comprehensive_voxel_feature, img_metas_occ, mask_feat, prototoype_occ_pred)
+        occ_preds = self.prototype_query_decoder.simple_test(
+            comprehensive_voxel_feature, img_metas_occ, mask_feat,
+            prototoype_occ_pred, query_residual=query_residual)
 
         if self.bev_seg_head is None:
             return occ_preds
 
-        map_feature = self._select_map_feature(bev_feature, map_bev_feature)
-        bev_seg_probs = self.bev_seg_head.predict(self.bev_seg_head(map_feature)).detach().cpu().numpy()
+        if bev_seg_logits is None:
+            map_feature, bev_seg_logits = self._forward_bev_seg(
+                bev_feature, map_bev_feature)
+        bev_seg_probs = self.bev_seg_head.predict(
+            bev_seg_logits).detach().cpu().numpy()
         gt_masks_bev = self._normalize_map_targets(kwargs.get('gt_masks_bev'))
         if gt_masks_bev is not None:
             self._check_map_feature_size(map_feature, gt_masks_bev)
