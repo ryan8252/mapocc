@@ -1,6 +1,6 @@
 # Layout-Geometry Mutual Guidance 計劃
 
-日期：2026-05-05
+日期：2026-05-06
 
 ## 動機
 
@@ -10,6 +10,7 @@
 | --- | --- | ---: | ---: | --- |
 | CNN head + 128ch map neck, `map_loss_weight=1` | epoch 24 EMA | 39.82 | 39.94 | map-specific neck 的基本 MTL baseline |
 | CNN head + 128ch map neck, `map_loss_weight=4` | epoch 24 EMA | 39.72 | 45.79 | 目前 strong MTL baseline |
+| CNN head + 128ch map neck, `overlay_dynamic` | epoch 24 EMA | 39.52 | 46.00 | map protection loss 已完成；Map 略高於 weight4，但 OCC 掉 0.20 |
 | CNN head + 128ch map neck, map-only | epoch 24 EMA | - | 48.34 | map-only upper bound |
 
 `map_loss_weight=4` 已經把 MTL map gap 從 `48.34 - 39.94 = 8.40` 縮到 `48.34 - 45.79 = 2.55`，而 OCC 只從 39.82 降到 39.72。這代表 map branch 的主要退化已經不是單純 map head capacity，而是多任務訓練中 map priority 與 task interaction 的問題。
@@ -20,7 +21,7 @@
 - OCC 提供 3D geometry / height / free-space / objectness cue，幫助 Map 的可行駛區域、邊界、遮擋區域與拓撲判斷。
 - Cross-task interaction 必須是可控的 side path，不能破壞已經有效的 DBE / HFM / map neck 主路徑。
 
-因此本計劃提出 **Layout-Geometry Mutual Guidance (LGMG)**：以 `CNN head + 128ch map neck + map_loss_weight=4` 為強 baseline，新增兩個輕量、可關閉、zero-init 的 cross-task guidance adapter：
+因此本計劃提出 **Layout-Geometry Mutual Guidance (LGMG)**：以 `CNN head + 128ch map neck + map_loss_weight=4` 為強 baseline，新增兩個輕量、可關閉、zero-residual 的 cross-task guidance adapter：
 
 1. **Map-to-Occ Layout Query Adapter**：把 map 預測轉成 layout prior，透過 semantic-masked learnable relation 只注入 OCC background semantic queries。
 2. **Occ-to-Map Geometry Adapter**：把 OCC 預測轉成 BEV geometry prior，作為 optional second-stage；第一版優先做 map logits residual / gate conditioning，不直接改 map feature。
@@ -91,7 +92,7 @@ MAESTRO 的價值是指出 shared backbone MTL 會有 feature interference，並
 
 - **OCC**：超過 39.72，至少希望 +0.3 到 +0.8；不能低於 39.5。
 - **Map**：維持或超過 45.79，理想上推到 46.x；Occ-to-Map 若加入，epoch 24 低於 45.6 就應放棄該方向。
-- **Class-level**：Map 優先看 `stop_line / divider / ped_crossing / carpark_area`；OCC 優先看 `driveable_surface / sidewalk / other_flat / terrain / manmade` 和容易受道路拓撲影響的類別。
+- **Class-level**：Map 優先看 `stop_line / divider / ped_crossing / carpark_area`；OCC 優先看 `driveable_surface / sidewalk / terrain / manmade` 和容易受道路拓撲影響的類別。
 - **Ablation**：單向 Map->Occ、單向 Occ->Map、雙向、no-gate、no-stop-gradient、raw concat 必須能說明模組不是偶然調參。
 
 ## 要增加什麼模組
@@ -105,16 +106,25 @@ MAESTRO 的價值是指出 shared backbone MTL 會有 feature interference，並
 核心流程用橫向寫法：
 
 ```text
-map_logits -> sigmoid confidence -> masked pooling on map_feature -> 6 layout tokens
+map_feature -> BEVSegHead -> map_logits -> sigmoid confidence
+          -> masked pooling on map_feature -> 6 layout tokens
+          -> Linear(128 -> D_occ)
           -> semantic-masked learnable relation -> background OCC query offsets
-          -> Q_occ_bg + alpha_m2o * gate * Delta_Q_bg -> PQD
+          -> optional query_residual for background semantic queries -> PQD
 ```
 
 輸入：
 
 - `map_feature`: map neck 輸出的 BEV feature，shape 約為 `[B, 128, 200, 200]`
 - `map_logits`: BEVSegHead 輸出的 map logits，shape 約為 `[B, 6, 200, 200]`
-- `Q_occ`: PQD semantic queries / scene-aware queries，shape 依 ProtoOcc PQD 設定
+- `K_bg`: OCC 18 個 semantic queries 中，第一版允許接受 Map-to-Occ residual 的 background/layout subset 大小；主設定不是所有 background 類都接收 layout prior
+- `query_residual`: 傳給 PQD 的 optional residual，shape 對齊 PQD 的 semantic query 維度；第一版只對 18 個 occupancy semantic queries 中的 background indices 非零
+
+目前 code hook 要注意：
+
+- 現有 `ProtoOccCnnSegHead.forward_train()` 是先跑 `cnn3d_decoder -> PQD loss`，之後才跑 `BEVSegHead` 算 map logits。因此 Map-to-Occ 不能只在 detector 端「事後」改 query；第一版需要把 map head 前移到 PQD 前，先得到 `map_logits / T_map`，再把 `query_residual` 傳進 PQD。
+- PQD 需要新增一個 optional argument，例如 `query_residual=None`。Baseline config 不給這個 argument 時，PQD 行為必須完全不變。
+- 不改 PQD 的 mask prediction / loss / RPL 主邏輯，只在 query synthesis 完成後、`query_self_attn` 前，把 residual 加到真正 semantic queries 上。
 
 做法：
 
@@ -124,54 +134,69 @@ map_logits -> sigmoid confidence -> masked pooling on map_feature -> 6 layout to
 P_map = sigmoid(map_logits)  # [B, 6, H, W]
 ```
 
-2. 使用 predicted map confidence 對 `map_feature` 做 masked average pooling，得到 6 個 layout tokens：
+2. 使用 predicted map confidence 對 `map_feature` 做 masked average pooling，得到 6 個 layout tokens。若某一個 map class 在該 frame 幾乎不存在，該 class token 直接設為 0，避免低 confidence mask 退化成 noisy global average：
 
 ```text
-T_map = MaskedAvgPool(map_feature, P_map)  # [B, 6, D]
+T_map_raw[c] = MaskedAvgPool(map_feature, P_map[c])
+if sum(P_map[c]) < eps:
+    T_map_raw[c] = 0
+
+T_map_raw = [B, 6, 128]
 ```
 
-3. 建立 `6 x K_bg` 的 semantic mask，其中 `K_bg` 只包含 OCC background/layout semantic queries，例如：
+3. 先做 channel projection，再做 semantic relation。`Linear(128 -> D_occ)` 只負責 channel 對齊；`semantic-masked learnable relation` 只負責 map token 到 OCC query token 的類別 mixing，mask 不作用在 channel projection 上：
 
 ```text
-OCC background group = [
-  driveable_surface, sidewalk, other_flat,
-  terrain, manmade, vegetation
+T_map = Linear_128_to_Docc(T_map_raw)  # [B, 6, D_occ]
+```
+
+4. 建立 `6 x K_bg` 的 semantic mask，其中 `K_bg=4`，只包含第一版真的允許被 map layout prior 修改的 OCC background/layout semantic queries：
+
+```text
+OCC layout target group = [
+  driveable_surface, sidewalk, terrain, manmade
 ]
 ```
 
-第一版 relation mask 建議：
+第一版 relation mask 建議已用 full train split GT 統計校正。統計來源是 `work_dirs/occ_map_overlap_z0_3_train_non_free.md`，Z=0~3 weighted 的 `Map -> OCC` 顯示：`drivable_area / ped_crossing / stop_line / divider` 主要落在 `driveable_surface`，`walkway` 主要落在 `sidewalk`，`carpark_area` 主要也是 `driveable_surface` 而不是 `other_flat`。
 
 | Map class | Allowed OCC background queries |
 | --- | --- |
-| `drivable_area` | `driveable_surface`, `other_flat` |
+| `drivable_area` | `driveable_surface` |
 | `ped_crossing` | `driveable_surface`, `sidewalk` |
-| `walkway` | `sidewalk`, `terrain` |
+| `walkway` | `sidewalk`, `terrain`, `manmade` |
 | `stop_line` | `driveable_surface` |
-| `carpark_area` | `driveable_surface`, `other_flat` |
+| `carpark_area` | `driveable_surface` |
 | `divider` | `driveable_surface` |
 
-4. 在這個 semantic mask 內學 relation weight，mask 外權重固定為 0：
+不把 `other_flat` 和 `vegetation` 放進第一版主 mask。雖然 `other_flat -> drivable_area` 在反向 coverage 裡有一定比例，但 Map -> OCC 的 `drivable_area / carpark_area` 對 `other_flat` 只有弱比例；`vegetation` 也沒有穩定對應的 map class。第一版應保持 relation mask 窄一點，這兩類的 `query_residual` 預設固定為 0；`other_flat` 可以放到 weak-relation ablation，`vegetation` 只在後續有明確統計或 class-level need 時再打開。
+
+5. 在這個 semantic mask 內學 relation weight，mask 外權重固定為 0：
 
 ```text
-R_m2o = SemanticMaskedLearnableRelation(mask=M_map_occ)  # [6, K_bg]
-Delta_Q_bg = R_m2o(T_map)                                # [B, K_bg, D_occ]
-Delta_Q_fg = 0                                           # foreground / dynamic queries 不被 map layout 改
+R_m2o = SemanticMaskedLearnableRelation(mask=M_map_occ)       # [6, K_bg]
+Delta_Q_bg = einsum("bmd,mk->bkd", T_map, R_m2o)              # [B, K_bg, D_occ]
+Delta_Q_other_background = 0                                  # other_flat / vegetation 等未開啟類別
+Delta_Q_fg = 0                                                # foreground / dynamic queries 不被 map layout 改
 ```
 
-5. 用 zero-init residual gate 加到 background OCC query，而不是加到 comprehensive voxel feature：
+6. 用 zero-residual gate 加到 background OCC query，而不是加到 comprehensive voxel feature：
 
 ```text
-Q_occ_bg' = Q_occ_bg + alpha_m2o * Gate_m2o(Q_occ_bg, T_map) * Delta_Q_bg
+Q_occ_layout' = Q_occ_layout + alpha_m2o * Gate_m2o(Q_occ_layout, T_map) * Delta_Q_bg
+Q_occ_other_background' = Q_occ_other_background
 Q_occ_fg' = Q_occ_fg
 ```
 
 設計原則：
 
-- `alpha_m2o` 初始為 0，確保一開始等價 baseline。
+- `alpha_m2o` 初始為 0，確保一開始等價 baseline；adapter / relation projection 本身正常初始化，不再把 adapter 最後一層也 zero-init，避免 `alpha=0` 且 `Delta_Q=0` 造成 residual branch 初期沒有有效學習訊號。
 - 第一版 `T_map` 預設 detach，只阻斷 OCC loss 回頭改 map side-path；但 map 主路徑仍正常由 map loss 更新。
 - 不使用 GT map mask，不做 GT-guided support mining。
+- `MaskedAvgPool` 對 absent / low-confidence map class 使用 zero-token fallback，並讓 gate 根據 zero token 自然壓低該 class 的 residual。
 - 不讓 layout prior 直接改 dynamic foreground OCC queries，避免 map layout 把車、人等 movable object prototypes 拉壞。
 - Relation 是 **masked learnable**：比純手工 mapping 更有學習能力，也比完全自由 relation 更不容易學到錯誤跨類別捷徑。
+- PQD training 有 RPL padding queries。訓練時 PQD 會先把 `RPL_Groups * num_classes` 個 RPL query 放在前面，再接原本 18 個 semantic queries。`query_residual` 只能加在後段真正 semantic queries 的 background indices；RPL query residual 必須固定為 0，避免把 layout prior 加到 augmentation/noise query 上。
 
 ### Module B: Occ-to-Map Geometry Adapter
 
@@ -183,7 +208,7 @@ Occ-to-Map 的風險比 Map-to-Occ 高，因為 OCC logits 在 early stage 很 n
 
 ```text
 map_feature -> BEVSegHead -> base_map_logits
-occ_logits -> HeightPool -> G_occ.detach() -> zero-init logit_adapter -> Delta_map_logits
+coarse prototype occ pred -> HeightPool -> G_occ.detach() -> logit_adapter -> Delta_map_logits
 base_map_logits + beta_o2m * Delta_map_logits -> final_map_logits
 ```
 
@@ -191,7 +216,7 @@ base_map_logits + beta_o2m * Delta_map_logits -> final_map_logits
 
 ```text
 map_feature -> BEVSegHead gate / predictor
-occ_logits -> HeightPool -> G_occ.detach() -> condition_adapter -> gate_bias
+coarse prototype occ pred -> HeightPool -> G_occ.detach() -> condition_adapter -> gate_bias
 gate + gate_bias -> final map logits
 ```
 
@@ -203,14 +228,21 @@ map_feature + alpha_o2m * Gate_o2m(map_feature, G_occ) * Delta_F_map -> BEVSegHe
 
 輸入：
 
-- `occ_logits` 或 `prototype_occ_pred`: coarse/final occupancy prediction
+- `prototype_occ_pred`: `cnn3d_decoder` 直接輸出的 coarse occupancy logits，shape 約為 `[B, 200, 200, 16, 18]`
 - `map_feature`: map neck feature `[B, 128, 200, 200]`
 - `base_map_logits`: BEVSegHead 原始輸出 `[B, 6, 200, 200]`
+
+第一版明確使用 **coarse prototype occ pred**，不是 final PQD prediction。理由：
+
+- `prototype_occ_pred` 是現有 training path 已經直接可得的 coarse 3D logits，不需要重構 PQD 回傳 final voxel probability。
+- final PQD prediction 在目前 training API 只進 loss，不回傳完整 formatted occ probability；若為了 Occ-to-Map 強行改 PQD 回傳 final prediction，會把第一版 LGMG 的改動面變大。
+- Occ-to-Map 本來就是 optional second-stage。先用 coarse geometry prior 驗證「3D geometry cue 是否能補 map」，若 coarse 版本無效，不應急著用更重的 final PQD prediction 搶救。
+- 若後續真的要測 final PQD source，應獨立成 ablation：`o2m_source = coarse_proto | final_pqd_detached`。
 
 OCC geometry summary：
 
 ```text
-G_occ = HeightPool(occ_logits.detach())  # [B, C_geo, H, W]
+G_occ = HeightPool(prototype_occ_pred.detach())  # [B, C_geo, H, W]
 ```
 
 建議包含：
@@ -236,11 +268,11 @@ epoch 7-10: beta_o2m linear warmup
 epoch 11+:  normal training
 ```
 
-如果是從已訓練好的 `map_loss_weight=4` checkpoint fine-tune，可以縮短成 1-2 epoch warmup；從 scratch 訓練則不要提早開 Occ-to-Map。
+本研究線不採 fine-tune，全部從 scratch 訓練。因此 Occ-to-Map 不應一開始就放進 main method；主線先跑 Map-to-Occ only。若要做 Occ-to-Map ablation，從 scratch 訓練時也必須依照上面 warmup：epoch 0-6 完全 disable，epoch 7-10 線性開啟，不能在 epoch 0 就讓 noisy OCC logits 影響 map。
 
 stop criterion：
 
-- epoch 11 要和同 epoch baseline 比。如果 baseline epoch 11 約為 Map 43.82，Occ-to-Map 低於 43.5 就停，不繼續調。
+- epoch 11 要和同 epoch baseline (weight4 epoch 11 EMA) 比。如果 baseline epoch 11 約為 Map 43.82，Occ-to-Map 低於 43.5 就停，不繼續調。
 - epoch 24 若 Map < 45.6，放棄 Occ-to-Map，不要一直做 detach / gate tuning。
 - 如果 Occ-to-Map 只帶來 Map ±0.3，而 OCC 不變，應把它當 optional ablation，不硬放進主方法。
 
@@ -248,9 +280,9 @@ stop criterion：
 
 - 第一版 `G_occ` 預設 detach，但這只 detach side-path source，不是 `detach_map_feature=True` 那種硬隔離。
 - Map 主路徑仍然正常反傳到 map neck 和 shared BEV feature。
-- Adapter 必須 zero-init，讓初始輸出等價 baseline。
+- `beta_o2m` 初始為 0 或由 schedule 控制為 0，讓初始輸出等價 baseline；logit adapter 本身正常初始化，不和 `beta_o2m=0` 疊加成雙重 zero-init。
 - 不使用 OCC prototype 去取代 map prototype；CNN map head 仍是主輸出。
-- 不在第一版同時讓 MSFP 和 Occ-to-Map 修改同一份 map feature。
+- 目前 code 還沒有 MSFP，只有 map-specific BEV neck + BEVSegHead。未來如果再做 MSFP / active-region feature residual，不能和 Occ-to-Map feature residual 同時修改同一份 `map_feature`；第一版 Occ-to-Map 只做 logits residual / gate conditioning。
 
 ### Module C: Task-Protected Gating
 
@@ -258,7 +290,7 @@ stop criterion：
 
 設計：
 
-- `alpha_m2o`、`beta_o2m`、`alpha_o2m` 為可學習 scalar，初始化 0；其中 `alpha_o2m` 只用於高風險 feature residual ablation。
+- `alpha_m2o`、`beta_o2m`、`alpha_o2m` 為 residual scalar，初始化 0 或由 schedule 從 0 開始；其中 `alpha_o2m` 只用於高風險 feature residual ablation。Adapter / projection 層正常初始化，避免 residual scalar 和 adapter output 同時為 0。
 - Gate 使用 sigmoid，輸入是 target feature + source prior 的簡單 concat/projection。
 - Source prior 預設走 stop-gradient side path，之後做 no-detach ablation。
 - 所有 adapter 都是 residual；第一版 Occ-to-Map 不改原本 map feature，只改 logits 或 gate。
@@ -302,17 +334,18 @@ map_feature -> map head -> map loss -> 正常更新 map 主路徑
 
 | 檔案 | 預計改動 |
 | --- | --- |
-| `projects/mmdet3d_plugin/models/detectors/ProtoOccCnnSegHead.py` | 在 `forward_train` / `simple_test` 接入 query residual 與 logits residual；保留原 baseline path 可關閉 |
-| `projects/mmdet3d_plugin/models/backbones/dual_branch_encoder.py` | 原則上不改 HFM 主幹；如需更多中間 feature，只新增 optional return，不改既有輸出 |
-| `projects/mmdet3d_plugin/models/dense_heads/bev_seg_head.py` | 原則上不改主結構；若需要，僅支援回傳 `base_map_logits` / 接收 logits residual |
+| `projects/mmdet3d_plugin/models/detectors/ProtoOccCnnSegHead.py` | 將 map logits 計算前移到 PQD 前以產生 `T_map / query_residual`；在 `forward_train` / `simple_test` 接入 query residual 與 logits residual；保留原 baseline path 可關閉 |
+| `projects/mmdet3d_plugin/models/backbones/dual_branch_encoder.py` | 不改；LGMG 第一版不從 HFM / DBE 取新的中間 feature |
+| `projects/mmdet3d_plugin/models/dense_heads/bev_seg_head.py` | 原則上不改主結構；僅需確保 forward 可回傳 `base_map_logits`，logits residual 在 detector 端相加 |
+| `projects/mmdet3d_plugin/models/OccHead/Prototype_Query_Decoder_nuScenes.py` | 新增 optional `query_residual=None`；只在 query synthesis 後、`query_self_attn` 前加到真正 semantic queries，RPL padding queries 不加 |
 | `projects/mmdet3d_plugin/models/__init__.py` 或相關 registry import | 註冊新 task module |
 | `experiment_results_summary.md` | 實驗完成後新增 LGMG 結果、單向 ablation、失敗案例 |
 
 ### 優先不要改
 
-- 不改 `Prototype_Query_Decoder_nuScenes.py` 的核心 PQD 邏輯；第一版只在 detector 端調整 query input 或 query residual。
+- 不改 `Prototype_Query_Decoder_nuScenes.py` 的核心 PQD 邏輯、loss、mask prediction、RPL mask/noise 生成；只新增 optional `query_residual` 入口，且預設 `None` 時完全等價原本 PQD。
 - 不改 `BEVSegHead` 主結構；map head 繼續使用 CNN head。
-- 不把 LGMG 寫進 `Dual_Branch_Encoder` 的 HFM 裡。
+- 不改 `Dual_Branch_Encoder` / HFM；LGMG 第一版只接在 task-specific head side path。
 - 不讓 Occ-to-Map 第一版直接改 `map_feature`；feature residual 只作高風險 ablation。
 
 ## 實驗計劃
@@ -322,7 +355,8 @@ map_feature -> map head -> map loss -> 正常更新 map 主路徑
 確認目前 baseline：
 
 - `CNN head + 128ch map neck + map_loss_weight=4`: Occ 39.72 / Map 45.79
-- `overlay_dynamic` epoch 24 若已完成，也加入比較；epoch 5/11 只能當 early signal。
+- `overlay_dynamic` epoch 24 已完成：Occ 39.52 / Map 46.00。它是 map protection loss 的目前 best map score，但 OCC 比 weight4 低 0.20；LGMG 主線仍先和 weight4 比 OCC recovery，再檢查是否能和 overlay_dynamic 組合。
+- `overlay_dynamic` epoch 5/11 只能當 early signal，不當 paper-level acceptance criterion。
 
 ### Stage 1: Map-to-Occ only, semantic-masked learnable relation
 
@@ -335,6 +369,8 @@ relation_mode = "semantic_masked_learnable"
 target_occ_group = "background_only"
 map_prior_detach = True
 alpha_m2o init = 0
+adapter projection normal init
+RPL query residual = 0
 ```
 
 預期：
@@ -367,7 +403,7 @@ alpha_m2o init = 0
 設定：
 
 ```text
-occ_logits -> HeightPool -> G_occ.detach() -> zero-init LogitAdapter
+coarse prototype occ pred -> HeightPool -> G_occ.detach() -> LogitAdapter
 final_map_logits = base_map_logits + beta_o2m * Delta_map_logits
 
 epoch 0-6:  beta_o2m = 0
@@ -380,6 +416,7 @@ epoch 11+:  normal
 - Map 不低於 45.79；最低不可低於 45.6。
 - 優先觀察 `drivable_area / carpark_area / divider`，但不要預設一定能改善 `stop_line`。
 - OCC 幾乎不變，因為 OCC 只是 source side。
+- 不建議一開始就把 Occ-to-Map 放進主方法。從 scratch 訓練時 early OCC logits noisy，且 Map 已經接近 upper bound；先用 Map-to-Occ 驗證 layout prior 能不能補 OCC，再單獨開 Occ-to-Map ablation。
 
 stop criterion：
 
@@ -409,7 +446,7 @@ stop criterion：
 | free relation vs semantic-masked learnable relation | 檢查語意遮罩是否必要 |
 | foreground relation enabled | 證明 dynamic foreground prototypes 不應被 map layout 改 |
 | Occ->Map logits residual vs gate conditioning | 找較安全的 O2M 注入方式 |
-| Occ->Map feature residual | 高風險 ablation；檢查直接改 map feature 是否和 MSFP/BEVSegHead 打架 |
+| Occ->Map feature residual | 高風險 ablation；目前 code 只有 map-specific BEV neck + BEVSegHead，未來若加入 MSFP，要檢查直接改 map feature 是否和 MSFP/BEVSegHead 打架 |
 | no warmup Occ-to-Map | negative ablation；檢查 early noisy OCC 是否傷 map |
 
 ### Stage 6: Paper table
@@ -422,7 +459,7 @@ stop criterion：
 | Naive Occ+Map MTL | 32.54 | 16.13 | naive map head |
 | CNN map neck MTL | 39.82 | 39.94 | task-specific map feature |
 | CNN map neck + map priority | 39.72 | 45.79 | strong baseline |
-| + overlay dynamic | TBD | TBD | map protection loss |
+| + overlay dynamic | 39.52 | 46.00 | map protection loss；Map +0.21，但 OCC -0.20 |
 | + Map-to-Occ masked relation | TBD | TBD | layout prior to OCC background queries |
 | + Occ-to-Map logits residual | TBD | TBD | optional geometry prior |
 | + LGMG full | TBD | TBD | only if O2M passes stop criterion |
@@ -511,10 +548,10 @@ ProtoMapHead + map neck / PQD-align / 256ch 版本都沒有超過 CNN head + 128
 ## 預期風險
 
 - **Map 已接近 upper bound，提升空間有限**：因此 LGMG 不能只看 Map，必須看 OCC 是否受益。
-- **Cross-task guidance 可能變成新的污染源**：需要 zero-init、gate、side-path detach 和 raw concat ablation。
+- **Cross-task guidance 可能變成新的污染源**：需要 zero-residual scalar、gate、side-path detach 和 raw concat ablation；adapter / projection 本身正常初始化，避免 scalar 和 adapter output 同時為 0。
 - **OCC prediction early stage 不穩**：Occ-to-Map 必須有明確 warmup；從 scratch 訓練 epoch 0-6 完全 disable，epoch 7-10 線性開啟。
 - **Occ-to-Map 收益可能很小**：Map 已經 45.79，距離 map-only 48.34 只剩 2.55。若 epoch 24 Map < 45.6，直接放棄 Occ-to-Map。
-- **和 MSFP 相容性不能太樂觀**：MSFP 已經在 map branch 做 active-region residual。LGMG 第一版應先只開 Map-to-Occ，或讓 Occ-to-Map 只做 logits residual / gate conditioning；不要讓兩個模組同時改同一份 `map_feature`。
+- **和未來 MSFP 相容性不能太樂觀**：目前 code 還沒有 MSFP，只有 map-specific BEV neck + BEVSegHead。LGMG 第一版應先只開 Map-to-Occ，或讓 Occ-to-Map 只做 logits residual / gate conditioning；未來若加入 MSFP / active-region feature residual，不要讓兩個模組同時改同一份 `map_feature`。
 - **計算量增加**：adapter 必須輕量，避免 MAESTRO-2T 那種資源壓力。
 - **語意對應不完全**：Map 六類和 OCC semantic queries 不是一對一。第一版用 semantic-masked learnable relation，並用 fixed / free / foreground-enabled relation ablation 證明設計必要性。
 
@@ -527,7 +564,7 @@ ProtoMapHead + map neck / PQD-align / 256ch 版本都沒有超過 CNN head + 128
 理想結果：
 
 - Occ mIoU 從 39.72 提升到 40.x。
-- Map mIoU 維持 45.79 以上，最好推到 46.x。
+- Map mIoU 維持 45.79 以上，最好推到 46.x；若和 `overlay_dynamic` 組合，應檢查是否能接近或維持 46.00，同時把 OCC 從 39.52 拉回來。
 - 單向 ablation 顯示 Map-to-Occ masked relation 主要幫 OCC，Occ-to-Map logits residual 若有效則主要幫 Map。
 - no-detach / no-gate / raw concat ablation 證明受控 side path 的必要性。
 
