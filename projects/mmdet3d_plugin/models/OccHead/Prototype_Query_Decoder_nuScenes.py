@@ -3,6 +3,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import logging
 from mmcv.runner import force_fp32
 from mmdet.core import build_assigner, build_sampler, reduce_mean, multi_apply
 from mmdet.models.builder import HEADS, build_loss
@@ -37,9 +38,17 @@ class Prototype_Query_Decoder_nuScenes(MaskHead):
                  shift_noise = [10,10,3],
                  mask_size=[200,200,16],
                  with_cp = False,
+                 debug_query_residual=False,
+                 debug_query_residual_max_calls=10,
+                 debug_query_residual_indices=(11, 13, 14, 15),
                  **kwargs):
         super(AnchorFreeHead, self).__init__(init_cfg)
         self.with_cp = with_cp
+        self.debug_query_residual = bool(debug_query_residual)
+        self.debug_query_residual_max_calls = int(debug_query_residual_max_calls)
+        self._debug_query_residual_calls = 0
+        self.debug_query_residual_indices = tuple(
+            int(index) for index in debug_query_residual_indices)
         self.num_occupancy_classes = num_occupancy_classes
         self.num_classes = self.num_occupancy_classes
         self.num_queries = num_queries
@@ -347,6 +356,43 @@ class Prototype_Query_Decoder_nuScenes(MaskHead):
             raise ValueError(
                 'query_residual shape after RPL padding must match query_feat: '
                 f'{tuple(query_residual.shape)} vs {tuple(query_feat.shape)}.')
+
+        if (self.debug_query_residual and
+                self._debug_query_residual_calls <
+                self.debug_query_residual_max_calls):
+            indices = torch.tensor(
+                self.debug_query_residual_indices,
+                dtype=torch.long,
+                device=query_feat.device)
+            if torch.any(indices < 0) or torch.any(indices >= self.num_queries):
+                raise ValueError(
+                    'debug_query_residual_indices must be valid semantic '
+                    f'query indices in [0, {self.num_queries}).')
+            indices = indices + RPL_pad_size
+            with torch.no_grad():
+                target_residual = query_residual.index_select(0, indices)
+                target_query = query_feat.index_select(0, indices)
+                residual_norm = target_residual.detach().norm(dim=-1).mean()
+                query_norm = target_query.detach().norm(dim=-1).mean()
+                ratio = residual_norm / query_norm.clamp_min(1e-6)
+                per_class_residual = (
+                    target_residual.detach().norm(dim=-1).mean(dim=1))
+                per_class_query = target_query.detach().norm(dim=-1).mean(dim=1)
+                per_class_ratio = per_class_residual / per_class_query.clamp_min(1e-6)
+            logging.getLogger('mmdet').warning(
+                '[LGMG PQD debug] call=%d RPL_pad_size=%d '
+                'target_res_norm=%.6f target_query_norm=%.6f ratio=%.6f '
+                'per_class_res_norm=%s per_class_query_norm=%s '
+                'per_class_ratio=%s',
+                self._debug_query_residual_calls,
+                RPL_pad_size,
+                float(residual_norm),
+                float(query_norm),
+                float(ratio),
+                [round(float(x), 6) for x in per_class_residual],
+                [round(float(x), 6) for x in per_class_query],
+                [round(float(x), 6) for x in per_class_ratio])
+            self._debug_query_residual_calls += 1
         return query_feat + query_residual
 
     def preprocess_gt(self, gt_occ, img_metas):

@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from mmcv.runner import BaseModule
+import logging
 
 from mmdet3d.models.builder import HEADS
 
@@ -23,6 +24,8 @@ class MapToOccLayoutAdapter(BaseModule):
                  relation_init_std=0.02,
                  gate_mode='source_only',
                  gate_hidden_channels=None,
+                 debug=False,
+                 debug_max_calls=10,
                  init_cfg=None):
         super(MapToOccLayoutAdapter, self).__init__(init_cfg)
         self.in_channels = int(in_channels)
@@ -32,6 +35,9 @@ class MapToOccLayoutAdapter(BaseModule):
         self.map_prior_detach = bool(map_prior_detach)
         self.eps = float(eps)
         self.gate_mode = str(gate_mode)
+        self.debug = bool(debug)
+        self.debug_max_calls = int(debug_max_calls)
+        self._debug_calls = 0
         if self.gate_mode != 'source_only':
             raise NotImplementedError(
                 'MapToOccLayoutAdapter currently implements only '
@@ -154,7 +160,34 @@ class MapToOccLayoutAdapter(BaseModule):
         delta = delta * gate * source_valid.unsqueeze(-1).to(delta.dtype)
         delta = self.alpha.to(delta.dtype) * delta
 
-        return torch.einsum(
+        query_residual = torch.einsum(
             'bkd,kq->bqd',
             delta,
             self.target_selector.to(dtype=delta.dtype, device=delta.device))
+
+        if self.debug and self._debug_calls < self.debug_max_calls:
+            logger = logging.getLogger('mmdet')
+            with torch.no_grad():
+                raw_token_norm = raw_tokens.detach().norm(dim=-1).mean(dim=0)
+                map_token_norm = map_tokens.detach().norm(dim=-1).mean(dim=0)
+                delta_norm = delta.detach().norm(dim=-1).mean(dim=0)
+                residual_norm = query_residual.detach().norm(dim=-1).mean(dim=0)
+                gate_mean = gate.detach().mean(dim=0).flatten()
+                valid_ratio = source_valid.detach().float().mean(dim=0)
+            logger.warning(
+                '[LGMG adapter debug] call=%d alpha=%.6f '
+                'delta_mean_norm=%.6f residual_mean_norm=%.6f '
+                'raw_token_norm=%s map_token_norm=%s delta_norm=%s '
+                'gate_mean=%s source_valid_ratio=%s',
+                self._debug_calls,
+                float(self.alpha.detach()),
+                float(delta.detach().norm(dim=-1).mean()),
+                float(query_residual.detach().norm(dim=-1).mean()),
+                [round(float(x), 6) for x in raw_token_norm],
+                [round(float(x), 6) for x in map_token_norm],
+                [round(float(x), 6) for x in delta_norm],
+                [round(float(x), 6) for x in gate_mean],
+                [round(float(x), 6) for x in valid_ratio])
+            self._debug_calls += 1
+
+        return query_residual
