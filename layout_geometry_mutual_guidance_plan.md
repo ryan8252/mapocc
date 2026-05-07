@@ -401,6 +401,13 @@ RPL query residual = 0
 - `MapToOccLayoutAdapter` 已加入 `target_occ_indices` duplicate check，避免 config 重複 index 造成 silent overwrite。
 - 已完成 smoke 檢查：`py_compile`、adapter tensor smoke、config/registry smoke、PQD residual/RPL padding smoke、`git diff --check`。本機環境顯示 `No CUDA runtime is found`，所以尚未跑完整 training smoke。
 
+暫停stage 1:
+
+- epoch 5 ema: map 41.27, occ 37.93
+- 沒有幫到occ 反而加強map
+- 當前 source-only gated relation 學歪了，主要把 capacity 花在 driveable_surface，這不是我們要的效果。
+- 反正OCC很強了，所以就是不加強他了
+
 ### Stage 2: Relation 設計 ablation
 
 目的：證明不是任意 relation 都可以，semantic mask 是必要保護。
@@ -412,6 +419,37 @@ RPL query residual = 0
 | free learnable relation | 若不穩或退步，證明完全自由跨類別 relation 會學到捷徑 |
 | foreground relation enabled | negative ablation；若 OCC dynamic classes 退步，證明 layout 不應改 foreground queries |
 | no detach map prior | 檢查 OCC loss 回頭改 map branch 是否造成污染 |
+
+暫停stage 2:
+
+- stage 1 就已經暫停了，所以這些 ablation 也不建議繼續做了。
+
+### 2026-05-07 commit / branch handoff
+
+本次 `layout_geometry_mutual_guidance_plan.md` 的修改用途是保留 Stage 1 / Stage 2 暫停判斷，並明確記錄 Stage 3 需要和 Stage 1 code 分開。這個 commit 只應包含 plan 文件，不要加入 `mmdetection3d/` 或其他未追蹤目錄。
+
+建議 commit message：
+
+```text
+docs: record LGMG Stage 1 pause and Stage 3 split
+```
+
+建議操作流程：
+
+```bash
+git status --short
+git add layout_geometry_mutual_guidance_plan.md
+git commit -m "docs: record LGMG Stage 1 pause and Stage 3 split"
+git status --short
+```
+
+後續 Stage 3 不應從目前 `feat/LGMG` HEAD 直接開發，因為 `feat/LGMG` 已經包含 Stage 1 Map-to-Occ adapter 與 debug code。若要做沒有 Stage 1 / Stage 2 的 Occ-to-Map only 分支，建議從只有 LGMG plan、尚未加入 Stage 1 實作的 `0bca839` 開新分支：
+
+```bash
+git switch -c feat/LGMG-o2m-only 0bca839
+```
+
+若需要把這份最新 plan 紀錄也帶到 `feat/LGMG-o2m-only`，可以在新分支建立後 cherry-pick 上面這個 docs commit。這樣 Stage 3 code base 仍然不含 Stage 1 實作，但 plan 會保留最新暫停紀錄。
 
 ### Stage 3: Optional Occ-to-Map logits residual
 
