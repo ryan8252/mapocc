@@ -2,6 +2,8 @@
 
 日期：2026-05-06
 
+更新：2026-05-07。Stage 1 / Stage 2 已暫停；Stage 3 改為獨立的 **Occ-to-Map only map recovery** 實驗，不再和 Stage 1 Map-to-Occ code 綁在一起。
+
 ## 動機
 
 目前 Occ+Map 多任務線已經從「map 明顯被壓制」推進到「map 接近 map-only upper bound」：
@@ -24,9 +26,11 @@
 因此本計劃提出 **Layout-Geometry Mutual Guidance (LGMG)**：以 `CNN head + 128ch map neck + map_loss_weight=4` 為強 baseline，新增兩個輕量、可關閉、zero-residual 的 cross-task guidance adapter：
 
 1. **Map-to-Occ Layout Query Adapter**：把 map 預測轉成 layout prior，透過 semantic-masked learnable relation 只注入 OCC background semantic queries。
-2. **Occ-to-Map Geometry Adapter**：把 OCC 預測轉成 BEV geometry prior，作為 optional second-stage；第一版優先做 map logits residual / gate conditioning，不直接改 map feature。
+2. **Occ-to-Map Geometry Adapter**：把 OCC 預測轉成 BEV geometry prior。2026-05-07 之後先作為獨立 Stage 3 map recovery path；第一版優先做 map logits residual，不直接改 map feature，也不引入 Stage 1 的 PQD query residual。
 
 這不是 teacher distillation，也不是 GT-guided mining。兩個任務仍然 end-to-end 一起訓練；只是 cross-task guidance 走受控 side path，而不是把 raw feature 直接混進 shared DBE/HFM。
+
+目前實驗策略已調整：Stage 1 的 source-only Map-to-Occ relation 在 epoch 5 EMA 沒有幫到 OCC，因此先暫停；Stage 2 relation ablation 也同步暫停。Stage 3 需從不含 Stage 1 / Stage 2 實作的分支獨立驗證 OCC geometry prior 是否能補 Map。
 
 ## 要挑戰的是什麼
 
@@ -92,6 +96,7 @@ MAESTRO 的價值是指出 shared backbone MTL 會有 feature interference，並
 
 - **OCC**：超過 39.72，至少希望 +0.3 到 +0.8；不能低於 39.5。
 - **Map**：維持或超過 45.79，理想上推到 46.x；Occ-to-Map 若加入，epoch 24 低於 45.6 就應放棄該方向。
+- **Stage 3 當前目標**：先補 Map 成績，正式比較 `map_loss_weight=4` 的 Occ 39.72 / Map 45.79；`overlay_dynamic` 的 Map 46.00 只作為第二階段組合參考，不應在第一個 O2M-only 實驗中混入。
 - **Class-level**：Map 優先看 `stop_line / divider / ped_crossing / carpark_area`；OCC 優先看 `driveable_surface / sidewalk / terrain / manmade` 和容易受道路拓撲影響的類別。
 - **Ablation**：單向 Map->Occ、單向 Occ->Map、雙向、no-gate、no-stop-gradient、raw concat 必須能說明模組不是偶然調參。
 
@@ -205,7 +210,15 @@ Q_occ_fg' = Q_occ_fg
 
 目的：讓 OCC 提供 3D geometry cue 給 Map，但不把 OCC prototype 當成 map prototype 使用，也不在第一版直接改 map feature。
 
-Occ-to-Map 的風險比 Map-to-Occ 高，因為 OCC logits 在 early stage 很 noisy，而且 Map 已經 45.79，提升空間有限。因此它應該是 optional second-stage。
+Occ-to-Map 的風險比 Map-to-Occ 高，因為 OCC logits 在 early stage 很 noisy，而且 Map 已經 45.79，提升空間有限。原本它被放在 optional second-stage；但 Stage 1 / Stage 2 已暫停後，Stage 3 改為獨立的 **O2M-only map recovery** 實驗，用乾淨 branch 檢查 3D geometry prior 是否能補 Map。
+
+Stage 3 的硬邊界：
+
+- 不啟用 Map-to-Occ adapter。
+- 不修改 PQD semantic query，也不新增 `query_residual`。
+- 不做 bidirectional LGMG。
+- 不疊 `overlay_dynamic`；第一個 O2M-only 實驗只和 `map_loss_weight=4` baseline 比。
+- OCC 只當 side-path source，預設 `detach()`，避免 map loss 或 adapter loss 反向污染 OCC 主路徑。
 
 第一版建議走 **logits residual**：
 
@@ -239,7 +252,7 @@ map_feature + alpha_o2m * Gate_o2m(map_feature, G_occ) * Delta_F_map -> BEVSegHe
 
 - `prototype_occ_pred` 是現有 training path 已經直接可得的 coarse 3D logits，不需要重構 PQD 回傳 final voxel probability。
 - final PQD prediction 在目前 training API 只進 loss，不回傳完整 formatted occ probability；若為了 Occ-to-Map 強行改 PQD 回傳 final prediction，會把第一版 LGMG 的改動面變大。
-- Occ-to-Map 本來就是 optional second-stage。先用 coarse geometry prior 驗證「3D geometry cue 是否能補 map」，若 coarse 版本無效，不應急著用更重的 final PQD prediction 搶救。
+- Stage 3 先用 coarse geometry prior 驗證「3D geometry cue 是否能補 map」。若 coarse 版本無效，不應急著用更重的 final PQD prediction 搶救，避免把失敗歸因變得不乾淨。
 - 若後續真的要測 final PQD source，應獨立成 ablation：`o2m_source = coarse_proto | final_pqd_detached`。
 
 OCC geometry summary：
@@ -256,6 +269,21 @@ G_occ = HeightPool(prototype_occ_pred.detach())  # [B, C_geo, H, W]
 - objectness / dynamic object group confidence
 - height mean / height max / vertical occupancy thickness
 
+HeightPool 第一版固定使用 nuScenes 18 類 index，不在不同實驗中任意改 grouping：
+
+| Geometry channel | OCC class indices | 說明 |
+| --- | --- | --- |
+| `free` | `[17]` | free voxel probability |
+| `occupied` | `1 - P_free` | 非 free confidence，包含 unknown / static / dynamic |
+| `ground_layout` | `[11, 12, 13, 14]` | `driveable_surface / other_flat / sidewalk / terrain` |
+| `structure` | `[15, 16]` | `manmade / vegetation` |
+| `dynamic` | `[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]` | `barrier` 到 `truck` 的 movable / object group |
+| `height_mean` | from `occupied` over z | `sum_z P_occ(z) * z_norm / (sum_z P_occ(z) + eps)` |
+| `height_max` | from `occupied` over z | occupied confidence 超過 threshold 的最高 z；若沒有 occupied voxel 則為 0 |
+| `occupied_count` | from `occupied` over z | `sum_z P_occ(z)`，表示 vertical thickness / occupancy mass |
+
+`others` class `[0]` 不單獨做 group；它已包含在 `occupied` 裡。若後續發現 unknown / ambiguous voxel 對 map 有幫助，再獨立做 ablation。
+
 logits residual：
 
 ```text
@@ -266,18 +294,29 @@ final_map_logits = base_map_logits + beta_o2m * Delta_map_logits
 warmup：
 
 ```text
-epoch 0-6:  beta_o2m = 0, disable Occ-to-Map
-epoch 7-10: beta_o2m linear warmup
-epoch 11+:  normal training
+beta_o2m(epoch) =
+  0                         if epoch <= 6
+  (epoch - 6) / 4 * beta_o2m_max
+                            if 7 <= epoch <= 10   # 0.25, 0.50, 0.75, 1.00 when beta_o2m_max=1.0
+  beta_o2m_max              if epoch >= 11
 ```
 
-本研究線不採 fine-tune，全部從 scratch 訓練。因此 Occ-to-Map 不應一開始就放進 main method；主線先跑 Map-to-Occ only。若要做 Occ-to-Map ablation，從 scratch 訓練時也必須依照上面 warmup：epoch 0-6 完全 disable，epoch 7-10 線性開啟，不能在 epoch 0 就讓 noisy OCC logits 影響 map。
+`beta_o2m_max` 是 config knob，第一版用 `1.0`，保留 `0.5` 作為 residual 過強時的 ablation。
+
+本研究線不採 fine-tune，全部從 scratch 訓練。因此 Stage 3 從 scratch 訓練時必須依照上面 warmup：epoch 0-6 residual scale 為 0，epoch 7-10 線性開啟，不能在 epoch 0 就讓 noisy OCC logits 影響 map。實作上不應把 warmup 寫成手動改 config；建議新增 hook 或 detector method，例如 `OccToMapWarmupHook -> model.set_o2m_epoch(runner.epoch)`，讓 `beta_o2m` 在訓練中自動更新。
+
+DDP 注意事項：
+
+- 若 `occ_to_map_adapter` 已在 model 裡，training path 應該每個 epoch 都 forward adapter，包含 `beta_o2m=0` 的 epoch 0-6；此時 adapter 參數在 autograd graph 內，只是 gradient 為 0，避免 DDP 判成 unused。
+- 第一版不要設定 `find_unused_parameters=True`；此 repo 既有訓練路徑對這個設定不穩，容易引入額外 DDP 問題。
+- 第一版也不要用 `if beta_o2m == 0: skip adapter forward`。若真的要跳過 forward，必須另寫 freeze / unfreeze hook 並獨立驗證，但這不進 Stage 3 主設定。
+- inference / evaluation 不需要 warmup，應直接使用 `beta_o2m_eval = beta_o2m_max`，避免 epoch 24 eval 仍看到 base map logits。
 
 stop criterion：
 
 - epoch 11 要和同 epoch baseline (weight4 epoch 11 EMA) 比。如果 baseline epoch 11 約為 Map 43.82，Occ-to-Map 低於 43.5 就停，不繼續調。
 - epoch 24 若 Map < 45.6，放棄 Occ-to-Map，不要一直做 detach / gate tuning。
-- 如果 Occ-to-Map 只帶來 Map ±0.3，而 OCC 不變，應把它當 optional ablation，不硬放進主方法。
+- 如果 Occ-to-Map 只帶來 Map ±0.3，而 thin / boundary classes 沒有穩定改善，應把它當 optional ablation，不硬放進主方法。
 
 設計原則：
 
@@ -319,37 +358,43 @@ map_feature -> map head -> map loss -> 正常更新 map 主路徑
 
 ### 新增檔案
 
+Stage 3 目前主線只新增 O2M-only 需要的檔案；Stage 1 Map-to-Occ 相關檔案暫停，不應出現在這個 branch 的第一版實作裡。
+
 | 檔案 | 用途 |
 | --- | --- |
-| `projects/mmdet3d_plugin/models/task_modules/layout_geometry_guidance.py` | 實作 `MapToOccLayoutAdapter`、`SemanticMaskedRelation`、`OccToMapLogitAdapter`、gating utilities |
-| `projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck_lgmg_m2o_masked_relation.py` | Map -> Occ only 主設定，semantic-masked learnable relation |
-| `projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck_lgmg_o2m_logits.py` | Occ -> Map logits residual optional ablation |
-| `projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck_lgmg_o2m_gate_condition.py` | Occ -> Map gate conditioning optional ablation |
-| `projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck_lgmg_o2m_feature_residual.py` | Occ -> Map feature residual 高風險 ablation |
-| `projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck_lgmg.py` | 雙向 LGMG 候選 config，只在 Occ-to-Map 通過 stop criterion 後使用 |
-| `projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck_lgmg_no_detach.py` | no stop-gradient ablation |
-| `projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck_lgmg_free_relation.py` | 完全自由 learnable relation negative ablation |
-| `projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck_lgmg_fixed_relation.py` | 固定 semantic relation ablation |
-| `projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck_lgmg_raw_concat.py` | raw concat / naive fusion negative ablation |
-| `TWCC/train_multi_cnn_head_map_neck_lgmg.sh` | TWCC 訓練 launcher |
+| `projects/mmdet3d_plugin/models/task_modules/occ_to_map_guidance.py` | 實作 `OccToMapGeometryAdapter`、HeightPool、logits residual adapter；不包含 Map-to-Occ relation |
+| `projects/mmdet3d_plugin/core/hook/occ_to_map_warmup.py` | 依 epoch 控制 `beta_o2m`：0-6 為 0，7-10 linear warmup，11+ 使用 `beta_o2m_max` |
+| `projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck_lgmg_o2m_logits.py` | Stage 3 O2M-only 主設定，從 `map_loss_weight=4` baseline 開始；包含 `beta_o2m_max=1.0` |
+| `TWCC/train_multi_cnn_head_map_neck_lgmg_o2m_logits.sh` | Stage 3 TWCC 訓練 launcher，work_dir 獨立於 Stage 1 |
+
+後續才考慮、目前不進 Stage 3 第一版：
+
+| 檔案 | 用途 |
+| --- | --- |
+| `projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck_lgmg_o2m_gate_condition.py` | O2M gate conditioning ablation，只有 logits residual 穩定後再做 |
+| `projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck_lgmg_o2m_feature_residual.py` | O2M feature residual 高風險 ablation，不進第一版 |
+| `projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck_lgmg_m2o_masked_relation.py` | Stage 1 Map-to-Occ 設定，已暫停，不應混入 Stage 3 branch |
+| `projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck_lgmg.py` | 雙向 LGMG 候選 config，只有 Stage 1 和 Stage 3 都通過後才考慮 |
 
 ### 修改檔案
 
 | 檔案 | 預計改動 |
 | --- | --- |
-| `projects/mmdet3d_plugin/models/detectors/ProtoOccCnnSegHead.py` | 將 map logits 計算前移到 PQD 前以產生 `T_map / query_residual`；在 `forward_train` / `simple_test` 接入 query residual 與 logits residual；保留原 baseline path 可關閉 |
+| `projects/mmdet3d_plugin/models/detectors/ProtoOccCnnSegHead.py` | 新增 optional `occ_to_map_adapter`。在 `cnn3d_decoder` 取得 `prototype_occ_pred` 後，對 map logits 加 O2M residual；`forward_train` 和 `simple_test` 都必須走同一個 final-logits helper；adapter 關閉時 baseline path 完全不變 |
 | `projects/mmdet3d_plugin/models/backbones/dual_branch_encoder.py` | 不改；LGMG 第一版不從 HFM / DBE 取新的中間 feature |
-| `projects/mmdet3d_plugin/models/dense_heads/bev_seg_head.py` | 原則上不改主結構；僅需確保 forward 可回傳 `base_map_logits`，logits residual 在 detector 端相加 |
-| `projects/mmdet3d_plugin/models/OccHead/Prototype_Query_Decoder_nuScenes.py` | 新增 optional `query_residual=None`；只在 query synthesis 後、`query_self_attn` 前加到真正 semantic queries，RPL padding queries 不加 |
-| `projects/mmdet3d_plugin/models/__init__.py` 或相關 registry import | 註冊新 task module |
+| `projects/mmdet3d_plugin/models/dense_heads/bev_seg_head.py` | 原則上不改主結構；`base_map_logits` 直接使用既有 forward 輸出，logits residual 在 detector 端相加 |
+| `projects/mmdet3d_plugin/models/OccHead/Prototype_Query_Decoder_nuScenes.py` | Stage 3 不改；不新增 `query_residual`，避免帶入 Stage 1 邏輯 |
+| `projects/mmdet3d_plugin/models/task_modules/__init__.py`、`projects/mmdet3d_plugin/core/hook/__init__.py` | 註冊 O2M adapter 與 warmup hook |
 | `experiment_results_summary.md` | 實驗完成後新增 LGMG 結果、單向 ablation、失敗案例 |
 
 ### 優先不要改
 
-- 不改 `Prototype_Query_Decoder_nuScenes.py` 的核心 PQD 邏輯、loss、mask prediction、RPL mask/noise 生成；只新增 optional `query_residual` 入口，且預設 `None` 時完全等價原本 PQD。
+- Stage 3 不改 `Prototype_Query_Decoder_nuScenes.py` 的核心 PQD 邏輯、loss、mask prediction、RPL mask/noise 生成，也不新增 optional `query_residual` 入口。
 - 不改 `BEVSegHead` 主結構；map head 繼續使用 CNN head。
 - 不改 `Dual_Branch_Encoder` / HFM；LGMG 第一版只接在 task-specific head side path。
 - 不讓 Occ-to-Map 第一版直接改 `map_feature`；feature residual 只作高風險 ablation。
+- 不啟用 `map_to_occ_adapter`、semantic relation、PQD `query_residual`、bidirectional LGMG。
+- 不把 `overlay_dynamic` 混進第一個 O2M-only 實驗；若 O2M-only 有效，再做 O2M + overlay 的組合檢查。
 
 ## 實驗計劃
 
@@ -358,7 +403,7 @@ map_feature -> map head -> map loss -> 正常更新 map 主路徑
 確認目前 baseline：
 
 - `CNN head + 128ch map neck + map_loss_weight=4`: Occ 39.72 / Map 45.79
-- `overlay_dynamic` epoch 24 已完成：Occ 39.52 / Map 46.00。它是 map protection loss 的目前 best map score，但 OCC 比 weight4 低 0.20；LGMG 主線仍先和 weight4 比 OCC recovery，再檢查是否能和 overlay_dynamic 組合。
+- `overlay_dynamic` epoch 24 已完成：Occ 39.52 / Map 46.00。它是 map protection loss 的目前 best map score，但 OCC 比 weight4 低 0.20；Stage 3 O2M-only 主線仍先和 weight4 比 map recovery，再檢查是否能和 `overlay_dynamic` 組合。
 - `overlay_dynamic` epoch 5/11 只能當 early signal，不當 paper-level acceptance criterion。
 - Stage 0 已完成
 
@@ -449,62 +494,84 @@ git status --short
 git switch -c feat/LGMG-o2m-only 0bca839
 ```
 
-若需要把這份最新 plan 紀錄也帶到 `feat/LGMG-o2m-only`，可以在新分支建立後 cherry-pick 上面這個 docs commit。這樣 Stage 3 code base 仍然不含 Stage 1 實作，但 plan 會保留最新暫停紀錄。
+若已經在 `feat/LGMG-o2m-only`，則不需要再重開分支；後續只要保持 Stage 3 code 不 cherry-pick Stage 1 implementation commits 即可。若需要把這份最新 plan 紀錄也帶到 `feat/LGMG-o2m-only`，可以在新分支建立後 cherry-pick 上面這個 docs commit。這樣 Stage 3 code base 仍然不含 Stage 1 實作，但 plan 會保留最新暫停紀錄。
 
-### Stage 3: Optional Occ-to-Map logits residual
+### Stage 3: Occ-to-Map only map recovery
 
-目的：確認 3D geometry prior 是否能補 Map。
+目的：在不啟用 Stage 1 / Stage 2 的前提下，確認 OCC coarse 3D geometry prior 是否能補 Map。這是獨立的 O2M-only 實驗，不是 Map-to-Occ 成功後的 second-stage。
+
+分支與比較邊界：
+
+- 建議分支：`feat/LGMG-o2m-only`
+- Base：不含 Stage 1 Map-to-Occ adapter / PQD `query_residual` 的 code base
+- Baseline：`CNN head + 128ch map neck + map_loss_weight=4`，Occ 39.72 / Map 45.79
+- 第一版不疊 `overlay_dynamic`；`overlay_dynamic` 的 Map 46.00 只作為後續組合上限參考
 
 設定：
 
 ```text
+map_feature -> BEVSegHead -> base_map_logits
 coarse prototype occ pred -> HeightPool -> G_occ.detach() -> LogitAdapter
 final_map_logits = base_map_logits + beta_o2m * Delta_map_logits
 
-epoch 0-6:  beta_o2m = 0
-epoch 7-10: beta_o2m linear warmup
-epoch 11+:  normal
+beta_o2m(epoch) =
+  0                         if epoch <= 6
+  (epoch - 6) / 4 * beta_o2m_max
+                            if 7 <= epoch <= 10
+  beta_o2m_max              if epoch >= 11
 ```
+
+實作要求：
+
+- `prototype_occ_pred` 使用 `cnn3d_decoder` 的 coarse logits，不用 final PQD prediction。
+- `G_occ` 預設 detach，只阻斷 O2M side source，不切斷 map 主路徑。
+- `beta_o2m` 由 hook / schedule 控制，不靠手動改 config；`beta_o2m_max` 是 config knob，第一版用 `1.0`，保留 `0.5` 作為 ablation。
+- `LogitAdapter` 正常初始化；不要再和 `beta_o2m=0` 疊成雙重 zero-init。
+- final map loss 使用 `final_map_logits`；若輸出 debug，可同時記錄 base / residual logits statistics，但 evaluation 以 final logits 為準。
+- `simple_test` 也必須 apply O2M residual：`base_map_logits -> final_map_logits -> bev_seg_head.predict(final_map_logits)`。否則 epoch 24 eval 會用 base logits，O2M 看起來像沒效果。
+- inference / evaluation 時使用 `beta_o2m_eval = beta_o2m_max`，等同 warmup 完成後的 epoch 11+ 狀態。
+- DDP-safe warmup：training 時即使 `beta_o2m=0`，也應 forward adapter 再乘上 0；第一版不要設定 `find_unused_parameters=True`，也不要條件式 skip adapter forward。
+- OCC loss path 不吃 map residual；理論上 OCC 應接近 baseline。
 
 預期：
 
-- Map 不低於 45.79；最低不可低於 45.6。
-- 優先觀察 `drivable_area / carpark_area / divider`，但不要預設一定能改善 `stop_line`。
+- Map 至少不低於 45.79；有價值的結果應接近或超過 46.00。
+- 優先觀察 `stop_line / divider / carpark_area / drivable_area`。不能只靠 `drivable_area` 拉均值，thin / boundary classes 沒改善就不算強結果。
 - OCC 幾乎不變，因為 OCC 只是 source side。
-- 不建議一開始就把 Occ-to-Map 放進主方法。從 scratch 訓練時 early OCC logits noisy，且 Map 已經接近 upper bound；先用 Map-to-Occ 驗證 layout prior 能不能補 OCC，再單獨開 Occ-to-Map ablation。
+- 若 Map 有提升但 OCC 明顯下降，需檢查是否有 unintended gradient path 或 shared map loss side effect。
 
 stop criterion：
 
 - epoch 11 若 Map 低於同 epoch baseline 0.3 以上，例如低於約 43.5，就停止 Occ-to-Map。
 - epoch 24 若 Map < 45.6，放棄 Occ-to-Map，不繼續調 detach/gate。
-- 如果只有 Map ±0.3 波動，Occ-to-Map 不應硬放進主方法。
+- epoch 24 若 Map 只在 45.79 附近 ±0.3 波動，且 `stop_line / divider / carpark_area` 沒有穩定改善，Occ-to-Map 不應硬放進主方法。
+- epoch 24 若 Map >= 45.79 且 thin / boundary classes 有明確 gain，可以保留為 O2M-only ablation；若接近或超過 46.00，才進一步測 O2M + overlay_dynamic 組合。
 
-### Stage 4: Bidirectional LGMG, only if Occ-to-Map passes
+### Stage 4: O2M + overlay_dynamic combination, only if Stage 3 passes
 
-目的：確認兩個 side path 合起來是否能共同提升。
+目的：如果 Stage 3 O2M-only 能補 Map，再檢查它能不能和 `overlay_dynamic` 的 map protection loss 組合。這不是第一版主實驗，避免把 architecture-level O2M 和 loss-level V3 混在一起。
 
 接受條件：
 
-- Occ > 39.72。
-- Map >= 45.79，理想上 > 46。
-- 不出現 Map 提升但 OCC 大掉，或 OCC 提升但 Map 掉回 45.6 以下。
-- 若 Occ-to-Map 沒通過 Stage 3，最終方法可以只保留 Map-to-Occ，不硬包成 bidirectional。
+- Map 接近或超過 `overlay_dynamic` 的 46.00。
+- OCC 不比 `overlay_dynamic` 的 39.52 更差，理想上回到 39.7 附近。
+- 若 O2M-only 沒通過 Stage 3，Stage 4 不做。
+
+Bidirectional LGMG 目前暫停。只有當未來 Map-to-Occ 重新設計後能證明幫 OCC，且 O2M 也通過 Stage 3，才重新考慮 full LGMG。
 
 ### Stage 5: 必要 ablations
 
 | Ablation | 目的 |
 | --- | --- |
-| no detach side path | 檢查 stop-gradient 是否真的避免 source branch 被污染 |
-| no gate / alpha fixed 1 | 檢查 gating 是否必要 |
-| raw concat fusion | 證明直接 fusion 比受控 side path 差 |
-| fixed relation vs semantic-masked learnable relation | 檢查 relation 是否需要學習 |
-| free relation vs semantic-masked learnable relation | 檢查語意遮罩是否必要 |
-| weak relation enabled | 檢查 `walkway -> driveable_surface`、`other_flat` 等弱關聯是否真的有幫助，或只是造成邊界污染 |
-| foreground relation enabled | 證明 dynamic foreground prototypes 不應被 map layout 改 |
-| source-only gate vs target-aware gate | 檢查是否需要讓 PQD target semantic query 參與 gate；Stage 1 主設定先用 source-only |
-| Occ->Map logits residual vs gate conditioning | 找較安全的 O2M 注入方式 |
-| Occ->Map feature residual | 高風險 ablation；目前 code 只有 map-specific BEV neck + BEVSegHead，未來若加入 MSFP，要檢查直接改 map feature 是否和 MSFP/BEVSegHead 打架 |
-| no warmup Occ-to-Map | negative ablation；檢查 early noisy OCC 是否傷 map |
+| O2M logits residual main | Stage 3 主設定，先確認 coarse geometry prior 能否補 Map |
+| no warmup O2M | negative ablation；檢查 early noisy OCC 是否傷 map |
+| no detach O2M source | 檢查 stop-gradient 是否避免 OCC source 被 map loss 污染 |
+| beta fixed / no residual schedule | 檢查 zero-start residual 是否必要 |
+| HeightPool component ablation | 分別移除 occupied / free-space / ground-layout / objectness / height summary，找出真正有效的 geometry cue |
+| O2M gate conditioning | logits residual 穩定後再測，找較安全的注入方式 |
+| O2M feature residual | 高風險 ablation；目前不進第一版，避免直接改 `map_feature` |
+| O2M + overlay_dynamic | 只有 Stage 3 通過後才測，檢查 architecture prior 和 loss balancing 是否可疊加 |
+| Map-to-Occ relation ablations | Stage 1 / 2 已暫停，暫不列入 Stage 3 必要 ablation |
 
 ### Stage 6: Paper table
 
@@ -517,9 +584,10 @@ stop criterion：
 | CNN map neck MTL | 39.82 | 39.94 | task-specific map feature |
 | CNN map neck + map priority | 39.72 | 45.79 | strong baseline |
 | + overlay dynamic | 39.52 | 46.00 | map protection loss；Map +0.21，但 OCC -0.20 |
-| + Map-to-Occ masked relation | TBD | TBD | layout prior to OCC background queries |
-| + Occ-to-Map logits residual | TBD | TBD | optional geometry prior |
-| + LGMG full | TBD | TBD | only if O2M passes stop criterion |
+| + Map-to-Occ masked relation | 37.93 @ epoch 5 | 41.27 @ epoch 5 | Stage 1 暫停；目前沒有幫 OCC |
+| + Occ-to-Map logits residual | TBD | TBD | Stage 3 O2M-only map recovery |
+| + Occ-to-Map logits residual + overlay_dynamic | TBD | TBD | only if O2M-only passes |
+| + LGMG full | TBD | TBD | deferred；需要 M2O 和 O2M 都通過 |
 | Map-only upper bound | - | 48.34 | diagnostic upper bound |
 
 ## 相關 work
@@ -547,7 +615,7 @@ MAESTRO 指出 naive shared-feature MTL 有 task conflict，提出 CPG / TSFG / 
 - 不把 MAESTRO-2T 當作本文主體，而是當 strong comparator / diagnostic。
 - Map-to-Occ relation 是 semantic-masked learnable，不是 rule-only mapping，也不是完全自由 relation。
 - LGMG 是 query/logit-level side adapter，不建立 MAESTRO-style heavy TSFG feature generator。
-- Occ-to-Map 是 optional second-stage；若 map 已接近 upper bound 且沒有穩定提升，就不硬放入主方法。
+- Occ-to-Map 在目前計劃中先作為 Stage 3 O2M-only map recovery 實驗；若 map 已接近 upper bound 且沒有穩定提升，就不硬放入主方法。
 
 ### BEVFusion / BEVerse
 
@@ -604,13 +672,13 @@ ProtoMapHead + map neck / PQD-align / 256ch 版本都沒有超過 CNN head + 128
 
 ## 預期風險
 
-- **Map 已接近 upper bound，提升空間有限**：因此 LGMG 不能只看 Map，必須看 OCC 是否受益。
+- **Map 已接近 upper bound，提升空間有限**：Stage 3 雖然主看 Map，但不能只看 mean mIoU；必須檢查 `stop_line / divider / carpark_area` 等 class-level 是否真的改善。
 - **Cross-task guidance 可能變成新的污染源**：需要 zero-residual scalar、gate、side-path detach 和 raw concat ablation；adapter / projection 本身正常初始化，避免 scalar 和 adapter output 同時為 0。
-- **OCC prediction early stage 不穩**：Occ-to-Map 必須有明確 warmup；從 scratch 訓練 epoch 0-6 完全 disable，epoch 7-10 線性開啟。
+- **OCC prediction early stage 不穩**：Occ-to-Map 必須有明確 warmup；從 scratch 訓練 epoch 0-6 residual scale 為 0，epoch 7-10 線性開啟；training 仍 forward adapter 以避免 DDP unused 風險。
 - **Occ-to-Map 收益可能很小**：Map 已經 45.79，距離 map-only 48.34 只剩 2.55。若 epoch 24 Map < 45.6，直接放棄 Occ-to-Map。
-- **和未來 MSFP 相容性不能太樂觀**：目前 code 還沒有 MSFP，只有 map-specific BEV neck + BEVSegHead。LGMG 第一版應先只開 Map-to-Occ，或讓 Occ-to-Map 只做 logits residual / gate conditioning；未來若加入 MSFP / active-region feature residual，不要讓兩個模組同時改同一份 `map_feature`。
+- **和未來 MSFP / overlay_dynamic 相容性不能太樂觀**：Stage 3 第一版只做 O2M logits residual，不直接改 `map_feature`，也不疊 overlay loss。未來若加入 MSFP / active-region feature residual，不要讓兩個模組同時改同一份 `map_feature`。
 - **計算量增加**：adapter 必須輕量，避免 MAESTRO-2T 那種資源壓力。
-- **語意對應不完全**：Map 六類和 OCC semantic queries 不是一對一。第一版用 semantic-masked learnable relation，並用 fixed / free / foreground-enabled relation ablation 證明設計必要性。
+- **O2M 可能只學到 drivable shortcut**：若 mean mIoU 上升但 `stop_line / divider / carpark_area` 沒有改善，不能把它寫成有效 geometry guidance。
 
 ## 預期效果
 
@@ -618,13 +686,13 @@ ProtoMapHead + map neck / PQD-align / 256ch 版本都沒有超過 CNN head + 128
 
 > We propose a task-protected layout-geometry mutual guidance framework for camera-only occupancy-map multi-task perception. Instead of directly sharing or fusing raw task features, the proposed method exchanges compact layout and geometry priors through gated residual adapters, enabling occupancy and map segmentation to benefit from each other while avoiding feature interference.
 
-理想結果：
+Stage 3 理想結果：
 
-- Occ mIoU 從 39.72 提升到 40.x。
-- Map mIoU 維持 45.79 以上，最好推到 46.x；若和 `overlay_dynamic` 組合，應檢查是否能接近或維持 46.00，同時把 OCC 從 39.52 拉回來。
-- 單向 ablation 顯示 Map-to-Occ masked relation 主要幫 OCC，Occ-to-Map logits residual 若有效則主要幫 Map。
-- no-detach / no-gate / raw concat ablation 證明受控 side path 的必要性。
+- Map mIoU 從 45.79 往 46.x 推進，最好接近或超過 `overlay_dynamic` 的 46.00。
+- OCC mIoU 維持 39.72 附近；若下降，需要確認 O2M side path 是否意外影響 OCC 主路徑。
+- Class-level 不只看 `drivable_area`，而要看 `stop_line / divider / carpark_area` 是否有穩定改善。
+- no-warmup / no-detach / beta schedule / HeightPool component ablation 證明受控 O2M side path 的必要性。
 
-如果只提升 OCC 而 Map 持平，仍然有論文價值，因為目前 Map 已經接近 map-only upper bound；此時主張應改成「preserve strong map performance while recovering / improving occupancy through layout guidance」。這種情況下最終方法可以是 `overlay-aware map balancing + Map-to-Occ masked relation`，不一定要包含 Occ-to-Map。
+如果 Stage 3 只讓 Map 小幅波動，或只改善 `drivable_area`，就把 Occ-to-Map 寫成 optional / negative ablation，不硬包成 LGMG full method。此時主線仍應回到已驗證的 map-specific neck + map priority / overlay-aware balancing。
 
-如果雙向沒有提升，保留最有效的單向版本，不硬包成 reciprocal module。從論文角度，誠實地把 Occ-to-Map 放成 optional / negative ablation，會比硬做雙向但分數不穩更有說服力。
+如果 Stage 3 有效，再測 Stage 4 的 O2M + `overlay_dynamic`。若組合能接近 46.00 且不再掉 OCC，才有機會把 Occ-to-Map geometry guidance 寫成第三個 cross-task interaction contribution。
