@@ -18,6 +18,7 @@ class ProtoOccCnnSegHead(BEVDet):
                  cnn3d_decoder=None,
                  prototype_query_decoder=None,
                  bev_seg_head=None,
+                 voxel_aware_map_ingest=None,
                  map_loss_weight=1.0,
                  **kwargs):
         super(ProtoOccCnnSegHead, self).__init__(**kwargs)
@@ -31,7 +32,22 @@ class ProtoOccCnnSegHead(BEVDet):
         self.cnn3d_decoder = build_head(cnn3d_decoder)
         self.prototype_query_decoder = build_head(prototype_query_decoder)
         self.bev_seg_head = build_head(bev_seg_head) if bev_seg_head is not None else None
+        self.voxel_aware_map_ingest = (
+            build_head(voxel_aware_map_ingest)
+            if voxel_aware_map_ingest is not None else None)
         self.map_loss_weight = map_loss_weight
+
+    def _apply_voxel_aware_map_ingest(self, map_feature, voxel_feature):
+        """Optional VAMI fusion before BEVSegHead.
+
+        When ``voxel_aware_map_ingest`` is configured, route the
+        OCC-supervised voxel feature into the map BEV feature. Otherwise
+        return ``map_feature`` unchanged.
+        """
+        if self.voxel_aware_map_ingest is None:
+            return map_feature
+        return self.voxel_aware_map_ingest(
+            map_feature=map_feature, voxel_feature=voxel_feature)
 
     def image_encoder(self, img, stereo=False):
         imgs = img
@@ -164,11 +180,13 @@ class ProtoOccCnnSegHead(BEVDet):
             if gt_masks_bev is None:
                 raise ValueError('Expected `gt_masks_bev` when training ProtoOccCnnSegHead with a BEV segmentation head.')
             map_feature = self._select_map_feature(bev_feature, map_bev_feature)
+            map_feature = self._apply_voxel_aware_map_ingest(
+                map_feature, comprehensive_voxel_feature)
             self._check_map_feature_size(map_feature, gt_masks_bev)
             bev_seg_logits = self.bev_seg_head(map_feature)
             map_losses = self.bev_seg_head.loss(bev_seg_logits, gt_masks_bev)
             losses.update(self._scale_map_losses(map_losses))
-        
+
         return losses
 
     def simple_test(self,
@@ -197,6 +215,8 @@ class ProtoOccCnnSegHead(BEVDet):
             return occ_preds
 
         map_feature = self._select_map_feature(bev_feature, map_bev_feature)
+        map_feature = self._apply_voxel_aware_map_ingest(
+            map_feature, comprehensive_voxel_feature)
         bev_seg_probs = self.bev_seg_head.predict(self.bev_seg_head(map_feature)).detach().cpu().numpy()
         gt_masks_bev = self._normalize_map_targets(kwargs.get('gt_masks_bev'))
         if gt_masks_bev is not None:

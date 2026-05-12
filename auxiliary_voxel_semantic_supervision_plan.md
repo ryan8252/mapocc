@@ -384,3 +384,54 @@ Reviewer / codex 都會問：「會不會只是 channel 變多、capacity 變大
 VAMI = **「ProtoOcc 已經有 voxel-supervised feature，但 map 從來沒使用；補上這條使用路徑」**。
 
 不補 supervision（早就有），不做 prototype（試過沒用），不做 logits residual（試過失敗）；只改 map 看的 feature 從哪來。
+
+## 2026-05-12 Stage 1 實作紀錄
+
+已完成 VAMI Stage 1 全部 code，所有 smoke test 通過。
+
+### 新增的檔案
+
+| 檔案 | 用途 |
+| --- | --- |
+| `projects/mmdet3d_plugin/models/task_modules/voxel_aware_map_ingest.py` | **VAMI 模組本體**。`VoxelAwareMapIngest` 註冊在 `HEADS` registry，可用 `build_head` 建立。`forward(map_feature, voxel_feature)` 內部流程：optional `voxel_feature.detach()` → Z-collapse（avg / max / avg_max_concat）→ 1×1 Conv channel projection（含 BN+ReLU）→ optional bilinear resize 對齊 `map_feature` 的 (H, W) → concat → 兩層 fusion conv（3×3 → 1×1）→ residual add 回 `map_feature`。最後一層 conv 採 zero-init，所以 step 0 的 residual 恰為 0，初始 forward 等價 baseline。 |
+| `projects/mmdet3d_plugin/models/task_modules/__init__.py` | 新建立的 sub-package，`from .voxel_aware_map_ingest import VoxelAwareMapIngest` 並 export。 |
+| `projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck_vami.py` | **Stage 1 主 config**。繼承 `ProtoOcc_multi_cnn_head_map_neck.py`，覆寫 `model.map_loss_weight=4.0`（沿用 weight4 baseline 訓練條件）並注入 `model.voxel_aware_map_ingest` dict。預設 `detach_voxel_source=True`、`residual=True`、`zero_init_output=True`、`z_collapse_mode='avg_max_concat'`、`voxel_in_channels=48`、`map_channels=128`。`evaluation.start=10`，方便觀察 epoch 11 stop criterion。 |
+| `TWCC/train_multi_cnn_head_map_neck_vami.sh` | **Stage 1 TWCC launcher**。沿用 `train_multi_cnn_head_map_neck_overlay_dynamic.sh` 的 sbatch 設定（4 GPU、samples_per_gpu=4、LR=2e-4、24 epoch、`ckpts/bevdet-r50-4d-depth-cbgs_depthnet_modify.pth` 為 pretrain），只把 CONFIG / WORK_DIR / job name 改為 VAMI 對應路徑。`work_dir=work_dirs/ProtoOcc_multi_cnn_head_map_neck_vami`。 |
+
+### 修改的檔案
+
+| 檔案 | 改了什麼 |
+| --- | --- |
+| `projects/mmdet3d_plugin/models/__init__.py` | 加一行 `from .task_modules import *`，讓 plugin 載入時 VAMI 會註冊到 `HEADS`。 |
+| `projects/mmdet3d_plugin/models/detectors/ProtoOccCnnSegHead.py` | (1) `__init__` 新增 optional `voxel_aware_map_ingest=None` 參數，用 `build_head` 建立；(2) 新增 helper `_apply_voxel_aware_map_ingest(map_feature, voxel_feature)`，VAMI 沒設定時 short-circuit 回傳原 `map_feature`；(3) `forward_train` 在 `_select_map_feature` 後、`bev_seg_head` 前插入 `map_feature = self._apply_voxel_aware_map_ingest(map_feature, comprehensive_voxel_feature)`；(4) `simple_test` 對應位置同樣插入。VAMI 關掉時 baseline path 一個指令都不變。 |
+
+### 嚴格沒改的檔案
+
+- `projects/mmdet3d_plugin/models/backbones/dual_branch_encoder.py`
+- `projects/mmdet3d_plugin/models/dense_heads/cnn3d_decoder.py`
+- `projects/mmdet3d_plugin/models/dense_heads/bev_seg_head.py`
+- `projects/mmdet3d_plugin/models/OccHead/Prototype_Query_Decoder_nuScenes.py`
+
+VAMI 完全只在 detector edge 注入，不動 DBE/HFM/PQD/BEVSegHead/cnn3d_decoder 任何主結構。
+
+### Smoke test 結果
+
+於 `ProtoOcc` conda env 跑：
+
+1. **`py_compile`**：5 個檔案（VAMI、`task_modules/__init__.py`、`models/__init__.py`、`ProtoOccCnnSegHead.py`、Stage 1 config）全過。Shell launcher `bash -n` 通過。
+2. **VAMI tensor smoke**：
+   - Zero-init residual 確認：初始 forward `out == map_feature`，max diff = 0
+   - 擾動 fusion 最後一層後 output 變動 ✓
+   - `detach_voxel_source=True` 時 `voxel_feature.grad is None`、`map_feature.grad` 正常累積 ✓
+   - 空間不匹配時 `(16,16) → (32,32)` 自動 bilinear resize ✓
+   - `avg` / `max` / `avg_max_concat` 三種 Z-collapse mode 輸出 shape 正確（96 vs 48）
+   - Channel mismatch 會 raise `ValueError`
+3. **Config + registry smoke**：
+   - `VoxelAwareMapIngest` 已在 `HEADS._module_dict`
+   - `Config.fromfile()` 載入 Stage 1 config，所有欄位（`map_loss_weight=4.0`、`detach_voxel_source=True`、`zero_init_output=True`、`z_collapse_mode='avg_max_concat'`、`evaluation.start=10`、`metric=['miou','map-miou']`）正確
+   - `build_detector(cfg.model)` 成功，`det.voxel_aware_map_ingest` 是 `VoxelAwareMapIngest` instance
+4. **Baseline 等價性**：
+   - 不帶 VAMI 的 baseline detector：`det.voxel_aware_map_ingest is None`，helper 直接 passthrough 同一個 tensor 對象
+   - 帶 VAMI 的 detector：在 zero-init 下，VAMI helper 第一次 forward 的輸出和輸入 `map_feature` 完全相等（max diff = 0），證明 step 0 等價 weight4 baseline
+
+本機沒 GPU 環境跑完整 distributed training smoke；下一步應在 TWCC 上跑全 24 epoch。建議第一個 epoch 11 EMA 出來就先比 weight4 baseline 的 epoch 11 ~43.82，低於 43.3 就停（plan stop criterion）。
