@@ -16,3 +16,4 @@ build-old
 ppl.cv
 */__pycache__/**.nbc
 *.nbi
+mmdetection3d/
