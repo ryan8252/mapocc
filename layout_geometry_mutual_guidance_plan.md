@@ -525,13 +525,14 @@ beta_o2m(epoch) =
 
 - `prototype_occ_pred` 使用 `cnn3d_decoder` 的 coarse logits，不用 final PQD prediction。
 - `G_occ` 預設 detach，只阻斷 O2M side source，不切斷 map 主路徑。
-- `beta_o2m` 由 hook / schedule 控制，不靠手動改 config；`beta_o2m_max` 是 config knob，第一版用 `1.0`，保留 `0.5` 作為 ablation。
-- `LogitAdapter` 正常初始化；不要再和 `beta_o2m=0` 疊成雙重 zero-init。
+- `beta_o2m` 由 hook / schedule 控制，不靠手動改 config；hook 使用 `runner.epoch + 1` 的 1-based human epoch，`beta_o2m_max` 是 config knob，第一版用 `1.0`，保留 `0.5` 作為 ablation。
+- `LogitAdapter` body 正常初始化，但最後輸出 `Delta_map_logits` 的 1x1 conv 採 zero-init，避免 epoch 7 warmup 開始時突然把 random residual 加到已經很強的 base map logits。
 - final map loss 使用 `final_map_logits`；若輸出 debug，可同時記錄 base / residual logits statistics，但 evaluation 以 final logits 為準。
 - `simple_test` 也必須 apply O2M residual：`base_map_logits -> final_map_logits -> bev_seg_head.predict(final_map_logits)`。否則 epoch 24 eval 會用 base logits，O2M 看起來像沒效果。
 - inference / evaluation 時使用 `beta_o2m_eval = beta_o2m_max`，等同 warmup 完成後的 epoch 11+ 狀態。
 - DDP-safe warmup：training 時即使 `beta_o2m=0`，也應 forward adapter 再乘上 0；第一版不要設定 `find_unused_parameters=True`，也不要條件式 skip adapter forward。
 - OCC loss path 不吃 map residual；理論上 OCC 應接近 baseline。
+- Stage 3 config 需把 `evaluation.start` 提前到可觀察 epoch 11 stop criterion；第一版用 `start=10`，保留 base config 的 map/occ metric 與 pipeline。
 
 預期：
 
@@ -546,6 +547,65 @@ stop criterion：
 - epoch 24 若 Map < 45.6，放棄 Occ-to-Map，不繼續調 detach/gate。
 - epoch 24 若 Map 只在 45.79 附近 ±0.3 波動，且 `stop_line / divider / carpark_area` 沒有穩定改善，Occ-to-Map 不應硬放進主方法。
 - epoch 24 若 Map >= 45.79 且 thin / boundary classes 有明確 gain，可以保留為 O2M-only ablation；若接近或超過 46.00，才進一步測 O2M + overlay_dynamic 組合。
+
+#### 2026-05-12 Stage 3 result update: failed
+
+本地 smoke run `work_dirs/smoke_lgmg_o2m_4090/result_4.md` 已完成，結論是 **Stage 3 O2M-only logits residual 第一版失敗**，不應進入 Stage 4，也不應再作為主方法候選。
+
+和本地 `weight_4_4090` baseline 比較：
+
+| Checkpoint | Setting | Occ mIoU | Map mIoU | 判讀 |
+| --- | --- | ---: | ---: | --- |
+| epoch 11 EMA | `weight_4_4090` baseline | 39.04 | 44.81 | 同機器 baseline |
+| epoch 11 EMA | Stage 3 O2M-only | 38.50 | 42.17 | Map `-2.64`、Occ `-0.54`；低於 stop line `43.5`，理論上這裡就該停 |
+| epoch 24 EMA | `weight_4_4090` baseline | 39.72 | 45.79 | 正式 strong baseline |
+| epoch 24 EMA | Stage 3 O2M-only | 38.87 | 44.38 | Map `-1.41`、Occ `-0.85`；未達 `45.6` guardrail，判定失敗 |
+
+class-level 對 `weight_4_4090` epoch 24 的影響：
+
+- `drivable_area`: `78.76` vs `80.03`，`-1.27`
+- `ped_crossing`: `39.88` vs `41.94`，`-2.06`
+- `walkway`: `48.87` vs `50.93`，`-2.06`
+- `stop_line`: `26.53` vs `28.32`，`-1.79`
+- `divider`: `31.80` vs `33.49`，`-1.69`
+- `carpark_area`: `40.45` vs `40.00`，只有這一類小幅 `+0.45`
+
+這代表退化不是只發生在 thin class，而是整體 map branch 幾乎全面下降；同時 OCC 也被拖低，表示目前的 coarse `HeightPool -> logits residual` 沒有形成有效 geometry prior，比較像是把 noisy side signal 直接灌進 map logits。
+
+因此目前判斷：
+
+- Stage 3 第一版不通過，不進 Stage 4 `O2M + overlay_dynamic`。
+- `Occ-to-Map logits residual` 應降級為 negative ablation / failure case，不作為第三個 contribution 主線。
+- 若之後要繼續看 O2M，應先做 debug 型分析：`base vs residual logits` magnitude、`beta_o2m` 開啟後的分布、以及 `HeightPool` 各 channel 是否只學到 coarse drivable shortcut。
+
+#### 2026-05-07 Stage 3 implementation record
+
+已完成 O2M-only logits residual 第一版，實作保持 Stage 3 邊界：不啟用 Map-to-Occ、不改 PQD、不做 bidirectional、不疊 `overlay_dynamic`。
+
+新增 / 修改檔案：
+
+| 檔案 | 實作內容 |
+| --- | --- |
+| `projects/mmdet3d_plugin/models/task_modules/occ_to_map_guidance.py` | 新增 `OccToMapGeometryAdapter`。輸入 `cnn3d_decoder` coarse occ logits `[B, H, W, Z, 18]`，經 `HeightPool` 產生 8-channel geometry prior：`free / occupied / ground_layout / structure / dynamic / height_mean / height_max / occupied_count`，再輸出 `Delta_map_logits` |
+| `projects/mmdet3d_plugin/models/task_modules/__init__.py`、`projects/mmdet3d_plugin/models/__init__.py` | 註冊 task module，讓 config 可透過 `type='OccToMapGeometryAdapter'` 建立 adapter |
+| `projects/mmdet3d_plugin/core/hook/occ_to_map_warmup.py`、`projects/mmdet3d_plugin/core/hook/__init__.py` | 新增 `OccToMapWarmupHook`。training 使用 1-based epoch：epoch 1-6 beta=0，epoch 7-10 linear warmup，之後 beta=`beta_o2m_max` |
+| `projects/mmdet3d_plugin/models/detectors/ProtoOccCnnSegHead.py` | 新增 optional `occ_to_map_adapter`、`set_o2m_epoch()`、`_forward_map_logits()`。`forward_train` 和 `simple_test` 都使用 final map logits；adapter 關閉時仍是原本 baseline path |
+| `projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck_lgmg_o2m_logits.py` | Stage 3 主 config。顯式設定 `map_loss_weight=4.0`、`map_loss_balance_mode='none'`、`beta_o2m_max=1.0`、`detach_occ=True`、`zero_init_output=True`，並把 `evaluation.start=10` |
+| `TWCC/train_multi_cnn_head_map_neck_lgmg_o2m_logits.sh` | Stage 3 TWCC launcher，work_dir 獨立為 `work_dirs/ProtoOcc_multi_cnn_head_map_neck_lgmg_o2m_logits` |
+
+重要實作細節：
+
+- `beta_o2m` 是 Python-side schedule value，不放進 parameter / buffer，避免 EMA checkpoint 把 beta 平滑掉；eval / inference 時 adapter 直接使用 `beta_o2m_max`。
+- `G_occ` 預設 detach，只阻斷 O2M side source，不切斷 map 主路徑；map loss 仍正常反傳到 map neck / shared feature。
+- training 時即使 beta=0 仍 forward adapter 再乘上 0，避免 DDP unused parameter 風險；第一版不開 `find_unused_parameters=True`。
+- `Delta_map_logits` 最後一層 zero-init，使初始 residual 等價 0；warmup 開始後先從保守 residual 學起，避免 random residual 直接破壞 strong map baseline。
+
+本地檢查：
+
+- `py_compile` 通過：O2M adapter、warmup hook、`ProtoOccCnnSegHead.py`、Stage 3 config。
+- CPU dummy forward 通過：`base_map_logits [2, 6, 4, 5] + occ_logits [2, 4, 5, 3, 18] -> final_map_logits [2, 6, 4, 5]`；epoch 7 beta=`0.25`，eval beta=`1.0`。
+- beta=0 的 backward smoke 通過：adapter parameters 仍在 autograd graph 內，符合 DDP-safe warmup 設計。
+- `mmcv.Config.fromfile()` 確認 Stage 3 config 保留 `metric=['miou', 'map-miou']`，並覆寫 `evaluation.start=10`。
 
 ### Stage 4: O2M + overlay_dynamic combination, only if Stage 3 passes
 
@@ -585,8 +645,8 @@ Bidirectional LGMG 目前暫停。只有當未來 Map-to-Occ 重新設計後能�
 | CNN map neck + map priority | 39.72 | 45.79 | strong baseline |
 | + overlay dynamic | 39.52 | 46.00 | map protection loss；Map +0.21，但 OCC -0.20 |
 | + Map-to-Occ masked relation | 37.93 @ epoch 5 | 41.27 @ epoch 5 | Stage 1 暫停；目前沒有幫 OCC |
-| + Occ-to-Map logits residual | TBD | TBD | Stage 3 O2M-only map recovery |
-| + Occ-to-Map logits residual + overlay_dynamic | TBD | TBD | only if O2M-only passes |
+| + Occ-to-Map logits residual | 38.87 | 44.38 | Stage 3 失敗；相較 weight4 baseline 為 Occ `-0.85` / Map `-1.41` |
+| + Occ-to-Map logits residual + overlay_dynamic | not run | not run | O2M-only 未通過 Stage 3，因此不進 Stage 4 |
 | + LGMG full | TBD | TBD | deferred；需要 M2O 和 O2M 都通過 |
 | Map-only upper bound | - | 48.34 | diagnostic upper bound |
 
@@ -658,7 +718,17 @@ ProtoMapHead + map neck / PQD-align / 256ch 版本都沒有超過 CNN head + 128
 - 不應用 OCC prototype 直接「加強 map prototype」。
 - Map 應保留 CNN segmentation path，cross-task 只提供 geometry prior。
 
-### 4. `detach_map_feature=True` 是錯的硬隔離
+### 4. Stage 3 O2M logits residual 第一版失敗
+
+`smoke_lgmg_o2m_4090` 的 Stage 3 第一版在 `epoch 11` 就已經掉到 Occ `38.50` / Map `42.17`，低於當初設定的 stop line `43.5`；到 `epoch 24` 也只到 Occ `38.87` / Map `44.38`，依然低於 weight4 baseline 的 Occ `39.72` / Map `45.79`。
+
+教訓：
+
+- coarse OCC `HeightPool -> logits residual` 第一版沒有提供穩定有效的 map geometry prior。
+- 問題不是只集中在 `stop_line / divider`，而是 `drivable_area / walkway / ped_crossing` 也一起下降，代表這版不是「thin class 沒補到」，而是整體 map logits 被 side residual 擾動。
+- Stage 3 應先作為 negative ablation 保留，不應直接往 Stage 4 疊 `overlay_dynamic`。
+
+### 5. `detach_map_feature=True` 是錯的硬隔離
 
 `detach_map_feature=True` epoch 5 結果為 Occ 38.33 / Map 16.49。這代表把 map branch 的主要學習路徑從 shared BEV feature 切掉，會讓 Map 幾乎學不起來。
 
@@ -696,3 +766,6 @@ Stage 3 理想結果：
 如果 Stage 3 只讓 Map 小幅波動，或只改善 `drivable_area`，就把 Occ-to-Map 寫成 optional / negative ablation，不硬包成 LGMG full method。此時主線仍應回到已驗證的 map-specific neck + map priority / overlay-aware balancing。
 
 如果 Stage 3 有效，再測 Stage 4 的 O2M + `overlay_dynamic`。若組合能接近 46.00 且不再掉 OCC，才有機會把 Occ-to-Map geometry guidance 寫成第三個 cross-task interaction contribution。
+
+
+PYTHONPATH=. bash tools/dist_train.sh projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck_lgmg_o2m_logits.py  1 --work-dir work_dirs/ProtoOcc_multi_cnn_head_map_neck_lgmg_o2m_logits_smoke --cfg-options evaluation.start=1
