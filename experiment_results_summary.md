@@ -1,10 +1,10 @@
 # ProtoOcc 多任務實驗結果整理
 
-日期：2026-05-04
+日期：2026-05-13
 
 ## 實驗摘要
 
-目前整理十三組主要訓練結果，另補 output ablation：
+目前整理十五組主要訓練結果，另補 output ablation：
 
 | 實驗 | Config | Checkpoint | Occ mIoU | Map mIoU |
 | --- | --- | --- | ---: | ---: |
@@ -13,6 +13,8 @@
 | CNN map head + 128ch map neck, `map_loss_weight=4` (EMA) | `projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck.py` | `work_dirs/ProtoOcc_multi_cnn_head_map_neck_TWCC/epoch_5_ema_weight_4.pth` | 38.17 | 39.55 |
 | CNN map head + 128ch map neck, `map_loss_weight=4` (EMA) | `projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck.py` | `work_dirs/ProtoOcc_multi_cnn_head_map_neck_TWCC/epoch_11_ema_weight_4.pth` | 39.26 | 43.82 |
 | **CNN map head + 128ch map neck, `map_loss_weight=4` (EMA)** | `projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck.py` | `work_dirs/ProtoOcc_multi_cnn_head_map_neck_TWCC/epoch_24_ema_weight_4.pth` | **39.72** | **45.79** |
+| CNN map head + 128ch map neck, overlay dynamic V3 (EMA) | `projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck_overlay_dynamic.py` | `work_dirs/ProtoOcc_multi_cnn_head_map_neck_overlay_dynamic/epoch_24_ema.pth` | 39.52 | 46.00 |
+| **CNN map head + 128ch map neck, overlay dynamic V3-lite (EMA)** | `projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck_overlay_dynamic.py` | `work_dirs/ProtoOcc_multi_cnn_head_map_neck_overlay_dynamic/epoch_24_ema_2.pth` | **39.60** | **46.38** |
 | **CNN map head + 128ch map neck, map-only (EMA)** | `projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck_map_only.py` | `work_dirs/ProtoOcc_multi_cnn_head_map_neck_map_only/epoch_24_ema.pth` | - | **48.34** |
 | ProtoMapHead canonical (no PGBR) | `projects/configs/ProtoOcc/ProtoOcc_proto_map_head.py` | `work_dirs/ProtoOcc_proto_map_head_TWCC/epoch17.pth` | 36.77 | 32.03 |
 | ProtoMapHead canonical (no PGBR) | `projects/configs/ProtoOcc/ProtoOcc_proto_map_head.py` | `work_dirs/ProtoOcc_proto_map_head_TWCC/epoch_24.pth` | 37.61 | 32.95 |
@@ -41,6 +43,8 @@
 | CNN head + 128ch map neck, `map_loss_weight=4`, epoch 5 EMA | 76.10 | 32.50 | 44.77 | 19.35 | 36.95 | 27.64 | 39.55 |
 | CNN head + 128ch map neck, `map_loss_weight=4`, epoch 11 EMA | 78.59 | 37.82 | 48.71 | 24.54 | 42.25 | 31.03 | 43.82 |
 | **CNN head + 128ch map neck, `map_loss_weight=4`, epoch 24 EMA** | **80.03** | **41.94** | **50.93** | **28.32** | **40.00** | **33.49** | **45.79** |
+| CNN head + 128ch map neck, overlay dynamic V3, epoch 24 EMA | 79.76 | 42.22 | 50.82 | 28.59 | 41.08 | 33.53 | 46.00 |
+| **CNN head + 128ch map neck, overlay dynamic V3-lite, epoch 24 EMA** | **79.88** | **42.61** | **50.80** | **28.33** | **43.37** | **33.30** | **46.38** |
 | ProtoMapHead no PGBR, epoch 17 | 71.36 | 22.67 | 37.51 | 14.98 | 24.52 | 21.11 | 32.03 |
 | ProtoMapHead no PGBR, epoch 24 | 72.14 | 24.52 | 38.44 | 15.22 | 25.88 | 21.50 | 32.95 |
 | ProtoMapHead + 128ch map neck no PGBR, epoch 24 | 73.97 | 28.29 | 41.91 | 18.96 | 33.71 | 26.00 | 37.14 |
@@ -56,26 +60,26 @@
 
 ## Occupancy 分類結果
 
-| Class | Naive MTL CNN epoch 15 | CNN head + 128ch neck epoch 24 EMA | CNN head + 128ch neck weight4 epoch 24 EMA | ProtoMapHead no PGBR epoch 17 | ProtoMapHead no PGBR epoch 24 | 128ch map neck epoch 24 | 128ch map neck epoch 24 EMA | 128ch map neck PQD-align epoch 24 EMA | 128ch map neck GT-soft epoch 24 EMA | 256ch map neck epoch 24 EMA |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| others | 6.94 | 12.17 | 11.82 | 9.91 | 10.65 | 11.61 | 12.05 | 12.34 | 12.31 | 12.05 |
-| barrier | 40.92 | 47.95 | 47.22 | 43.87 | 43.87 | 44.59 | 47.73 | 47.90 | 47.62 | 48.24 |
-| bicycle | 22.10 | 26.34 | 24.03 | 21.36 | 21.52 | 23.51 | 25.81 | 24.98 | 25.12 | 24.88 |
-| bus | 39.19 | 44.81 | 44.77 | 42.05 | 43.31 | 36.46 | 44.52 | 44.58 | 44.52 | 44.20 |
-| car | 45.96 | 51.91 | 51.94 | 49.63 | 50.54 | 49.01 | 51.95 | 52.06 | 51.94 | 51.84 |
-| construction_vehicle | 20.82 | 23.47 | 25.86 | 20.65 | 20.87 | 20.39 | 22.86 | 24.50 | 22.98 | 23.48 |
-| motorcycle | 22.49 | 26.54 | 26.68 | 22.58 | 26.05 | 25.26 | 26.89 | 26.35 | 26.43 | 26.40 |
-| pedestrian | 23.40 | 27.64 | 27.72 | 26.59 | 25.29 | 25.79 | 27.10 | 27.84 | 27.84 | 27.85 |
-| traffic_cone | 22.58 | 28.26 | 27.52 | 25.84 | 26.66 | 26.04 | 28.26 | 27.79 | 27.49 | 28.09 |
-| trailer | 29.35 | 33.31 | 33.06 | 28.32 | 31.72 | 29.20 | 31.50 | 32.23 | 32.09 | 32.98 |
-| truck | 34.25 | 37.16 | 37.61 | 34.81 | 35.60 | 33.34 | 37.12 | 36.63 | 37.03 | 37.20 |
-| driveable_surface | 75.42 | 81.92 | 81.97 | 80.10 | 81.01 | 81.30 | 82.28 | 82.15 | 81.82 | 82.18 |
-| other_flat | 26.28 | 46.13 | 45.89 | 41.83 | 42.78 | 43.57 | 46.59 | 46.56 | 45.90 | 46.45 |
-| sidewalk | 40.90 | 53.28 | 53.49 | 50.24 | 51.17 | 51.80 | 53.66 | 53.34 | 52.78 | 53.46 |
-| terrain | 42.80 | 56.46 | 56.36 | 53.41 | 53.05 | 54.58 | 56.44 | 56.93 | 56.47 | 56.63 |
-| manmade | 33.44 | 42.89 | 42.66 | 40.27 | 40.87 | 38.03 | 43.51 | 43.03 | 42.67 | 42.97 |
-| vegetation | 26.34 | 36.67 | 36.64 | 33.63 | 34.37 | 35.14 | 36.86 | 37.05 | 36.78 | 37.06 |
-| mIoU | 32.54 | 39.82 | 39.72 | 36.77 | 37.61 | 37.04 | 39.71 | 39.78 | 39.52 | 39.76 |
+| Class | Naive MTL CNN epoch 15 | CNN head + 128ch neck epoch 24 EMA | CNN head + 128ch neck weight4 epoch 24 EMA | CNN head + 128ch neck V3 epoch 24 EMA | CNN head + 128ch neck V3-lite epoch 24 EMA | ProtoMapHead no PGBR epoch 17 | ProtoMapHead no PGBR epoch 24 | 128ch map neck epoch 24 | 128ch map neck epoch 24 EMA | 128ch map neck PQD-align epoch 24 EMA | 128ch map neck GT-soft epoch 24 EMA | 256ch map neck epoch 24 EMA |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| others | 6.94 | 12.17 | 11.82 | 11.67 | 12.17 | 9.91 | 10.65 | 11.61 | 12.05 | 12.34 | 12.31 | 12.05 |
+| barrier | 40.92 | 47.95 | 47.22 | 46.63 | 46.44 | 43.87 | 43.87 | 44.59 | 47.73 | 47.90 | 47.62 | 48.24 |
+| bicycle | 22.10 | 26.34 | 24.03 | 24.70 | 25.08 | 21.36 | 21.52 | 23.51 | 25.81 | 24.98 | 25.12 | 24.88 |
+| bus | 39.19 | 44.81 | 44.77 | 44.99 | 44.56 | 42.05 | 43.31 | 36.46 | 44.52 | 44.58 | 44.52 | 44.20 |
+| car | 45.96 | 51.91 | 51.94 | 51.76 | 51.78 | 49.63 | 50.54 | 49.01 | 51.95 | 52.06 | 51.94 | 51.84 |
+| construction_vehicle | 20.82 | 23.47 | 25.86 | 24.96 | 25.01 | 20.65 | 20.87 | 20.39 | 22.86 | 24.50 | 22.98 | 23.48 |
+| motorcycle | 22.49 | 26.54 | 26.68 | 26.01 | 26.88 | 22.58 | 26.05 | 25.26 | 26.89 | 26.35 | 26.43 | 26.40 |
+| pedestrian | 23.40 | 27.64 | 27.72 | 27.48 | 27.63 | 26.59 | 25.29 | 25.79 | 27.10 | 27.84 | 27.84 | 27.85 |
+| traffic_cone | 22.58 | 28.26 | 27.52 | 27.32 | 27.51 | 25.84 | 26.66 | 26.04 | 28.26 | 27.79 | 27.49 | 28.09 |
+| trailer | 29.35 | 33.31 | 33.06 | 31.16 | 31.94 | 28.32 | 31.72 | 29.20 | 31.50 | 32.23 | 32.09 | 32.98 |
+| truck | 34.25 | 37.16 | 37.61 | 37.81 | 37.67 | 34.81 | 35.60 | 33.34 | 37.12 | 36.63 | 37.03 | 37.20 |
+| driveable_surface | 75.42 | 81.92 | 81.97 | 81.97 | 82.05 | 80.10 | 81.01 | 81.30 | 82.28 | 82.15 | 81.82 | 82.18 |
+| other_flat | 26.28 | 46.13 | 45.89 | 45.72 | 45.92 | 41.83 | 42.78 | 43.57 | 46.59 | 46.56 | 45.90 | 46.45 |
+| sidewalk | 40.90 | 53.28 | 53.49 | 53.71 | 53.34 | 50.24 | 51.17 | 51.80 | 53.66 | 53.34 | 52.78 | 53.46 |
+| terrain | 42.80 | 56.46 | 56.36 | 56.74 | 56.06 | 53.41 | 53.05 | 54.58 | 56.44 | 56.93 | 56.47 | 56.63 |
+| manmade | 33.44 | 42.89 | 42.66 | 42.59 | 42.66 | 40.27 | 40.87 | 38.03 | 43.51 | 43.03 | 42.67 | 42.97 |
+| vegetation | 26.34 | 36.67 | 36.64 | 36.64 | 36.47 | 33.63 | 34.37 | 35.14 | 36.86 | 37.05 | 36.78 | 37.06 |
+| mIoU | 32.54 | 39.82 | 39.72 | 39.52 | 39.60 | 36.77 | 37.61 | 37.04 | 39.71 | 39.78 | 39.52 | 39.76 |
 
 ## 主要比較
 
@@ -203,6 +207,29 @@ Map 各類差異：
 
 `map_loss_weight=4` 不是單純 early-learning boost；到 epoch 24 仍把 Map mIoU 從 39.94 拉到 45.79，OCC 只下降 0.10。這強力支持 MTL map drop 的第一層瓶頸是 task-level map suppression，而不是 CNN map head 或 rasterization pipeline 本身能力不足。後續 overlay-aware loss 必須和這個 weight4 baseline 比，而不是只和 weight1 比。
 
+### Overlay dynamic V3 / V3-lite vs weight4
+
+這三組使用同一個 CNN head + 128ch map neck 主架構，V3/V3-lite 都疊在 `map_loss_weight=4` 強 baseline 上。V3 full 使用 `dynamic_overlay_gamma=0.5`、`dynamic_overlay_max_weight=5.0`；V3-lite 使用 `dynamic_overlay_gamma=0.25`、`dynamic_overlay_max_weight=3.0`。
+
+| 指標 | weight4 epoch 24 EMA | V3 full epoch 24 EMA | V3 full 差異 | V3-lite epoch 24 EMA | V3-lite 差異 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Occ mIoU | 39.72 | 39.52 | -0.20 | 39.60 | -0.12 |
+| Map mIoU | 45.79 | 46.00 | +0.21 | 46.38 | +0.60 |
+
+Map 各類差異：
+
+| Class | weight4 | V3 full | V3 full 差異 | V3-lite | V3-lite 差異 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| drivable_area | 80.03 | 79.76 | -0.27 | 79.88 | -0.15 |
+| ped_crossing | 41.94 | 42.22 | +0.28 | 42.61 | +0.67 |
+| walkway | 50.93 | 50.82 | -0.11 | 50.80 | -0.13 |
+| stop_line | 28.32 | 28.59 | +0.27 | 28.33 | +0.01 |
+| carpark_area | 40.00 | 41.08 | +1.08 | 43.37 | +3.37 |
+| divider | 33.49 | 33.53 | +0.04 | 33.30 | -0.19 |
+| mean | 45.79 | 46.00 | +0.21 | 46.38 | +0.60 |
+
+V3 full 有小幅提升，但 Occ 下降較多。V3-lite 目前是 MTL map 最佳結果，Map mIoU 達到 46.38，且 Occ 只比 weight4 低 0.12。不過 V3-lite 的主要增益來自 `carpark_area` +3.37 與 `ped_crossing` +0.67，`stop_line` 幾乎不變、`divider` 小幅下降；因此它更適合記成 loss-balancing / add-on ablation，而不是直接宣稱 overlay thin classes 全面被解決。
+
 ### ProtoMapHead + 128ch map neck epoch 24 / EMA vs no-neck epoch 24
 
 | 指標 | no-neck epoch 24 | map neck epoch 24 | map neck epoch 24 EMA | map neck 差異 | EMA 差異 | 最終差異 |
@@ -316,9 +343,9 @@ Map 各類差異（map-only minus MTL）：
 
 | 對比方法 | Occ 差距 | Map 差距 |
 | --- | ---: | ---: |
-| 原始 ProtoOcc | +0.16 using CNN head + 128ch neck weight4 EMA | - |
-| MAESTRO R50 | +1.12 using CNN head + 128ch neck weight4 EMA | -5.51 using CNN head + 128ch neck weight4 EMA |
-| BEVFusion R50 | - | -1.31 using CNN head + 128ch neck weight4 EMA |
+| 原始 ProtoOcc | +0.26 using CNN head + 128ch neck weight1 EMA / +0.04 using V3-lite | - |
+| MAESTRO R50 | +1.22 using CNN head + 128ch neck weight1 EMA / +1.00 using V3-lite | -4.92 using V3-lite |
+| BEVFusion R50 | - | -0.72 using V3-lite |
 | BEVFusion R50 | - | **+1.24 using map-only** |
 | MAESTRO R50 | - | **-2.96 using map-only** |
 
@@ -334,11 +361,11 @@ Map 各類差異（map-only minus MTL）：
 
 5. MTL 本身確實對 map 造成明顯損耗，但 `map_loss_weight=4` 大幅縮小這個 gap。相同架構 CNN head + 128ch map neck EMA，map-only 是 **48.34**；weight1 MTL 只有 39.94，gap 為 -8.40；weight4 MTL 達到 45.79，gap 縮到 -2.55。這表示第一層主要問題是 task-level map suppression，而不是 map head 能力上限。
 
-6. Map-only 48.34 已超越 BEVFusion R50（47.10）+1.24，距離 MAESTRO R50（51.30）僅差 2.96。weight4 MTL 45.79 仍低於 BEVFusion R50 1.31、低於 MAESTRO R50 5.51，但已比 weight1 的 39.94 明顯接近外部 map baseline。
+6. Map-only 48.34 已超越 BEVFusion R50（47.10）+1.24，距離 MAESTRO R50（51.30）僅差 2.96。V3-lite MTL 46.38 仍低於 BEVFusion R50 0.72、低於 MAESTRO R50 4.92，但已比 weight4 的 45.79 再縮小 0.60。
 
-7. 目前 MTL best 是 CNN head + 128ch map neck `map_loss_weight=4` epoch 24 EMA：Occ 39.72 / Map 45.79。Occ 仍高於原始 ProtoOcc R50 39.56 和 MAESTRO R50 38.60，Map 則把與 BEVFusion R50 的差距縮到 1.31。
+7. 目前 MTL map best 是 CNN head + 128ch map neck overlay dynamic V3-lite epoch 24 EMA：Occ 39.60 / Map 46.38。若以乾淨 strong baseline 來看，`map_loss_weight=4` 仍是 Occ 39.72 / Map 45.79；V3-lite 在它上面多 +0.60 Map、少 -0.12 Occ。
 
-8. weight1 MTL 的線狀類別瓶頸非常明顯：`stop_line` 20.73、`divider` 27.63、`ped_crossing` 30.52。weight4 後分別提升到 28.32 / 33.49 / 41.94，已接近 map-only 的 33.62 / 35.43 / 44.58。剩餘最明顯 gap 是 `stop_line`，因此下一步 overlay-aware balancing 應優先處理它，而不是只追求整體 Map mIoU。
+8. weight1 MTL 的線狀類別瓶頸非常明顯：`stop_line` 20.73、`divider` 27.63、`ped_crossing` 30.52。weight4 後分別提升到 28.32 / 33.49 / 41.94，已接近 map-only 的 33.62 / 35.43 / 44.58。V3-lite 雖然把 mean 拉到 46.38，但主要來自 `carpark_area` +3.37 和 `ped_crossing` +0.67；`stop_line` 幾乎不變、`divider` 下降 0.19，所以 thin/overlay gap 還沒有被全面解決。
 
 9. PQD-align epoch 24 EMA 達到 Occ 39.78 / Map 38.75。Occ 小幅高於舊 128ch EMA 的 39.71，但 Map 低 0.27，主要由 `carpark_area` -2.35 造成。這表示 PQD 對齊沒有造成 occupancy 退化，也修掉一部分 prototype 空間問題，但仍沒有讓 ProtoMapHead 超越 CNN head + 128ch map neck；和 weight4 CNN baseline 45.79 相比，差距更明顯。
 
@@ -346,17 +373,17 @@ Map 各類差異（map-only minus MTL）：
 
 11. Coarse/final output ablation 顯示兩個 epoch 24 EMA checkpoint 都是 coarse output 高於 final output：256ch 舊版為 39.44 vs 39.09（+0.36），128ch PQD-align 為 39.01 vs 38.75（+0.26）。Prototype refinement 目前只穩定保住或小幅改善 `stop_line`，但會壓低 `drivable_area` 或 `carpark_area` 等區塊類別，因此後續不應直接假設 final mask 是最佳輸出，應測 coarse-only、coarse+final fusion 或 class-wise selection。
 
-12. 目前最強證據支持的是 map-specific feature branch + task-level map loss balancing：map-only 48.34 > CNN head + 128ch neck weight4 MTL 45.79 >> CNN head + 128ch neck weight1 MTL 39.94 > ProtoMapHead + 256ch neck EMA coarse 39.44 > ProtoMapHead + 128ch PQD-align coarse 39.01。Prototype refinement 本身的貢獻目前仍不足，不應作為下一步主線。
+12. 目前最強證據支持的是 map-specific feature branch + task-level map loss balancing：map-only 48.34 > CNN head + 128ch neck V3-lite MTL 46.38 > V3 full MTL 46.00 > weight4 MTL 45.79 >> weight1 MTL 39.94 > ProtoMapHead + 256ch neck EMA coarse 39.44 > ProtoMapHead + 128ch PQD-align coarse 39.01。Prototype refinement 本身的貢獻目前仍不足，不應作為下一步主線。
 
 ## 建議下一步實驗
 
 1. 以 weight4 作為正式 strong baseline：
    - 128ch branch 已證實比直接使用 48-channel shared `bev_feature` 更適合 map segmentation。
-   - CNN head + 128ch map neck + `map_loss_weight=4` 已是目前 MTL best，後續方法必須和 Occ 39.72 / Map 45.79 比，而不是只和 weight1 39.94 比。
+   - CNN head + 128ch map neck + `map_loss_weight=4` 是乾淨 strong baseline，後續架構方法必須先和 Occ 39.72 / Map 45.79 比，而不是只和 weight1 39.94 比。
 
-2. 實作 overlay-aware map balancing：
-   - 目標不是再證明 map task 需要更大 loss，而是在 weight4 strong baseline 上補 `stop_line / divider / ped_crossing`。
-   - 成功標準應是 Map mIoU 維持 45.79 附近，`stop_line` 優先超過 30，且 Occ 不低於 39.0。
+2. 保留 overlay-aware map balancing 作為 loss-level ablation：
+   - V3-lite 目前是 MTL map best：Occ 39.60 / Map 46.38，但增益主要來自 `carpark_area`，不能直接當成 thin overlay 問題已解。
+   - 若要繼續調 V3，成功標準應是 Map mIoU 高於 46.38，`stop_line` 優先超過 30，且 Occ 不低於 39.0。
 
 3. 保護 occupancy 主任務：
    - weight4 已可讓 Occ 達到 39.72，後續目標是保持 Occ 不低於原始 ProtoOcc 39.56，最好不要比 weight4 低超過 0.3。
