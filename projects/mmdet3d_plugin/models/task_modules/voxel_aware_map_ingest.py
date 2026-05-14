@@ -107,7 +107,7 @@ class VoxelAwareMapIngest(BaseModule):
         mx = voxel_feature.max(dim=-1).values
         return torch.cat([avg, mx], dim=1)
 
-    def forward(self, map_feature, voxel_feature):
+    def forward(self, map_feature, voxel_feature, **kwargs):
         """Fuse the voxel-supervised feature into the map BEV feature.
 
         Args:

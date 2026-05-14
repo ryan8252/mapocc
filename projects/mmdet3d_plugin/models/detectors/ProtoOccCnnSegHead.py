@@ -37,7 +37,24 @@ class ProtoOccCnnSegHead(BEVDet):
             if voxel_aware_map_ingest is not None else None)
         self.map_loss_weight = map_loss_weight
 
-    def _apply_voxel_aware_map_ingest(self, map_feature, voxel_feature):
+    def _needs_pqd_query_info(self):
+        return (
+            self.voxel_aware_map_ingest is not None and
+            getattr(self.voxel_aware_map_ingest,
+                    'requires_pqd_query_info',
+                    False))
+
+    def set_cfv_proto_tsfg_gamma(self, value):
+        if (self.voxel_aware_map_ingest is not None and
+                hasattr(self.voxel_aware_map_ingest, 'set_gamma')):
+            self.voxel_aware_map_ingest.set_gamma(value)
+            return True
+        return False
+
+    def _apply_voxel_aware_map_ingest(self,
+                                      map_feature,
+                                      voxel_feature,
+                                      query_info=None):
         """Optional VAMI fusion before BEVSegHead.
 
         When ``voxel_aware_map_ingest`` is configured, route the
@@ -46,8 +63,11 @@ class ProtoOccCnnSegHead(BEVDet):
         """
         if self.voxel_aware_map_ingest is None:
             return map_feature
+        query_info = query_info or {}
         return self.voxel_aware_map_ingest(
-            map_feature=map_feature, voxel_feature=voxel_feature)
+            map_feature=map_feature,
+            voxel_feature=voxel_feature,
+            **query_info)
 
     def image_encoder(self, img, stereo=False):
         imgs = img
@@ -167,7 +187,21 @@ class ProtoOccCnnSegHead(BEVDet):
         # Prototype Query Decoder (PQD)
         B = comprehensive_voxel_feature.shape[0]
         img_metas = [{"pc_range": self.pc_range, "occ_size":self.grid_size} for i in range(B)]
-        losses = self.prototype_query_decoder.forward_train(comprehensive_voxel_feature, img_metas, voxel_semantics, mask_camera, mask_feat, prototoype_occ_pred)
+        return_query_info = (
+            self.bev_seg_head is not None and self._needs_pqd_query_info())
+        pqd_outputs = self.prototype_query_decoder.forward_train(
+            comprehensive_voxel_feature,
+            img_metas,
+            voxel_semantics,
+            mask_camera,
+            mask_feat,
+            prototoype_occ_pred,
+            return_query_info=return_query_info)
+        if return_query_info:
+            losses, query_info = pqd_outputs
+        else:
+            losses = pqd_outputs
+            query_info = None
         
         # aggregate loss values
         loss_prototype = self.cnn3d_decoder.loss(prototoype_occ_pred, voxel_semantics, mask_camera)
@@ -181,7 +215,7 @@ class ProtoOccCnnSegHead(BEVDet):
                 raise ValueError('Expected `gt_masks_bev` when training ProtoOccCnnSegHead with a BEV segmentation head.')
             map_feature = self._select_map_feature(bev_feature, map_bev_feature)
             map_feature = self._apply_voxel_aware_map_ingest(
-                map_feature, comprehensive_voxel_feature)
+                map_feature, comprehensive_voxel_feature, query_info)
             self._check_map_feature_size(map_feature, gt_masks_bev)
             bev_seg_logits = self.bev_seg_head(map_feature)
             map_losses = self.bev_seg_head.loss(bev_seg_logits, gt_masks_bev)
@@ -209,14 +243,26 @@ class ProtoOccCnnSegHead(BEVDet):
         # Prototype Query Decoder (PQD)
         B = comprehensive_voxel_feature.shape[0]
         img_metas_occ = [{"pc_range": self.pc_range, "occ_size":self.grid_size} for i in range(B)]
-        occ_preds = self.prototype_query_decoder.simple_test(comprehensive_voxel_feature, img_metas_occ, mask_feat, prototoype_occ_pred)
+        return_query_info = (
+            self.bev_seg_head is not None and self._needs_pqd_query_info())
+        pqd_outputs = self.prototype_query_decoder.simple_test(
+            comprehensive_voxel_feature,
+            img_metas_occ,
+            mask_feat,
+            prototoype_occ_pred,
+            return_query_info=return_query_info)
+        if return_query_info:
+            occ_preds, query_info = pqd_outputs
+        else:
+            occ_preds = pqd_outputs
+            query_info = None
 
         if self.bev_seg_head is None:
             return occ_preds
 
         map_feature = self._select_map_feature(bev_feature, map_bev_feature)
         map_feature = self._apply_voxel_aware_map_ingest(
-            map_feature, comprehensive_voxel_feature)
+            map_feature, comprehensive_voxel_feature, query_info)
         bev_seg_probs = self.bev_seg_head.predict(self.bev_seg_head(map_feature)).detach().cpu().numpy()
         gt_masks_bev = self._normalize_map_targets(kwargs.get('gt_masks_bev'))
         if gt_masks_bev is not None:

@@ -463,9 +463,14 @@ model = dict(
             start_value=0.0,
             end_value=1.0,
         ),
+        initial_gamma=1.0,
+        refine_kernel_size=1,
+        debug=False,
+        debug_interval=100,
     ),
 )
 
+# 這個 child config 會覆蓋 base 的 custom_hooks，所以 EMA 要明確保留。
 custom_hooks = [
     dict(
         type='CFVProtoTSFGWarmupHook',
@@ -473,6 +478,12 @@ custom_hooks = [
         end_epoch=3,
         start_value=0.0,
         end_value=1.0,
+        priority='NORMAL',
+    ),
+    dict(
+        type='MEGVIIEMAHook',
+        init_updates=10560,
+        priority='NORMAL',
     ),
 ]
 
@@ -500,7 +511,7 @@ evaluation = dict(start=10)
 | `overlay_dynamic V3-lite` | 39.60 | 46.38 | 目前 MTL map best，作為 secondary target |
 | `map-only` | - | 48.34 | upper bound |
 
-### V1：Plain VAMI ablation
+### V1：Plain VAMI ablation  (已經在跑了 等一下)
 
 目的：測「只把 CFV collapse 到 map neck」是否已經有效。
 
@@ -645,3 +656,33 @@ MAESTRO shows that prototype-guided task-specific feature generation can mitigat
 7. 做 CPU/config build 檢查，確認 baseline config 不受影響。
 8. 先跑 1-GPU smoke：檢查 debug log 中 `gamma(t)=0` 時 residual output 等價 baseline、warmup 後 residual norm 非零、background query/filter shape 正常、`mask_embed_real_bqc.requires_grad=False`。
 9. 正式 TWCC 跑 epoch 11 EMA；通過 stop criterion 才跑滿 epoch 24。
+
+## V2 實作紀錄（2026-05-14）
+
+### 新增檔案
+
+| 檔案 | 內容 |
+| --- | --- |
+| `projects/mmdet3d_plugin/models/task_modules/cfv_prototype_tsfg_map_fusion.py` | 新增 `CFVPrototypeTSFGMapFusion`。支援 detached PQD mask filter、background prototype-wise activation、prototype-aware channel gate、avg+max height collapse、two-layer scheduled residual fusion。 |
+| `projects/mmdet3d_plugin/core/hook/cfv_proto_tsfg_warmup.py` | 新增 `CFVProtoTSFGWarmupHook`，在 runtime 將 adapter gamma 從 0 線性 ramp 到 1，並支援 DDP wrapper。 |
+| `projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck_cfv_proto_tsfg.py` | V2 主實驗 config。繼承 128ch map neck baseline，設定 `map_loss_weight=4.0`，啟用 `CFVPrototypeTSFGMapFusion`，並同時保留 `MEGVIIEMAHook`。 |
+| `TWCC/train_multi_cnn_head_map_neck_cfv_proto_tsfg.sh` | TWCC 4-GPU launcher，work dir 為 `work_dirs/ProtoOcc_multi_cnn_head_map_neck_cfv_proto_tsfg`。 |
+
+### 修改檔案
+
+| 檔案 | 改動 |
+| --- | --- |
+| `projects/mmdet3d_plugin/models/OccHead/Prototype_Query_Decoder_nuScenes.py` | 新增 `return_query_info` optional path。PQD 會在 RPL slicing 後回傳 `query_embed_real_bqc: [B,18,48]` 與 detached `mask_embed_real_bqc: [B,18,48]`，原本 forward / train / simple_test 呼叫保持相容。 |
+| `projects/mmdet3d_plugin/models/detectors/ProtoOccCnnSegHead.py` | 新增 `_needs_pqd_query_info()`、`set_cfv_proto_tsfg_gamma()`，並讓 `forward_train()` / `simple_test()` 在 adapter 需要時同一路徑傳入 PQD query/filter。 |
+| `projects/mmdet3d_plugin/models/task_modules/__init__.py` | export `CFVPrototypeTSFGMapFusion`。 |
+| `projects/mmdet3d_plugin/models/task_modules/voxel_aware_map_ingest.py` | `forward()` 增加 `**kwargs`，讓舊 VAMI 在共用 detector helper 時仍可忽略 query/filter 參數。 |
+| `projects/mmdet3d_plugin/core/hook/__init__.py` | export `CFVProtoTSFGWarmupHook`。 |
+| `cfv_prototype_tsfg_map_fusion_plan.md` | 補上實作紀錄與 config 中 EMA hook 保留方式。 |
+
+### 已做檢查
+
+- `python -m py_compile`：通過，涵蓋 PQD、detector、VAMI、新 adapter、新 hook、新 config。
+- `bash -n TWCC/train_multi_cnn_head_map_neck_cfv_proto_tsfg.sh`：通過。
+- `conda run -n mapocc` adapter dummy smoke：`gamma=0` 時 output 和 `F_map` max diff = 0；`gamma=1` forward shape 正常。
+- `conda run -n mapocc` detach smoke：使用 scalar fusion 做 backward，確認 `query_embed_real_bqc`、`mask_embed_real_bqc`、`voxel_feature` 都沒有收到 map-loss gradient，只有 map path 收到 gradient。
+- `conda run -n mapocc` config / constructor check：可 build `ProtoOccCnnSegHead`，adapter 為 `CFVPrototypeTSFGMapFusion`，`requires_pqd_query_info=True`，custom hooks 為 `CFVProtoTSFGWarmupHook` + `MEGVIIEMAHook`。

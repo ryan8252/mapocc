@@ -327,12 +327,24 @@ class Prototype_Query_Decoder_nuScenes(MaskHead):
             mask_camera,
             mask_feat,
             occ_pred,
+            return_query_info=False,
             **kwargs,
         ):
         gt_labels, gt_masks, gt_binaries = self.preprocess_gt(gt_occ, img_metas, )
-        all_cls_scores, all_mask_preds, RPL_args = self(voxel_feats, img_metas, mask_feat, occ_pred, )
+        decoder_outputs = self(
+            voxel_feats,
+            img_metas,
+            mask_feat,
+            occ_pred,
+            return_query_info=return_query_info)
+        if return_query_info:
+            all_cls_scores, all_mask_preds, RPL_args, query_info = decoder_outputs
+        else:
+            all_cls_scores, all_mask_preds, RPL_args = decoder_outputs
         losses = self.loss(all_cls_scores, all_mask_preds, gt_labels, gt_masks, gt_binaries, gt_occ, mask_camera, img_metas, RPL_args)
 
+        if return_query_info:
+            return losses, query_info
         return losses
 
     def forward(self, 
@@ -340,6 +352,7 @@ class Prototype_Query_Decoder_nuScenes(MaskHead):
             img_metas,
             mask_feat,
             occ_pred=None,
+            return_query_info=False,
             **kwargs,
         ):
         batch_size = len(img_metas)
@@ -449,6 +462,18 @@ class Prototype_Query_Decoder_nuScenes(MaskHead):
         RPL_args['cls_pred_list'] = RPL_cls_pred_list
         RPL_args['mask_pred_list'] = RPL_mask_pred_list
 
+        if return_query_info:
+            query_real_qbc = query_feat[RPL_pad_size:]
+            query_embed_real_bqc = query_real_qbc.transpose(0, 1).contiguous()
+            with torch.no_grad():
+                mask_embed_real_bqc = self.mask_embed(
+                    self.post_norm(query_real_qbc)).transpose(0, 1).contiguous()
+            query_info = dict(
+                query_embed_real_bqc=query_embed_real_bqc,
+                mask_embed_real_bqc=mask_embed_real_bqc.detach(),
+                RPL_pad_size=RPL_pad_size)
+            return cls_pred_list_, mask_pred_list_, RPL_args, query_info
+
         return cls_pred_list_, mask_pred_list_, RPL_args
 
     def format_results(self, mask_cls_results, mask_pred_results):
@@ -463,9 +488,19 @@ class Prototype_Query_Decoder_nuScenes(MaskHead):
             img_metas,
             mask_feat,
             occ_pred=None,
+            return_query_info=False,
             **kwargs,
         ):
-        all_cls_scores, all_mask_preds, _ = self(voxel_feats, img_metas, mask_feat, occ_pred)
+        decoder_outputs = self(
+            voxel_feats,
+            img_metas,
+            mask_feat,
+            occ_pred,
+            return_query_info=return_query_info)
+        if return_query_info:
+            all_cls_scores, all_mask_preds, _, query_info = decoder_outputs
+        else:
+            all_cls_scores, all_mask_preds, _ = decoder_outputs
         mask_cls_results = all_cls_scores[-1]
         mask_pred_results = all_mask_preds[-1]
         
@@ -473,4 +508,6 @@ class Prototype_Query_Decoder_nuScenes(MaskHead):
         occ_score = output_voxels.permute(0,2,3,4,1).softmax(-1)
         occ_res = occ_score.argmax(-1)
         occ_res = occ_res.cpu().numpy().astype(np.uint8)
+        if return_query_info:
+            return list(occ_res), query_info
         return list(occ_res)
