@@ -98,7 +98,9 @@ class ProtoMapHead(BaseModule):
       5. (Optional) Prototype-grounded BEV refinement, enabled only when
          `pgbr_cfg` is provided for PGBR ablations.
       6. Class-fixed queries interact with self-attention
-      7. Final map masks come from `mask_embed(query) x mask_feature`
+      7. Final map logits are produced by a PQD-inspired class-confidence
+         branch: query masks are mixed by `cls_embed(query)` while the output
+         remains sigmoid multi-label.
 
     Compared with the 3-D occupancy decoder, the main differences are:
       - The spatial lattice is 2-D BEV instead of 3-D voxels.
@@ -130,6 +132,8 @@ class ProtoMapHead(BaseModule):
                  prototype_debug=False,
                  prototype_debug_interval=50,
                  prototype_debug_class_names=None,
+                 use_class_mixing=True,
+                 class_mixing_identity_bias=4.0,
                  with_cp=False,
                  loss_coarse_bce=None,
                  loss_coarse_dice=None,
@@ -152,6 +156,8 @@ class ProtoMapHead(BaseModule):
         self.use_ema_bank       = use_ema_bank
         self.use_learnable_query = use_learnable_query
         self.use_query_self_attn = use_query_self_attn
+        self.use_class_mixing = use_class_mixing
+        self.class_mixing_identity_bias_value = float(class_mixing_identity_bias)
         self.with_cp         = with_cp
         self.prototype_debug = prototype_debug
         self.prototype_debug_interval = max(1, int(prototype_debug_interval))
@@ -266,7 +272,16 @@ class ProtoMapHead(BaseModule):
         # first line `decoder_out = self.post_norm(decoder_out)`.
         self.post_norm      = nn.LayerNorm(hidden_channels)
 
-        # ── 7. Mask embed (query -> embedding for dot product) ─────────────
+        # ── 7. Class confidence + mask embed heads ─────────────────────────
+        # `cls_embed` follows PQD's query classification branch, but in map we
+        # use it as query-to-class mixing and keep the final output multi-label.
+        self.cls_embed = nn.Linear(hidden_channels, num_classes)
+        nn.init.zeros_(self.cls_embed.weight)
+        nn.init.zeros_(self.cls_embed.bias)
+        class_bias = torch.eye(num_classes).unsqueeze(0) * \
+            self.class_mixing_identity_bias_value
+        self.register_buffer('class_mixing_bias', class_bias)
+
         self.mask_embed = nn.Sequential(
             nn.Linear(hidden_channels, hidden_channels), nn.ReLU(inplace=True),
             nn.Linear(hidden_channels, hidden_channels), nn.ReLU(inplace=True),
@@ -668,12 +683,13 @@ class ProtoMapHead(BaseModule):
     # ──────────────────────────────────────────────────────────────────────
 
     def _forward_head(self, query_feat, mask_feature):
-        """Self-attention among class queries then dot product with mask_feature.
+        """Self-attention, PQD-style class confidence, and spatial masks.
 
-        Mirrors PQD `forward_head(decoder_out, mask_feature)` exactly:
-        post_norm -> mask_embed MLP -> einsum with the high-dim feature
-        (analog of PQD's `voxel_feats`, called `mask_feature` inside its
-        `forward_head`).
+        The queries remain class-specific, but `cls_embed` provides a
+        correction/confidence branch. The branch mixes query masks into final
+        class logits with an identity bias, so initialization stays close to
+        the previous class-fixed behavior. The returned logits are still
+        consumed by sigmoid BCE/Dice as multi-label map predictions.
 
         Args:
             query_feat:   (num_classes, hidden_channels)  — batch-shared query
@@ -693,11 +709,20 @@ class ProtoMapHead(BaseModule):
         # first line `decoder_out = self.post_norm(decoder_out)`.
         q = self.post_norm(q)
 
-        # Dot product: einsum mirrors ProtoOcc's forward_head
-        # mask_embed: (K, B, C) -> (B, K, C)
+        # Dot product: query mask embeddings produce one spatial mask per
+        # class-specific query, then cls_embed mixes those query masks into
+        # final map-class logits.
         q = q.permute(1, 0, 2)                           # (B, K, C)
+        cls_logits = self.cls_embed(q)                    # (B, K, K)
         mask_embed  = self.mask_embed(q)                 # (B, K, C)
-        final_masks = torch.einsum('bkc,bchw->bkhw', mask_embed, mask_feature)
+        query_masks = torch.einsum('bkc,bchw->bkhw', mask_embed, mask_feature)
+        if self.use_class_mixing:
+            class_prob = F.softmax(
+                cls_logits + self.class_mixing_bias, dim=-1)
+            final_masks = torch.einsum(
+                'bqk,bqhw->bkhw', class_prob, query_masks)
+        else:
+            final_masks = query_masks
         return final_masks                               # (B, K, H, W)
 
     # ──────────────────────────────────────────────────────────────────────

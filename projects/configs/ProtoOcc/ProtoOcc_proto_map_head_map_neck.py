@@ -7,7 +7,7 @@ numC_Trans = 80
 map_bev_channels = 128
 
 model = dict(
-    map_loss_weight=1.0,
+    map_loss_weight=2.0,
     dual_branch_encoder=dict(
         return_bev_feature=True,
         return_map_feature=True,

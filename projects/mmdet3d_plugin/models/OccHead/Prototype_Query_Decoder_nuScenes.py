@@ -348,10 +348,10 @@ class Prototype_Query_Decoder_nuScenes(MaskHead):
         return losses
 
     def forward(self, 
-            voxel_feats,
-            img_metas,
-            mask_feat,
-            occ_pred=None,
+            voxel_feats,  #CFV [B, 48, 200, 200, 16]
+            img_metas,  
+            mask_feat,    # cnn3d_decoder 的 mask_feat [B,200,200,16,32] 給 AdaPG 抽 32 維 prototype 用
+            occ_pred=None, # prototoype_occ_pred 是 18 類 coarse semantic logits [B,200,200,16,18]
             return_query_info=False,
             **kwargs,
         ):
@@ -361,7 +361,7 @@ class Prototype_Query_Decoder_nuScenes(MaskHead):
 
         # Scene-Adaptive Prototype Generator
         mask_target = occ_pred.clone().detach().permute(0,4,1,2,3)
-        mask_ = F.softmax(mask_target, dim=1)
+        mask_ = F.softmax(mask_target, dim=1) # 每個 voxel 對 18 個 occupancy class 的 coarse probability。
         top2_values, top2_indices = torch.topk(mask_, 2, dim=1)
         difference = top2_values[:, 0] - top2_values[:, 1]
         scores = 1.0 - difference
@@ -439,12 +439,12 @@ class Prototype_Query_Decoder_nuScenes(MaskHead):
             query_feat = self.for_query_embed(query_feat).unsqueeze(1).repeat((1, batch_size, 1))
 
         query_feat = self.query_self_attn(query_feat, [self_attn_mask])
-        
+        # query_feat: Scene-Aware Queries
 
         # Preidct final occupancy
         cls_pred_list = []
         mask_pred_list = []
-        cls_pred, mask_pred = self.forward_head(query_feat, mask_features)
+        cls_pred, mask_pred = self.forward_head(query_feat, mask_features) # mask_features 來自 CFV
 
         cls_pred_list.append(cls_pred)
         mask_pred_list.append(mask_pred)
