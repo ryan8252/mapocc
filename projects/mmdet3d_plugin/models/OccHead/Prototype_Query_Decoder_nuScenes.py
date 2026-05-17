@@ -465,13 +465,16 @@ class Prototype_Query_Decoder_nuScenes(MaskHead):
         if return_query_info:
             query_real_qbc = query_feat[RPL_pad_size:]
             query_embed_real_bqc = query_real_qbc.transpose(0, 1).contiguous()
-            with torch.no_grad():
-                mask_embed_real_bqc = self.mask_embed(
-                    self.post_norm(query_real_qbc)).transpose(0, 1).contiguous()
+            query_norm_real_qbc = self.post_norm(query_real_qbc)
+            query_norm_real_bqc = query_norm_real_qbc.transpose(0, 1).contiguous()
+            mask_embed_real_qbc = self.mask_embed(query_norm_real_qbc)
+            mask_embed_real_bqc = mask_embed_real_qbc.transpose(0, 1).contiguous()
             query_info = dict(
                 query_embed_real_bqc=query_embed_real_bqc,
-                mask_embed_real_bqc=mask_embed_real_bqc.detach(),
+                query_norm_real_bqc=query_norm_real_bqc,
+                mask_embed_real_bqc=mask_embed_real_bqc,
                 RPL_pad_size=RPL_pad_size)
+
             return cls_pred_list_, mask_pred_list_, RPL_args, query_info
 
         return cls_pred_list_, mask_pred_list_, RPL_args
