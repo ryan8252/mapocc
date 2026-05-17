@@ -39,6 +39,7 @@ class ProtoMapHeadV2(BaseModule):
                  cnn2d_decoder_cfg=None,
                  use_query_self_attn=True,
                  class_mixing_identity_bias=4.0,
+                 test_output='final',
                  with_cp=False,
                  loss_coarse_bce=None,
                  loss_coarse_dice=None,
@@ -55,6 +56,11 @@ class ProtoMapHeadV2(BaseModule):
         self.use_internal_cnn2d_decoder = use_internal_cnn2d_decoder
         self.use_query_self_attn = use_query_self_attn
         self.class_mixing_identity_bias_value = float(class_mixing_identity_bias)
+        if test_output not in ('final', 'coarse'):
+            raise ValueError(
+                "ProtoMapHeadV2 test_output must be 'final' or 'coarse', "
+                f'but got {test_output}.')
+        self.test_output = test_output
         self.with_cp = with_cp
 
         if self.out_channels != in_channels:
@@ -289,6 +295,11 @@ class ProtoMapHeadV2(BaseModule):
                 gt_masks_bev.reshape(-1, *gt_masks_bev.shape[2:]))
 
         return losses
+
+    def select_output(self, coarse_pred, final_masks):
+        if self.test_output == 'coarse':
+            return coarse_pred
+        return final_masks
 
     def predict(self, final_masks):
         return torch.sigmoid(final_masks)
