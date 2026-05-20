@@ -1,5 +1,8 @@
 # Map-neck Query-TSFG 計劃
 
+## 失敗了沒有屁用 還是打不贏 weight4 baseline 
+## dot 效果比較好 cosine prototype collapse 了
+
 日期：2026-05-17
 
 ## 一句話定位
@@ -349,37 +352,6 @@ model = dict(
 - `BEVSegHead`
 - `cnn3d_decoder`
 - `ProtoOccMultitask`，除非要把 prototype-map-head branch 也支援這個 adapter
-
-### 2026-05-17 實作紀錄
-
-新增：
-
-| 檔案 | 內容 |
-| --- | --- |
-| `projects/mmdet3d_plugin/models/task_modules/map_neck_query_tsfg.py` | 新增 `MapNeckQueryTSFG`，支援 `query_norm_real_bqc` / `query_embed_real_bqc` / `mask_embed_real_bqc` source、`similarity_mode='cosine'|'dot'`、prototype-wise response、prototype-aware channel modulation、fixed-gamma zero-init residual、`mmdet` logger debug。 |
-| `projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck_query_tsfg.py` | 主實驗 config，繼承 128ch map neck baseline，設定 `map_loss_weight=4.0`、啟用 `MapNeckQueryTSFG`、保留 `MEGVIIEMAHook`、`evaluation.start=10`。 |
-| `TWCC/train_multi_cnn_head_map_neck_query_tsfg.sh` | TWCC launcher，輸出到 `work_dirs/ProtoOcc_multi_cnn_head_map_neck_query_tsfg`。 |
-
-修改：
-
-| 檔案 | 內容 |
-| --- | --- |
-| `projects/mmdet3d_plugin/models/OccHead/Prototype_Query_Decoder_nuScenes.py` | `return_query_info` 新增 `query_norm_real_bqc`；PQD 內不 detach，detach 由 adapter 的 `detach_query` 控制。 |
-| `projects/mmdet3d_plugin/models/task_modules/__init__.py` | export `MapNeckQueryTSFG`。 |
-| `map_neck_query_tsfg_plan.md` | 補上實作紀錄與驗證結果。 |
-
-已完成驗證：
-
-```text
-python -m py_compile map_neck_query_tsfg.py Prototype_Query_Decoder_nuScenes.py
-bash -n TWCC/train_multi_cnn_head_map_neck_query_tsfg.sh
-conda run -n mapocc Config.fromfile(...)  # map_loss_weight=4.0, type=MapNeckQueryTSFG, similarity_mode=cosine, EMA hook, evaluation.start=10
-conda run -n mapocc tensor smoke          # F_out shape [2,128,8,8], zero-init max diff=0, query grad None, map grad exists, final delta conv grad exists
-conda run -n mapocc dot-path smoke        # similarity_mode='dot' forward shape [2,128,8,8]
-conda run -n mapocc build_detector(...)   # CPU-only monkeypatch torch.Tensor.cuda, registry/config build OK
-```
-
-梯度 smoke 細節：因為 `zero_init_delta=True` 與 `zero_init_gate=True`，第一次 backward 只有 final delta conv 會立刻有有效梯度；第二次 backward 可看到 `prototype_proj`、fusion 前段、gate final Linear 開始有梯度；gate MLP 前層到第三次 backward 才開始有梯度。這符合 zero-init residual/gate 的預期。
 
 ## Validation / Smoke Tests
 
