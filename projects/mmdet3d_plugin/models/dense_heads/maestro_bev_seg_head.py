@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
@@ -6,6 +7,30 @@ from mmcv.cnn import ConvModule
 from mmcv.runner import BaseModule
 
 from mmdet3d.models.builder import HEADS, build_loss
+
+
+def _bevfusion_sigmoid_focal_loss(inputs,
+                                  targets,
+                                  alpha=-1.0,
+                                  gamma=2.0,
+                                  reduction='mean'):
+    inputs = inputs.float()
+    targets = targets.float()
+    prob = torch.sigmoid(inputs)
+    ce_loss = F.binary_cross_entropy_with_logits(
+        inputs, targets, reduction='none')
+    p_t = prob * targets + (1.0 - prob) * (1.0 - targets)
+    loss = ce_loss * ((1.0 - p_t) ** gamma)
+
+    if alpha >= 0:
+        alpha_t = alpha * targets + (1.0 - alpha) * (1.0 - targets)
+        loss = alpha_t * loss
+
+    if reduction == 'mean':
+        return loss.mean()
+    if reduction == 'sum':
+        return loss.sum()
+    return loss
 
 
 @HEADS.register_module()
@@ -20,6 +45,7 @@ class MAESTROBEVSegHead(BaseModule):
                  norm_cfg=dict(type='BN'),
                  with_cp=False,
                  loss_bce=None,
+                 loss_focal=None,
                  loss_dice=None,
                  init_cfg=None):
         super(MAESTROBEVSegHead, self).__init__(init_cfg)
@@ -45,6 +71,7 @@ class MAESTROBEVSegHead(BaseModule):
         self.decoder = nn.Sequential(*blocks)
         self.predictor = nn.Conv2d(current_channels, num_classes, kernel_size=1)
         self.loss_bce = build_loss(loss_bce) if loss_bce is not None else None
+        self.loss_focal = loss_focal
         self.loss_dice = build_loss(loss_dice) if loss_dice is not None else None
 
     def forward(self, bev_feature):
@@ -60,6 +87,23 @@ class MAESTROBEVSegHead(BaseModule):
 
         if self.loss_bce is not None:
             losses['loss_map_bce'] = self.loss_bce(seg_logits, gt_masks_bev)
+
+        if self.loss_focal is not None:
+            cfg = dict(self.loss_focal)
+            weight = cfg.pop('loss_weight', 1.0)
+            gamma = cfg.pop('gamma', 2.0)
+            alpha = cfg.pop('alpha', -1.0)
+            reduction = cfg.pop('reduction', 'mean')
+            loss_focal = seg_logits.new_tensor(0.0)
+            for index in range(self.num_classes):
+                loss_focal = loss_focal + _bevfusion_sigmoid_focal_loss(
+                    seg_logits[:, index],
+                    gt_masks_bev[:, index],
+                    alpha=alpha,
+                    gamma=gamma,
+                    reduction=reduction,
+                )
+            losses['loss_map_focal'] = loss_focal * weight
 
         if self.loss_dice is not None:
             losses['loss_map_dice'] = self.loss_dice(

@@ -12,16 +12,23 @@ from mmdet3d.models import BACKBONES
 class MAESTROTaskSpecificFeatureGenerator(BaseModule):
     """Task-specific feature generator used by MAESTRO 2-task ProtoOcc.
 
-    The input convention is ProtoOcc's voxel feature layout (B, C, X, Y, Z).
-    For map segmentation, the height axis is collapsed into channels and a 2D
-    feature is produced. For occupancy, the 3D layout is kept and the output is
-    converted back to (B, C, X, Y, Z).
+    Paper mapping:
+    - Task-dependent Feature Transformation: F_t = T_t(F_s)
+    - Prototype-wise Features: F_wise = G_t dot F_t
+    - Prototype-aware Features: F_aware = gamma_t_scale * F_t
+    - Adaptive Feature Enhancement: F_tilde = Conv([F_wise, F_aware])
+    - Feature Suppression: F_TS = F_tilde * S_t_supp
+
+    Input uses ProtoOcc's voxel layout (B, C, X, Y, Z). The map branch
+    collapses height Z into BEV channels; the occupancy branch keeps 3D layout
+    internally and converts back to (B, C, X, Y, Z) before returning.
     """
 
     def __init__(self,
                  in_channels,
                  out_channels=None,
                  prototype_channels=None,
+                 num_prototypes=None,
                  task='occ',
                  voxel_z=16,
                  hidden_channels=None,
@@ -37,6 +44,7 @@ class MAESTROTaskSpecificFeatureGenerator(BaseModule):
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.prototype_channels = prototype_channels
+        self.num_prototypes = num_prototypes or out_channels
         self.task = task
         self.voxel_z = voxel_z
         self.with_cp = with_cp
@@ -56,7 +64,7 @@ class MAESTROTaskSpecificFeatureGenerator(BaseModule):
                 act_cfg=dict(type='ReLU', inplace=True),
             )
             self.fuse = ConvModule(
-                out_channels * 3,
+                out_channels + self.num_prototypes,
                 out_channels,
                 kernel_size=1,
                 stride=1,
@@ -79,7 +87,7 @@ class MAESTROTaskSpecificFeatureGenerator(BaseModule):
                 act_cfg=dict(type='ReLU', inplace=True),
             )
             self.fuse = ConvModule(
-                out_channels * 3,
+                out_channels + self.num_prototypes,
                 out_channels,
                 kernel_size=1,
                 stride=1,
@@ -102,21 +110,21 @@ class MAESTROTaskSpecificFeatureGenerator(BaseModule):
             nn.Linear(hidden_channels, out_channels),
             nn.Sigmoid(),
         )
-        self.residual_scale = nn.Parameter(torch.zeros(1))
 
-    def _transform_feature(self, voxel_feature):
+    def _transform_feature(self, F_s):
+        # Task-dependent Feature Transformation.
         if self.is_bev_task:
-            b, c, x, y, z = voxel_feature.shape
+            b, c, x, y, z = F_s.shape
             if z != self.voxel_z:
                 raise ValueError(
                     f'Expected voxel_z={self.voxel_z}, but got feature Z={z}.')
-            bev_feature = voxel_feature.permute(0, 1, 4, 2, 3).reshape(
+            bev_feature = F_s.permute(0, 1, 4, 2, 3).reshape(
                 b, c * z, x, y)
             if self.with_cp and self.training:
                 return checkpoint(self.feature_transform, bev_feature)
             return self.feature_transform(bev_feature)
 
-        conv_feature = voxel_feature.permute(0, 1, 4, 2, 3).contiguous()
+        conv_feature = F_s.permute(0, 1, 4, 2, 3).contiguous()
         if self.with_cp and self.training:
             return checkpoint(self.feature_transform, conv_feature)
         return self.feature_transform(conv_feature)
@@ -128,25 +136,30 @@ class MAESTROTaskSpecificFeatureGenerator(BaseModule):
         return feature_flat.reshape(
             feature_like.shape[0], feature_flat.shape[1], *feature_like.shape[2:])
 
-    def _prototype_context(self, feature, prototypes):
-        b, c = feature.shape[:2]
-        feature_flat = self._flatten_feature(feature)
-        if prototypes is None or prototypes.size(1) == 0:
-            zeros = feature_flat.new_zeros(feature_flat.shape)
-            return zeros, zeros
+    def _adaptive_feature_enhancement(self, F_t, G_t):
+        F_t_flat = self._flatten_feature(F_t)
+        b, c = F_t_flat.shape[:2]
+        if G_t is None or G_t.size(1) == 0:
+            F_wise = F_t_flat.new_zeros(b, self.num_prototypes, F_t_flat.size(-1))
+            F_aware = F_t_flat.new_zeros(F_t_flat.shape)
+            return F_wise, F_aware
 
-        projected = self.prototype_proj(prototypes)
-        feature_norm = F.normalize(feature_flat, dim=1)
-        proto_norm = F.normalize(projected, dim=-1)
-        scores = torch.einsum('bcs,bnc->bns', feature_norm, proto_norm)
-        weights = F.softmax(scores, dim=1)
-        prototype_wise = torch.einsum('bns,bnc->bcs', weights, projected)
+        if G_t.size(1) != self.num_prototypes:
+            raise ValueError(
+                f'Expected {self.num_prototypes} task prototypes for {self.task}, '
+                f'but got {G_t.size(1)}.')
 
-        proto_mean = projected.mean(dim=1)
-        proto_max = projected.max(dim=1).values
-        gate = self.prototype_gate(torch.cat([proto_mean, proto_max], dim=-1))
-        prototype_aware = feature_flat * gate.view(b, c, 1)
-        return prototype_wise, prototype_aware
+        G_t = self.prototype_proj(G_t)
+
+        # Prototype-wise Features: dot product between each prototype and F_t.
+        F_wise = torch.einsum('bnc,bcs->bns', G_t, F_t_flat)
+
+        # Prototype-aware Features: pooled prototype group predicts gamma_t_scale.
+        G_t_mean = G_t.mean(dim=1)
+        G_t_max = G_t.max(dim=1).values
+        gamma_t_scale = self.prototype_gate(torch.cat([G_t_mean, G_t_max], dim=-1))
+        F_aware = F_t_flat * gamma_t_scale.view(b, c, 1)
+        return F_wise, F_aware
 
     def _resize_target(self, target_mask, score_logits):
         if target_mask is None:
@@ -183,28 +196,32 @@ class MAESTROTaskSpecificFeatureGenerator(BaseModule):
         return {self.loss_name: loss * self.loss_supp_weight}
 
     def forward(self, voxel_feature, prototypes, target_mask=None):
-        task_feature = self._transform_feature(voxel_feature)
-        proto_wise, proto_aware = self._prototype_context(task_feature, prototypes)
-        enhanced_input = torch.cat([
-            self._flatten_feature(task_feature),
-            proto_wise,
-            proto_aware,
-        ], dim=1)
-        enhanced_input = self._unflatten_feature(enhanced_input, task_feature)
+        # Shared Voxel Feature (F_s) -> transformed task feature (F_t).
+        F_s = voxel_feature
+        G_t = prototypes
+        F_t = self._transform_feature(F_s)
+
+        # Adaptive Feature Enhancement.
+        F_wise_flat, F_aware_flat = self._adaptive_feature_enhancement(F_t, G_t)
+        F_wise = self._unflatten_feature(F_wise_flat, F_t)
+        F_aware = self._unflatten_feature(F_aware_flat, F_t)
+        enhanced_input = torch.cat([F_wise, F_aware], dim=1)
 
         if self.with_cp and self.training:
-            enhanced = checkpoint(self.fuse, enhanced_input)
+            F_tilde = checkpoint(self.fuse, enhanced_input)
         else:
-            enhanced = self.fuse(enhanced_input)
+            F_tilde = self.fuse(enhanced_input)
 
-        score_logits = self.score_predictor(enhanced)
-        relevance = torch.sigmoid(score_logits)
-        output = task_feature + self.residual_scale * (
-            enhanced * relevance - task_feature * (1.0 - relevance))
-        losses = self._suppression_loss(score_logits, target_mask)
+        # Feature Suppression Score: S_t_supp is predicted from F_aware.
+        S_t_supp_logits = self.score_predictor(F_aware)
+        S_t_supp = torch.sigmoid(S_t_supp_logits)
+
+        # Task-Specific Feature: F_TS = F_tilde * S_t_supp.
+        F_TS = F_tilde * S_t_supp
+        losses = self._suppression_loss(S_t_supp_logits, target_mask)
 
         if self.is_bev_task:
-            return output, losses
+            return F_TS, losses
 
-        output = output.permute(0, 1, 3, 4, 2).contiguous()
-        return output, losses
+        F_TS = F_TS.permute(0, 1, 3, 4, 2).contiguous()
+        return F_TS, losses

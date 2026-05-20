@@ -5,3 +5,4 @@ from .losses import *
 from .samplers import *
 from .Prototype_Query_Decoder_nuScenes import *
 from .Prototype_Query_Decoder_KITTI import *
+from .maestro_occformer_head import *
