@@ -33,10 +33,12 @@ projects/configs/MAESTRO/MAESTRO_2task_lss_occformer_51m2.py
   - Input is now the LSS voxel feature, not DBE output.
   - The config sets `in_channels=80`, matching `LSSViewTransformer_depthGT.out_channels`.
   - The forward path follows `F_s -> S_v -> B_k -> P_k`, uses hard class masks by default, and exposes `P_fg`, `P_bg`, and `G_occ`.
+  - The auxiliary CPG supervision follows MAESTRO's `Dice + Lovasz` mask-classification loss.
 - TSFG: `projects/mmdet3d_plugin/models/model_utils/maestro_tsfg.py`
   - Map branch collapses height into BEV.
   - Occupancy branch keeps the 3D feature.
   - The implementation now uses MAESTRO-style dot-product `F_wise`, prototype-gated `F_aware`, and suppression `F_TS = F_tilde * S_t_supp`.
+  - The suppression score supervision follows MAESTRO's focal loss.
 - SPA: `projects/mmdet3d_plugin/models/model_utils/maestro_spa.py`
   - Kept one-way map-to-occ because this is a two-task reproduction.
   - The code explicitly documents this as a 2-task adaptation of MAESTRO SPA: map prototypes are pooled from `map_feature` and `map_logits`, then aggregated into `P_bg`.
@@ -73,9 +75,11 @@ projects/configs/MAESTRO/MAESTRO_2task_lss_occformer_51m2.py
   - Added centered XY crop support for OCC features, CPG auxiliary logits, and OCC suppression logits.
 - `projects/mmdet3d_plugin/models/model_utils/maestro_cpg.py`
   - Fixed the CPG voxel layout bug and aligned variable names/comments with the MAESTRO notation.
+  - Replaced the previous CE auxiliary loss with unweighted Dice + Lovasz losses.
 - `projects/mmdet3d_plugin/models/model_utils/maestro_tsfg.py`
   - Replaced the previous cosine/softmax context with MAESTRO's dot-product prototype-wise activation and suppression-gated task feature.
   - Added optional target-logit cropping so the 51.2m shared canvas can supervise OCC only on the annotated `200 x 200` Occ3D crop.
+  - Replaced weighted BCE suppression supervision with unweighted focal loss.
 - `projects/mmdet3d_plugin/models/model_utils/maestro_spa.py`
   - Replaced the zero-initialized learned fusion scale and similarity fallback with explicit semantic prototype aggregation rules.
 - `projects/mmdet3d_plugin/models/dense_heads/maestro_bev_seg_head.py`
@@ -119,7 +123,14 @@ CPU smoke for the train-time MAESTRO path passed on a reduced grid:
 
 ```text
 smoke-ok (1, 96, 16, 16, 8) (1, 96, 16, 16) (1, 6, 16, 16)
-['d0.loss_occformer_cls', 'd0.loss_occformer_dice', 'd0.loss_occformer_mask', 'loss_maestro_cpg_ce', 'loss_maestro_map_supp', 'loss_maestro_occ_supp', 'loss_map_focal', 'loss_occformer_cls', 'loss_occformer_dice', 'loss_occformer_mask']
+['d0.loss_occformer_cls', 'd0.loss_occformer_dice', 'd0.loss_occformer_mask', 'loss_maestro_cpg_dice', 'loss_maestro_cpg_lovasz', 'loss_maestro_map_supp', 'loss_maestro_occ_supp', 'loss_map_focal', 'loss_occformer_cls', 'loss_occformer_dice', 'loss_occformer_mask']
+```
+
+Auxiliary-loss smoke passed after the MAESTRO loss alignment:
+
+```text
+cpg_keys ['loss_maestro_cpg_dice', 'loss_maestro_cpg_lovasz']
+tsfg_keys ['loss_maestro_occ_supp']
 ```
 
 This environment reports no CUDA runtime, so I verified the model/dataset build and CPU train-graph path instead of launching full GPU training here.

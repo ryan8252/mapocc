@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from mmcv.runner import BaseModule
 
 from mmdet3d.models import BACKBONES
+from ..losses.lovasz_softmax import lovasz_softmax
 
 
 @BACKBONES.register_module()
@@ -26,7 +27,9 @@ class MAESTROClasswisePrototypeGenerator(BaseModule):
                  background_classes=(11, 12, 13, 14, 15, 16),
                  use_hard_masks=True,
                  ignore_index=255,
-                 loss_weight=0.0,
+                 loss_enabled=True,
+                 dice_eps=1.0,
+                 lovasz_classes='present',
                  init_cfg=None):
         super(MAESTROClasswisePrototypeGenerator, self).__init__(init_cfg)
         hidden_channels = hidden_channels or in_channels
@@ -34,7 +37,9 @@ class MAESTROClasswisePrototypeGenerator(BaseModule):
         self.num_classes = num_classes
         self.use_hard_masks = use_hard_masks
         self.ignore_index = ignore_index
-        self.loss_weight = loss_weight
+        self.loss_enabled = loss_enabled
+        self.dice_eps = dice_eps
+        self.lovasz_classes = lovasz_classes
 
         self.mask_classifier = nn.Sequential(
             nn.Conv3d(in_channels, hidden_channels, kernel_size=1, bias=False),
@@ -117,8 +122,37 @@ class MAESTROClasswisePrototypeGenerator(BaseModule):
             G_occ=G_occ,
         )
 
+    def _dice_loss(self, probs, target):
+        valid = target != self.ignore_index
+        if not valid.any():
+            return probs.sum() * 0.0
+
+        target_for_one_hot = target.clone()
+        target_for_one_hot[~valid] = 0
+        target_one_hot = F.one_hot(
+            target_for_one_hot.clamp(min=0, max=self.num_classes - 1),
+            num_classes=self.num_classes,
+        )
+        target_one_hot = target_one_hot.permute(0, 4, 1, 2, 3).to(probs.dtype)
+
+        valid = valid.unsqueeze(1)
+        probs = probs * valid
+        target_one_hot = target_one_hot * valid
+
+        reduce_dims = tuple(range(2, probs.dim()))
+        intersection = (probs * target_one_hot).sum(dim=reduce_dims)
+        cardinality = probs.sum(dim=reduce_dims) + target_one_hot.sum(
+            dim=reduce_dims)
+        dice = (2.0 * intersection + self.dice_eps) / (
+            cardinality + self.dice_eps)
+
+        present_classes = target_one_hot.sum(dim=reduce_dims) > 0
+        if not present_classes.any():
+            return probs.sum() * 0.0
+        return (1.0 - dice)[present_classes].mean()
+
     def loss(self, logits, voxel_semantics, valid_mask=None):
-        if self.loss_weight <= 0 or voxel_semantics is None:
+        if not self.loss_enabled or voxel_semantics is None:
             return {}
 
         target = voxel_semantics.long()
@@ -126,5 +160,12 @@ class MAESTROClasswisePrototypeGenerator(BaseModule):
             target = target.clone()
             target[~valid_mask.bool()] = self.ignore_index
 
-        loss = F.cross_entropy(logits, target, ignore_index=self.ignore_index)
-        return {'loss_maestro_cpg_ce': loss * self.loss_weight}
+        # MAESTRO supervises CPG mask classification with Dice + Lovasz.
+        probs = F.softmax(logits.float(), dim=1)
+        loss_dice = self._dice_loss(probs, target)
+        loss_lovasz = lovasz_softmax(
+            probs, target, classes=self.lovasz_classes, ignore=self.ignore_index)
+        return {
+            'loss_maestro_cpg_dice': loss_dice,
+            'loss_maestro_cpg_lovasz': loss_lovasz,
+        }

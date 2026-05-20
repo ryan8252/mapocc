@@ -123,8 +123,7 @@ model = dict(
         foreground_classes=(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10),
         background_classes=(11, 12, 13, 14, 15, 16),
         use_hard_masks=True,
-        ignore_index=255,
-        loss_weight=0.2),
+        ignore_index=255),
     maestro_map_tsfg=dict(
         type='MAESTROTaskSpecificFeatureGenerator',
         in_channels=numC_Trans,
@@ -135,7 +134,6 @@ model = dict(
         voxel_z=grid_size[2],
         hidden_channels=maestro_channels * 2,
         with_cp=True,
-        loss_supp_weight=0.05,
         loss_name='loss_maestro_map_supp'),
     maestro_occ_tsfg=dict(
         type='MAESTROTaskSpecificFeatureGenerator',
@@ -147,7 +145,6 @@ model = dict(
         voxel_z=grid_size[2],
         hidden_channels=maestro_channels * 2,
         with_cp=True,
-        loss_supp_weight=0.05,
         loss_name='loss_maestro_occ_supp'),
     maestro_spa=dict(
         type='MAESTROOnewayScenePrototypeAggregator',
@@ -414,7 +411,7 @@ data = dict(
 for key in ['train', 'val', 'test']:
     data[key].update(share_data_config)
 
-optimizer = dict(type='AdamW', lr=2e-4, weight_decay=1e-2)
+optimizer = dict(type='AdamW', lr=1e-4, weight_decay=1e-2)
 optimizer_config = dict(grad_clip=dict(max_norm=5, norm_type=2))
 lr_config = dict(
     policy='step',

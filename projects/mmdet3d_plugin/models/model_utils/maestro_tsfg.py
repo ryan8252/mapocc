@@ -34,8 +34,11 @@ class MAESTROTaskSpecificFeatureGenerator(BaseModule):
                  hidden_channels=None,
                  norm_cfg=dict(type='BN'),
                  with_cp=False,
-                 loss_supp_weight=0.0,
+                 loss_enabled=True,
                  loss_name='loss_maestro_supp',
+                 focal_gamma=2.0,
+                 focal_alpha=-1.0,
+                 loss_reduction='mean',
                  init_cfg=None):
         super(MAESTROTaskSpecificFeatureGenerator, self).__init__(init_cfg)
         out_channels = out_channels or in_channels
@@ -48,8 +51,11 @@ class MAESTROTaskSpecificFeatureGenerator(BaseModule):
         self.task = task
         self.voxel_z = voxel_z
         self.with_cp = with_cp
-        self.loss_supp_weight = loss_supp_weight
+        self.loss_enabled = loss_enabled
         self.loss_name = loss_name
+        self.focal_gamma = focal_gamma
+        self.focal_alpha = focal_alpha
+        self.loss_reduction = loss_reduction
         self.is_bev_task = task in ('bev', 'map')
 
         if self.is_bev_task:
@@ -188,12 +194,32 @@ class MAESTROTaskSpecificFeatureGenerator(BaseModule):
         return target
 
     def _suppression_loss(self, score_logits, target_mask):
-        if self.loss_supp_weight <= 0 or target_mask is None:
+        if not self.loss_enabled or target_mask is None:
             return {}
 
         target = self._resize_target(target_mask, score_logits)
-        loss = F.binary_cross_entropy_with_logits(score_logits, target)
-        return {self.loss_name: loss * self.loss_supp_weight}
+        # MAESTRO uses Focal loss to supervise task suppression score maps.
+        score_logits = score_logits.float()
+        target = target.float()
+        prob = torch.sigmoid(score_logits)
+        ce_loss = F.binary_cross_entropy_with_logits(
+            score_logits, target, reduction='none')
+        p_t = prob * target + (1.0 - prob) * (1.0 - target)
+        loss = ce_loss * ((1.0 - p_t) ** self.focal_gamma)
+
+        if self.focal_alpha >= 0:
+            alpha_t = (
+                self.focal_alpha * target
+                + (1.0 - self.focal_alpha) * (1.0 - target))
+            loss = alpha_t * loss
+
+        if self.loss_reduction == 'mean':
+            loss = loss.mean()
+        elif self.loss_reduction == 'sum':
+            loss = loss.sum()
+        elif self.loss_reduction != 'none':
+            raise ValueError(f'Unsupported reduction: {self.loss_reduction}')
+        return {self.loss_name: loss}
 
     def _crop_score_logits(self, score_logits, target_crop_slices=None):
         if target_crop_slices is None:
