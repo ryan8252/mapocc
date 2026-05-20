@@ -10,6 +10,12 @@ The active training config is:
 projects/configs/MAESTRO/MAESTRO_2task_lss_occformer.py
 ```
 
+The paper-range reproduction config is:
+
+```bash
+projects/configs/MAESTRO/MAESTRO_2task_lss_occformer_51m2.py
+```
+
 ## Forward Path
 
 1. Camera images go through the existing ResNet-50 image backbone, `CustomFPN`, `CM_DepthNet`, and `LSSViewTransformer_depthGT`.
@@ -58,10 +64,18 @@ projects/configs/MAESTRO/MAESTRO_2task_lss_occformer.py
   - Set CPG to hard class masks and set TSFG prototype counts to 6 for map and 17 for occupancy.
   - Moved from `projects/configs/ProtoOcc/` to `projects/configs/MAESTRO/` to avoid implying this path still uses ProtoOcc's core DBE/PQD modules.
   - Changed work dir to `work_dirs/MAESTRO_2task_lss_occformer`.
+- `projects/configs/MAESTRO/MAESTRO_2task_lss_occformer_51m2.py`
+  - Strict MAESTRO range protocol variant.
+  - Shared LSS/CPG/TSFG/map canvas is `[-51.2m, 51.2m]` at `0.4m`, producing `256 x 256`.
+  - Occupancy supervision and OccFormer decoding stay on the Occ3D `[-40m, 40m]` region, so the detector center-crops `256 -> 200` before OCC losses and prediction.
+- `projects/mmdet3d_plugin/models/detectors/MAESTRO2Task.py`
+  - Added separate `occ_pc_range` and `occ_grid_size`.
+  - Added centered XY crop support for OCC features, CPG auxiliary logits, and OCC suppression logits.
 - `projects/mmdet3d_plugin/models/model_utils/maestro_cpg.py`
   - Fixed the CPG voxel layout bug and aligned variable names/comments with the MAESTRO notation.
 - `projects/mmdet3d_plugin/models/model_utils/maestro_tsfg.py`
   - Replaced the previous cosine/softmax context with MAESTRO's dot-product prototype-wise activation and suppression-gated task feature.
+  - Added optional target-logit cropping so the 51.2m shared canvas can supervise OCC only on the annotated `200 x 200` Occ3D crop.
 - `projects/mmdet3d_plugin/models/model_utils/maestro_spa.py`
   - Replaced the zero-initialized learned fusion scale and similarity fallback with explicit semantic prototype aggregation rules.
 - `projects/mmdet3d_plugin/models/dense_heads/maestro_bev_seg_head.py`
@@ -83,7 +97,8 @@ python -m py_compile \
   projects/mmdet3d_plugin/models/detectors/MAESTRO2Task.py \
   projects/mmdet3d_plugin/models/OccHead/maestro_occformer_head.py \
   projects/mmdet3d_plugin/models/dense_heads/maestro_bev_seg_head.py \
-  projects/configs/MAESTRO/MAESTRO_2task_lss_occformer.py
+  projects/configs/MAESTRO/MAESTRO_2task_lss_occformer.py \
+  projects/configs/MAESTRO/MAESTRO_2task_lss_occformer_51m2.py
 ```
 
 Model registry/build passed:
@@ -126,3 +141,17 @@ conda run -n mapocc bash tools/dist_train.sh \
   --cfg-options model.occ_head.transformer_decoder.num_layers=6 \
   model.occ_head.train_cfg.num_points=25088
 ```
+
+Paper-range 51.2m variant:
+
+```bash
+conda run -n mapocc bash tools/dist_train.sh \
+  projects/configs/MAESTRO/MAESTRO_2task_lss_occformer_51m2.py 1
+```
+
+The 51.2m variant keeps `bda_aug_conf.rot_lim=(0, 0)` and
+`scale_lim=(1, 1)`. With flip-only BDA, center-cropping the symmetric
+`256 x 256` shared feature to `200 x 200` remains aligned with
+`LoadOccGTFromFile`'s flipped Occ3D GT. Do not enable non-zero BDA rotation or
+scale in this config without replacing the simple center crop with a matching
+GT/feature warp.

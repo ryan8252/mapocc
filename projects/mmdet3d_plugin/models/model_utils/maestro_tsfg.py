@@ -195,7 +195,20 @@ class MAESTROTaskSpecificFeatureGenerator(BaseModule):
         loss = F.binary_cross_entropy_with_logits(score_logits, target)
         return {self.loss_name: loss * self.loss_supp_weight}
 
-    def forward(self, voxel_feature, prototypes, target_mask=None):
+    def _crop_score_logits(self, score_logits, target_crop_slices=None):
+        if target_crop_slices is None:
+            return score_logits
+
+        x_slice, y_slice = target_crop_slices
+        if self.is_bev_task:
+            return score_logits[:, :, x_slice, y_slice]
+        return score_logits[:, :, :, x_slice, y_slice]
+
+    def forward(self,
+                voxel_feature,
+                prototypes,
+                target_mask=None,
+                target_crop_slices=None):
         # Shared Voxel Feature (F_s) -> transformed task feature (F_t).
         F_s = voxel_feature
         G_t = prototypes
@@ -218,7 +231,9 @@ class MAESTROTaskSpecificFeatureGenerator(BaseModule):
 
         # Task-Specific Feature: F_TS = F_tilde * S_t_supp.
         F_TS = F_tilde * S_t_supp
-        losses = self._suppression_loss(S_t_supp_logits, target_mask)
+        loss_logits = self._crop_score_logits(
+            S_t_supp_logits, target_crop_slices)
+        losses = self._suppression_loss(loss_logits, target_mask)
 
         if self.is_bev_task:
             return F_TS, losses

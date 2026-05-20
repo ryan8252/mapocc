@@ -21,6 +21,8 @@ class MAESTRO2Task(BEVDet):
     def __init__(self,
                  pc_range=[-40.0, -40.0, -1, 40.0, 40.0, 5.4],
                  grid_size=[200, 200, 16],
+                 occ_pc_range=None,
+                 occ_grid_size=None,
                  depth_net=None,
                  maestro_cpg=None,
                  maestro_map_tsfg=None,
@@ -35,6 +37,9 @@ class MAESTRO2Task(BEVDet):
         self.pts_bbox_head = None
         self.pc_range = pc_range
         self.grid_size = grid_size
+        self.occ_pc_range = occ_pc_range or pc_range
+        self.occ_grid_size = occ_grid_size or grid_size
+        self._validate_occ_crop_config()
         self.depth_net = build_head(depth_net)
         self.maestro_cpg = builder.build_backbone(maestro_cpg)
         self.maestro_map_tsfg = builder.build_backbone(maestro_map_tsfg)
@@ -93,6 +98,62 @@ class MAESTRO2Task(BEVDet):
             f'dim2 or dim4 to equal grid Z={expected_z}, got '
             f'{tuple(voxel_feat.shape)}.')
 
+    def _xy_voxel_size(self, pc_range, grid_size):
+        return (
+            (float(pc_range[3]) - float(pc_range[0])) / int(grid_size[0]),
+            (float(pc_range[4]) - float(pc_range[1])) / int(grid_size[1]),
+        )
+
+    def _xy_center(self, pc_range):
+        return (
+            (float(pc_range[0]) + float(pc_range[3])) * 0.5,
+            (float(pc_range[1]) + float(pc_range[4])) * 0.5,
+        )
+
+    def _validate_occ_crop_config(self):
+        shared_x, shared_y = int(self.grid_size[0]), int(self.grid_size[1])
+        occ_x, occ_y = int(self.occ_grid_size[0]), int(self.occ_grid_size[1])
+        if shared_x < occ_x or shared_y < occ_y:
+            raise ValueError(
+                f'occ_grid_size {self.occ_grid_size} cannot exceed shared '
+                f'grid_size {self.grid_size}.')
+        if (shared_x - occ_x) % 2 != 0 or (shared_y - occ_y) % 2 != 0:
+            raise ValueError(
+                'MAESTRO2Task only supports centered OCC crops with even '
+                f'spatial margins, got shared={self.grid_size}, '
+                f'occ={self.occ_grid_size}.')
+
+        shared_voxel = self._xy_voxel_size(self.pc_range, self.grid_size)
+        occ_voxel = self._xy_voxel_size(self.occ_pc_range, self.occ_grid_size)
+        if any(abs(a - b) > 1e-6 for a, b in zip(shared_voxel, occ_voxel)):
+            raise ValueError(
+                'Shared and OCC ranges must use the same XY voxel size for a '
+                f'clean center crop, got shared={shared_voxel}, '
+                f'occ={occ_voxel}.')
+        if any(abs(a - b) > 1e-6 for a, b in zip(
+                self._xy_center(self.pc_range),
+                self._xy_center(self.occ_pc_range))):
+            raise ValueError(
+                'Shared and OCC ranges must share the same XY center for '
+                f'center crop alignment, got shared={self.pc_range}, '
+                f'occ={self.occ_pc_range}.')
+
+    def _get_occ_crop_slices(self):
+        shared_x, shared_y = int(self.grid_size[0]), int(self.grid_size[1])
+        occ_x, occ_y = int(self.occ_grid_size[0]), int(self.occ_grid_size[1])
+        if shared_x == occ_x and shared_y == occ_y:
+            return None
+
+        x0 = (shared_x - occ_x) // 2
+        y0 = (shared_y - occ_y) // 2
+        return slice(x0, x0 + occ_x), slice(y0, y0 + occ_y)
+
+    def _crop_voxel_xy_to_occ(self, voxel_tensor, crop_slices):
+        if crop_slices is None or voxel_tensor is None:
+            return voxel_tensor
+        x_slice, y_slice = crop_slices
+        return voxel_tensor[:, :, x_slice, y_slice, :]
+
     def _normalize_map_targets(self, gt_masks_bev):
         if gt_masks_bev is None:
             return None
@@ -148,8 +209,8 @@ class MAESTRO2Task(BEVDet):
     def _make_occ_img_metas(self, batch_size):
         return [
             {
-                'pc_range': self.pc_range,
-                'occ_size': self.grid_size,
+                'pc_range': self.occ_pc_range,
+                'occ_size': self.occ_grid_size,
             } for _ in range(batch_size)
         ]
 
@@ -160,6 +221,7 @@ class MAESTRO2Task(BEVDet):
                               gt_masks_bev=None):
         # Class-wise Prototype Generator (CPG): run once on F_s.
         cpg_output = self.maestro_cpg(Shared_Voxel_Feature)
+        occ_crop_slices = self._get_occ_crop_slices()
 
         # Map TSFG receives the background prototype group P_bg.
         map_target = self._make_map_relevance_target(gt_masks_bev)
@@ -185,7 +247,12 @@ class MAESTRO2Task(BEVDet):
             Shared_Voxel_Feature,
             occ_prototypes,
             target_mask=occ_target,
+            target_crop_slices=occ_crop_slices,
         )
+        occ_feature = self._crop_voxel_xy_to_occ(
+            occ_feature, occ_crop_slices)
+        cpg_logits = self._crop_voxel_xy_to_occ(
+            cpg_output['logits'], occ_crop_slices)
 
         aux_losses = {}
         aux_losses.update(map_aux_losses)
@@ -193,7 +260,7 @@ class MAESTRO2Task(BEVDet):
         # CPG loss reuses S_v from cpg_output; it does not run CPG again.
         aux_losses.update(
             self.maestro_cpg.loss(
-                cpg_output['logits'],
+                cpg_logits,
                 voxel_semantics,
                 valid_mask=mask_camera,
             ))
