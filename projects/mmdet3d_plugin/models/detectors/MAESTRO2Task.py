@@ -90,7 +90,7 @@ class MAESTRO2Task(BEVDet):
 
         expected_z = int(self.grid_size[2])
         if voxel_feat.shape[2] == expected_z:
-            return voxel_feat.permute(0, 1, 3, 4, 2).contiguous()
+            return voxel_feat.permute(0, 1, 4, 3, 2).contiguous()
         if voxel_feat.shape[-1] == expected_z:
             return voxel_feat.contiguous()
         raise ValueError(
