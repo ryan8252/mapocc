@@ -44,16 +44,20 @@ class Dual_Branch_Encoder(nn.Module):
         bev_encoder_backbone=None,
         bev_encoder_neck=None,
         map_bev_encoder_neck=None,
+        height_task_gate=None,
+        map_topology_encoder=None,
         down_sample_for_3d_pooling=None,
         return_bev_feature=False,
         return_map_feature=False,
         detach_map_feature=False,
+        use_height_task_gate_for_legacy=True,
     ):
         super().__init__()
         self.with_cp = with_cp
         self.return_bev_feature = return_bev_feature
         self.return_map_feature = return_map_feature
         self.detach_map_feature = detach_map_feature
+        self.use_height_task_gate_for_legacy = use_height_task_gate_for_legacy
         if self.return_map_feature and not self.return_bev_feature:
             raise ValueError('return_map_feature=True requires return_bev_feature=True.')
         if self.return_map_feature and map_bev_encoder_neck is None:
@@ -67,6 +71,12 @@ class Dual_Branch_Encoder(nn.Module):
                     padding=0,
                     stride=1)
         self.bev_encoder_backbone = builder.build_backbone(bev_encoder_backbone)
+        self.height_task_gate = (
+            builder.build_backbone(height_task_gate)
+            if height_task_gate is not None else None)
+        self.map_topology_encoder = (
+            builder.build_backbone(map_topology_encoder)
+            if map_topology_encoder is not None else None)
 
         # Voxel encoder
         self.vox_branch_first = self._make_vox_branch_first(vox_feat1, vox_feat2, vox_kernel_size)
@@ -153,10 +163,18 @@ class Dual_Branch_Encoder(nn.Module):
         else:
             return layer(x)
 
+    def _split_task_inputs(self, x):
+        if self.height_task_gate is None:
+            return x, x
+        return self.height_task_gate(x)
+
     def forward(self, x):
+        x_occ, x_map = self._split_task_inputs(x)
+        legacy_x = x_occ if self.use_height_task_gate_for_legacy else x
+
         # Voxel Branch
         # checkpoint is crucial for reducing GPU memory usage during training, but require longer training time.
-        vox_res = self.apply_checkpoint(self.vox_branch_first, x)
+        vox_res = self.apply_checkpoint(self.vox_branch_first, legacy_x)
         vox1 = self.apply_checkpoint(self.vox_branch1, vox_res)
         vox2 = self.apply_checkpoint(self.vox_branch2, vox1)
         vox3 = self.apply_checkpoint(self.vox_branch3, vox2)
@@ -164,14 +182,18 @@ class Dual_Branch_Encoder(nn.Module):
         vox3 = self.apply_checkpoint(self.vox_branch4, vox3)
         
         # BEV Branch
-        pooled_x = torch.cat(x.unbind(dim=2), 1)
+        pooled_x = torch.cat(legacy_x.unbind(dim=2), 1)
         pooled_x = self.down_sample_for_3d_pooling(pooled_x)
         multi_scale_bev = self.bev_encoder_backbone(pooled_x)
 
         map_bev_feature = None
         if self.map_bev_encoder_neck is not None:
-            map_source = multi_scale_bev
-            if self.detach_map_feature:
+            if self.map_topology_encoder is not None:
+                map_input = x_map.detach() if self.detach_map_feature else x_map
+                map_source = self.map_topology_encoder(map_input)
+            else:
+                map_source = multi_scale_bev
+            if self.detach_map_feature and self.map_topology_encoder is None:
                 map_source = [feat.detach() for feat in multi_scale_bev]
             map_bev = self.map_bev_encoder_neck(map_source)
             map_bev_feature = map_bev[0] if isinstance(map_bev, (list, tuple)) else map_bev
