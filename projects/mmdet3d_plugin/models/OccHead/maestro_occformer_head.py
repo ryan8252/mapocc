@@ -34,6 +34,8 @@ class MAESTROOccFormerHead(AnchorFreeHead):
                  positional_encoding=None,
                  pooling_attn_mask=True,
                  padding_mode='border',
+                 scene_prototype_channels=None,
+                 scene_query_init_mode='replace',
                  loss_cls=None,
                  loss_mask=None,
                  loss_dice=None,
@@ -53,6 +55,11 @@ class MAESTROOccFormerHead(AnchorFreeHead):
         self.pooling_attn_mask = pooling_attn_mask
         self.padding_mode = padding_mode
         self.align_corners = True
+        self.scene_query_init_mode = scene_query_init_mode
+        if self.scene_query_init_mode not in ('replace', 'add'):
+            raise ValueError(
+                'scene_query_init_mode must be either "replace" or "add", '
+                f'got {self.scene_query_init_mode}.')
 
         self.input_proj = ConvModule(
             in_channels,
@@ -101,6 +108,12 @@ class MAESTROOccFormerHead(AnchorFreeHead):
             positional_encoding)
         self.query_embed = nn.Embedding(num_queries, feat_channels)
         self.query_feat = nn.Embedding(num_queries, feat_channels)
+        scene_prototype_channels = scene_prototype_channels or feat_channels
+        if scene_prototype_channels == feat_channels:
+            self.scene_query_proj = nn.Identity()
+        else:
+            self.scene_query_proj = nn.Linear(
+                scene_prototype_channels, feat_channels)
         self.level_embed = nn.Embedding(num_transformer_feat_level,
                                         feat_channels)
 
@@ -425,13 +438,43 @@ class MAESTROOccFormerHead(AnchorFreeHead):
                       img_metas,
                       gt_occ,
                       mask_camera=None,
+                      scene_prototypes=None,
                       **kwargs):
-        all_cls_scores, all_mask_preds = self(voxel_feats, img_metas)
+        all_cls_scores, all_mask_preds = self(
+            voxel_feats, img_metas, scene_prototypes=scene_prototypes)
         gt_labels, gt_masks, gt_binary = self.preprocess_gt(gt_occ, img_metas)
         return self.loss(all_cls_scores, all_mask_preds, gt_labels, gt_masks,
                          gt_binary, mask_camera, img_metas)
 
-    def forward(self, voxel_feats, img_metas, **kwargs):
+    def _build_scene_queries(self, base_query_feat, scene_prototypes,
+                             batch_size):
+        if scene_prototypes is None:
+            return base_query_feat
+        if scene_prototypes.dim() != 3:
+            raise ValueError(
+                'Expected scene_prototypes with shape (B, K, C), got '
+                f'{tuple(scene_prototypes.shape)}.')
+        if scene_prototypes.size(0) != batch_size:
+            raise ValueError(
+                'scene_prototypes batch size does not match img_metas: '
+                f'{scene_prototypes.size(0)} vs {batch_size}.')
+
+        scene_queries = self.scene_query_proj(scene_prototypes)
+        num_scene_queries = min(scene_queries.size(1), self.num_queries)
+        if num_scene_queries == 0:
+            return base_query_feat
+
+        scene_queries = scene_queries[:, :num_scene_queries]
+        scene_queries = scene_queries.permute(1, 0, 2).contiguous()
+        query_feat = base_query_feat.clone()
+        if self.scene_query_init_mode == 'replace':
+            query_feat[:num_scene_queries] = scene_queries
+        else:
+            query_feat[:num_scene_queries] = (
+                query_feat[:num_scene_queries] + scene_queries)
+        return query_feat
+
+    def forward(self, voxel_feats, img_metas, scene_prototypes=None, **kwargs):
         batch_size = len(img_metas)
         if isinstance(voxel_feats, torch.Tensor):
             voxel_feats = self._build_pyramid(voxel_feats)
@@ -460,6 +503,8 @@ class MAESTROOccFormerHead(AnchorFreeHead):
             1, batch_size, 1)
         query_embed = self.query_embed.weight.unsqueeze(1).repeat(
             1, batch_size, 1)
+        query_feat = self._build_scene_queries(
+            query_feat, scene_prototypes, batch_size)
 
         cls_pred_list = []
         mask_pred_list = []
@@ -500,8 +545,13 @@ class MAESTROOccFormerHead(AnchorFreeHead):
         mask_pred = mask_pred_results.sigmoid()
         return torch.einsum('bqc,bqxyz->bcxyz', mask_cls, mask_pred)
 
-    def simple_test(self, voxel_feats, img_metas, **kwargs):
-        all_cls_scores, all_mask_preds = self(voxel_feats, img_metas)
+    def simple_test(self,
+                    voxel_feats,
+                    img_metas,
+                    scene_prototypes=None,
+                    **kwargs):
+        all_cls_scores, all_mask_preds = self(
+            voxel_feats, img_metas, scene_prototypes=scene_prototypes)
         output_voxels = self.format_results(all_cls_scores[-1],
                                             all_mask_preds[-1])
 

@@ -264,7 +264,7 @@ class MAESTRO2Task(BEVDet):
                 voxel_semantics,
                 valid_mask=mask_camera,
             ))
-        return occ_feature, map_feature, map_logits, aux_losses
+        return occ_feature, map_feature, map_logits, occ_prototypes, aux_losses
 
     def forward_train(self,
                       points=None,
@@ -289,7 +289,8 @@ class MAESTRO2Task(BEVDet):
         if gt_masks_bev is None:
             raise ValueError('Expected `gt_masks_bev` when training MAESTRO2Task.')
 
-        occ_feature, map_feature, map_logits, aux_losses = self._run_maestro_branches(
+        (occ_feature, map_feature, map_logits, occ_prototypes,
+         aux_losses) = self._run_maestro_branches(
             Shared_Voxel_Feature,
             voxel_semantics=voxel_semantics,
             mask_camera=mask_camera,
@@ -304,6 +305,7 @@ class MAESTRO2Task(BEVDet):
             img_metas_occ,
             voxel_semantics,
             mask_camera=mask_camera,
+            scene_prototypes=occ_prototypes,
         )
         losses.update(
             self.depth_net.get_PV_loss(
@@ -325,14 +327,16 @@ class MAESTRO2Task(BEVDet):
         Shared_Voxel_Feature = self._to_maestro_layout(voxel_feat)
         gt_masks_bev = self._normalize_map_targets(kwargs.get('gt_masks_bev'))
 
-        occ_feature, map_feature, map_logits, _ = self._run_maestro_branches(
+        (occ_feature, map_feature, map_logits, occ_prototypes,
+         _) = self._run_maestro_branches(
             Shared_Voxel_Feature,
             gt_masks_bev=gt_masks_bev,
         )
 
         batch_size = occ_feature.shape[0]
         img_metas_occ = self._make_occ_img_metas(batch_size)
-        occ_preds = self.occ_head.simple_test(occ_feature, img_metas_occ)
+        occ_preds = self.occ_head.simple_test(
+            occ_feature, img_metas_occ, scene_prototypes=occ_prototypes)
         map_probs = self.bev_seg_head.predict(map_logits).detach().cpu().numpy()
 
         if gt_masks_bev is not None:
