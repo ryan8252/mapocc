@@ -26,6 +26,69 @@ class voxelize_module(nn.Module):
         return x
 
 
+class MapHFMFusionLayer(nn.Module):
+    """Fuse one BEV pyramid level with one early voxel-branch feature."""
+
+    def __init__(self, bev_channels, voxel_channels, hidden_channels=None):
+        super().__init__()
+        self.bev_channels = bev_channels
+        self.voxel_channels = voxel_channels
+        hidden_channels = hidden_channels or bev_channels
+        self.fusion = nn.Sequential(
+            nn.Conv2d(
+                bev_channels + voxel_channels * 2,
+                hidden_channels,
+                kernel_size=3,
+                padding=1,
+                bias=False),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(
+                hidden_channels,
+                bev_channels,
+                kernel_size=1,
+                padding=0,
+                bias=True),
+        )
+        nn.init.zeros_(self.fusion[-1].weight)
+        if self.fusion[-1].bias is not None:
+            nn.init.zeros_(self.fusion[-1].bias)
+
+    def _collapse_voxel_bev(self, voxel_feature):
+        if voxel_feature.dim() != 5:
+            raise ValueError(
+                'MapHFMFusionLayer expects voxel feature in '
+                f'(B, C, Z, H, W), got shape {tuple(voxel_feature.shape)}.')
+        if voxel_feature.shape[1] != self.voxel_channels:
+            raise ValueError(
+                f'MapHFMFusionLayer expected {self.voxel_channels} voxel '
+                f'channels, got {voxel_feature.shape[1]}.')
+        return torch.cat([
+            voxel_feature.mean(dim=2),
+            voxel_feature.max(dim=2).values,
+        ], dim=1)
+
+    def forward(self, bev_feature, voxel_feature):
+        if bev_feature.dim() != 4:
+            raise ValueError(
+                'MapHFMFusionLayer expects BEV feature in (B, C, H, W), '
+                f'got shape {tuple(bev_feature.shape)}.')
+        if bev_feature.shape[1] != self.bev_channels:
+            raise ValueError(
+                f'MapHFMFusionLayer expected {self.bev_channels} BEV '
+                f'channels, got {bev_feature.shape[1]}.')
+
+        voxel_bev = self._collapse_voxel_bev(voxel_feature)
+        if voxel_bev.shape[-2:] != bev_feature.shape[-2:]:
+            voxel_bev = F.interpolate(
+                voxel_bev,
+                size=bev_feature.shape[-2:],
+                mode='bilinear',
+                align_corners=True)
+        delta = self.fusion(torch.cat([bev_feature, voxel_bev], dim=1))
+        return bev_feature + delta
+
+
 @BACKBONES.register_module()
 class Dual_Branch_Encoder(nn.Module):
     def __init__(
@@ -48,16 +111,28 @@ class Dual_Branch_Encoder(nn.Module):
         return_bev_feature=False,
         return_map_feature=False,
         detach_map_feature=False,
+        use_map_hfm=False,
+        map_hfm_lower_source='vox3',
+        map_hfm_with_cp=None,
     ):
         super().__init__()
         self.with_cp = with_cp
         self.return_bev_feature = return_bev_feature
         self.return_map_feature = return_map_feature
         self.detach_map_feature = detach_map_feature
+        self.use_map_hfm = use_map_hfm
+        if map_hfm_lower_source not in ('vox2', 'vox3'):
+            raise ValueError(
+                "map_hfm_lower_source must be one of 'vox2' or 'vox3', "
+                f'got {map_hfm_lower_source!r}.')
+        self.map_hfm_lower_source = map_hfm_lower_source
+        self.map_hfm_with_cp = with_cp if map_hfm_with_cp is None else map_hfm_with_cp
         if self.return_map_feature and not self.return_bev_feature:
             raise ValueError('return_map_feature=True requires return_bev_feature=True.')
         if self.return_map_feature and map_bev_encoder_neck is None:
             raise ValueError('return_map_feature=True requires map_bev_encoder_neck.')
+        if self.use_map_hfm and map_bev_encoder_neck is None:
+            raise ValueError('use_map_hfm=True requires map_bev_encoder_neck.')
         
         # BEV encoder
         self.down_sample_for_3d_pooling = \
@@ -95,6 +170,15 @@ class Dual_Branch_Encoder(nn.Module):
             builder.build_neck(map_bev_encoder_neck)
             if map_bev_encoder_neck is not None else None
         )
+        if self.use_map_hfm:
+            lower_vox_channels = vox_feat3
+            self.map_hfm_layers = nn.ModuleList([
+                MapHFMFusionLayer(bev_feat_ch1, vox_feat2),
+                MapHFMFusionLayer(bev_feat_ch2, vox_feat2),
+                MapHFMFusionLayer(bev_feat_ch3, lower_vox_channels),
+            ])
+        else:
+            self.map_hfm_layers = None
         self.voxelize_module = voxelize_module(
             in_dim = voxel_out_channels,
             )
@@ -153,6 +237,34 @@ class Dual_Branch_Encoder(nn.Module):
         else:
             return layer(x)
 
+    def _apply_checkpoint_multi(self, layer, *inputs):
+        use_checkpoint = (
+            self.training and
+            self.map_hfm_with_cp and
+            any(torch.is_tensor(t) and t.requires_grad for t in inputs)
+        )
+        if use_checkpoint:
+            return cp.checkpoint(layer, *inputs)
+        return layer(*inputs)
+
+    def _build_map_hfm_features(self, multi_scale_bev, vox_res, vox1, vox2, vox3):
+        if len(multi_scale_bev) < 3:
+            raise ValueError(
+                'Map-HFM expects at least 3 BEV pyramid levels, got '
+                f'{len(multi_scale_bev)}.')
+        lower_vox = vox3 if self.map_hfm_lower_source == 'vox3' else vox2
+        bev_sources = multi_scale_bev
+        voxel_sources = [vox_res, vox1, lower_vox]
+        if self.detach_map_feature:
+            bev_sources = [feat.detach() for feat in bev_sources]
+            voxel_sources = [feat.detach() for feat in voxel_sources]
+        map_hfm_features = []
+        for layer, bev_feature, voxel_feature in zip(
+                self.map_hfm_layers, bev_sources, voxel_sources):
+            map_hfm_features.append(
+                self._apply_checkpoint_multi(layer, bev_feature, voxel_feature))
+        return map_hfm_features
+
     def forward(self, x):
         # Voxel Branch
         # checkpoint is crucial for reducing GPU memory usage during training, but require longer training time.
@@ -170,9 +282,13 @@ class Dual_Branch_Encoder(nn.Module):
 
         map_bev_feature = None
         if self.map_bev_encoder_neck is not None:
-            map_source = multi_scale_bev
-            if self.detach_map_feature:
+            if self.use_map_hfm:
+                map_source = self._build_map_hfm_features(
+                    multi_scale_bev, vox_res, vox1, vox2, vox3)
+            elif self.detach_map_feature:
                 map_source = [feat.detach() for feat in multi_scale_bev]
+            else:
+                map_source = multi_scale_bev
             map_bev = self.map_bev_encoder_neck(map_source)
             map_bev_feature = map_bev[0] if isinstance(map_bev, (list, tuple)) else map_bev
 
