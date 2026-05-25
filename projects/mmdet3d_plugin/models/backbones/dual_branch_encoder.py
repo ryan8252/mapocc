@@ -27,6 +27,68 @@ class voxelize_module(nn.Module):
 
 
 @BACKBONES.register_module()
+class PerScaleMapResidualAdapter(nn.Module):
+    """Zero-init per-scale residual adapter for the map BEV branch."""
+
+    def __init__(self,
+                 in_channels=[160, 320, 640],
+                 residual_scale=1.0,
+                 with_cp=False,
+                 detach_input=False):
+        super().__init__()
+        self.in_channels = list(in_channels)
+        self.residual_scale = residual_scale
+        self.with_cp = with_cp
+        self.detach_input = detach_input
+        self.blocks = nn.ModuleList([
+            self._make_block(channels) for channels in self.in_channels
+        ])
+
+    def _make_block(self, channels):
+        block = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=1),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(),
+            nn.Conv2d(
+                channels,
+                channels,
+                kernel_size=3,
+                padding=1,
+                groups=channels),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(),
+            nn.Conv2d(channels, channels, kernel_size=1),
+        )
+        nn.init.constant_(block[-1].weight, 0)
+        if block[-1].bias is not None:
+            nn.init.constant_(block[-1].bias, 0)
+        return block
+
+    def _forward_block(self, block, feat):
+        if self.with_cp and self.training and feat.requires_grad:
+            return cp.checkpoint(block, feat)
+        return block(feat)
+
+    def forward(self, feats):
+        if not isinstance(feats, (list, tuple)):
+            raise TypeError('PerScaleMapResidualAdapter expects a list/tuple of BEV features.')
+        if len(feats) != len(self.blocks):
+            raise ValueError(
+                f'Expected {len(self.blocks)} BEV feature scales, got {len(feats)}.')
+
+        outputs = []
+        for feat, block, channels in zip(feats, self.blocks, self.in_channels):
+            if feat.shape[1] != channels:
+                raise ValueError(
+                    f'Expected {channels} channels, got {feat.shape[1]}.')
+            source = feat.detach() if self.detach_input else feat
+            residual = self._forward_block(block, source)
+            outputs.append(source + self.residual_scale * residual)
+
+        return tuple(outputs) if isinstance(feats, tuple) else outputs
+
+
+@BACKBONES.register_module()
 class Dual_Branch_Encoder(nn.Module):
     def __init__(
         self,
@@ -44,6 +106,7 @@ class Dual_Branch_Encoder(nn.Module):
         bev_encoder_backbone=None,
         bev_encoder_neck=None,
         map_bev_encoder_neck=None,
+        map_residual_adapter=None,
         down_sample_for_3d_pooling=None,
         return_bev_feature=False,
         return_map_feature=False,
@@ -94,6 +157,10 @@ class Dual_Branch_Encoder(nn.Module):
         self.map_bev_encoder_neck = (
             builder.build_neck(map_bev_encoder_neck)
             if map_bev_encoder_neck is not None else None
+        )
+        self.map_residual_adapter = (
+            builder.build_backbone(map_residual_adapter)
+            if map_residual_adapter is not None else None
         )
         self.voxelize_module = voxelize_module(
             in_dim = voxel_out_channels,
@@ -172,7 +239,9 @@ class Dual_Branch_Encoder(nn.Module):
         if self.map_bev_encoder_neck is not None:
             map_source = multi_scale_bev
             if self.detach_map_feature:
-                map_source = [feat.detach() for feat in multi_scale_bev]
+                map_source = [feat.detach() for feat in map_source]
+            if self.map_residual_adapter is not None:
+                map_source = self.map_residual_adapter(map_source)
             map_bev = self.map_bev_encoder_neck(map_source)
             map_bev_feature = map_bev[0] if isinstance(map_bev, (list, tuple)) else map_bev
 
