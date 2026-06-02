@@ -28,6 +28,7 @@ class BEVSegHead(BaseModule):
                  with_cp=False,
                  loss_bce=None,
                  loss_dice=None,
+                 loss_focal=None,
                  map_loss_balance_mode='none',
                  map_class_weights=None,
                  overlay_class_indices=None,
@@ -85,6 +86,7 @@ class BEVSegHead(BaseModule):
 
         self.loss_bce = build_loss(loss_bce) if loss_bce is not None else None
         self.loss_dice = build_loss(loss_dice) if loss_dice is not None else None
+        self.loss_focal = build_loss(loss_focal) if loss_focal is not None else None
 
     def _normalize_balance_mode(self, mode):
         if mode is None:
@@ -218,6 +220,9 @@ class BEVSegHead(BaseModule):
 
         if self.loss_bce is not None:
             losses['loss_map_bce'] = self.loss_bce(seg_logits, gt_masks_bev)
+
+        if self.loss_focal is not None:
+            losses['loss_map_focal'] = self.loss_focal(seg_logits, gt_masks_bev)
 
         if self.loss_dice is not None:
             losses['loss_map_dice'] = self.loss_dice(

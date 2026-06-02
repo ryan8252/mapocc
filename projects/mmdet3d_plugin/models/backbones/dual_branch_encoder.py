@@ -88,6 +88,91 @@ class PerScaleMapResidualAdapter(nn.Module):
         return tuple(outputs) if isinstance(feats, tuple) else outputs
 
 
+class MapPreBackboneAdapter(nn.Module):
+    """Zero-init residual adapter on the 200x200 BEV feature before backbone."""
+
+    def __init__(self,
+                 channels=160,
+                 adapter_type='res_bottleneck',
+                 hidden_channels=64,
+                 residual_scale=1.0,
+                 detach_input=False,
+                 with_cp=False):
+        super().__init__()
+        valid_adapter_types = ('res_bottleneck', 'convnext')
+        if adapter_type not in valid_adapter_types:
+            raise ValueError(
+                'MapPreBackboneAdapter supports adapter_type in '
+                f'{valid_adapter_types}, got {adapter_type!r}.')
+        self.channels = channels
+        self.adapter_type = adapter_type
+        self.residual_scale = residual_scale
+        self.detach_input = detach_input
+        self.with_cp = with_cp
+
+        if adapter_type == 'res_bottleneck':
+            self.block = self._make_res_bottleneck(channels, hidden_channels)
+        else:
+            self.block = self._make_convnext_block(channels)
+
+    def _make_res_bottleneck(self, channels, hidden_channels):
+        block = nn.Sequential(
+            nn.Conv2d(channels, hidden_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(
+                hidden_channels,
+                hidden_channels,
+                kernel_size=3,
+                padding=1,
+                bias=False),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_channels, channels, kernel_size=1),
+        )
+        nn.init.zeros_(block[-1].weight)
+        if block[-1].bias is not None:
+            nn.init.zeros_(block[-1].bias)
+        return block
+
+    def _make_convnext_block(self, channels):
+        block = nn.Sequential(
+            nn.Conv2d(
+                channels,
+                channels,
+                kernel_size=7,
+                padding=3,
+                groups=channels,
+                bias=False),
+            nn.BatchNorm2d(channels),
+            nn.Conv2d(channels, channels * 4, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(channels * 4, channels, kernel_size=1),
+        )
+        nn.init.zeros_(block[-1].weight)
+        if block[-1].bias is not None:
+            nn.init.zeros_(block[-1].bias)
+        return block
+
+    def _forward_block(self, x):
+        if self.with_cp and self.training and x.requires_grad:
+            return cp.checkpoint(self.block, x)
+        return self.block(x)
+
+    def forward(self, x):
+        if x.dim() != 4:
+            raise ValueError(
+                'MapPreBackboneAdapter expects input shape [B, C, H, W], '
+                f'got {tuple(x.shape)}.')
+        if x.shape[1] != self.channels:
+            raise ValueError(
+                f'MapPreBackboneAdapter expected {self.channels} channels, '
+                f'got {x.shape[1]}.')
+        source = x.detach() if self.detach_input else x
+        residual = self._forward_block(source)
+        return source + self.residual_scale * residual
+
+
 class MapHFMFusionLayer(nn.Module):
     """Fuse one BEV pyramid level with one early voxel-branch feature.
 
@@ -158,6 +243,140 @@ class MapHFMFusionLayer(nn.Module):
 
 
 @BACKBONES.register_module()
+class MapZResidualLayer(nn.Module):
+    """Zero-init map residual from the full-resolution LSS voxel feature.
+
+    This preserves the shared BEV/map-neck path and adds only an optional
+    map-specific correction before BEVSegHead.
+    """
+
+    def __init__(self,
+                 in_channels=80,
+                 z_channels=16,
+                 out_channels=128,
+                 hidden_channels=128,
+                 z_projection='cat_z',
+                 num_height_patterns=4,
+                 residual_scale=1.0,
+                 detach_input=True,
+                 with_cp=True,
+                 zero_init_z_logits=True):
+        super().__init__()
+        if z_projection == 'weighted_pool':
+            z_projection = 'learned_pool'
+        valid_z_projection = ('cat_z', 'learned_pool')
+        if z_projection not in valid_z_projection:
+            raise ValueError(
+                'MapZResidualLayer supports z_projection in '
+                f'{valid_z_projection}, got {z_projection!r}.')
+        if z_projection == 'learned_pool' and num_height_patterns < 1:
+            raise ValueError('num_height_patterns must be >= 1.')
+
+        self.in_channels = in_channels
+        self.z_channels = z_channels
+        self.out_channels = out_channels
+        self.z_projection = z_projection
+        self.num_height_patterns = num_height_patterns
+        self.residual_scale = residual_scale
+        self.detach_input = detach_input
+        self.with_cp = with_cp
+
+        self.refine3d = nn.Sequential(
+            nn.Conv3d(
+                in_channels,
+                in_channels,
+                kernel_size=3,
+                padding=1,
+                groups=in_channels,
+                bias=False),
+            nn.BatchNorm3d(in_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(in_channels, in_channels, kernel_size=1, bias=False),
+            nn.BatchNorm3d(in_channels),
+            nn.ReLU(inplace=True),
+        )
+        if z_projection == 'learned_pool':
+            self.height_logits = nn.Conv3d(
+                in_channels, num_height_patterns, kernel_size=1)
+            project_in_channels = in_channels * num_height_patterns
+            if zero_init_z_logits:
+                nn.init.zeros_(self.height_logits.weight)
+                if self.height_logits.bias is not None:
+                    nn.init.zeros_(self.height_logits.bias)
+        else:
+            self.height_logits = None
+            project_in_channels = in_channels * z_channels
+
+        self.project2d = nn.Sequential(
+            nn.Conv2d(
+                project_in_channels,
+                hidden_channels,
+                kernel_size=1,
+                bias=False),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(
+                hidden_channels,
+                hidden_channels,
+                kernel_size=3,
+                padding=1,
+                groups=hidden_channels,
+                bias=False),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_channels, out_channels, kernel_size=1),
+        )
+        nn.init.zeros_(self.project2d[-1].weight)
+        if self.project2d[-1].bias is not None:
+            nn.init.zeros_(self.project2d[-1].bias)
+
+    def _forward_refine3d(self, x):
+        if self.with_cp and self.training and x.requires_grad:
+            return cp.checkpoint(self.refine3d, x)
+        return self.refine3d(x)
+
+    def _forward_project2d(self, x):
+        if self.with_cp and self.training and x.requires_grad:
+            return cp.checkpoint(self.project2d, x)
+        return self.project2d(x)
+
+    def _z_project(self, x):
+        if self.z_projection == 'cat_z':
+            return torch.cat(x.unbind(dim=2), dim=1)
+
+        z_weight = torch.softmax(self.height_logits(x), dim=2)
+        pooled = []
+        for k in range(self.num_height_patterns):
+            weight = z_weight[:, k:k + 1]
+            pooled.append(torch.sum(x * weight, dim=2))
+        return torch.cat(pooled, dim=1)
+
+    def forward(self, x, output_size=None):
+        if x.dim() != 5:
+            raise ValueError(
+                'MapZResidualLayer expects input shape [B, C, Z, H, W], '
+                f'got {tuple(x.shape)}.')
+        if x.shape[1] != self.in_channels:
+            raise ValueError(
+                f'MapZResidualLayer expected {self.in_channels} channels, '
+                f'got {x.shape[1]}.')
+        if x.shape[2] != self.z_channels:
+            raise ValueError(
+                f'MapZResidualLayer expected Z={self.z_channels}, '
+                f'got Z={x.shape[2]}.')
+
+        source = x.detach() if self.detach_input else x
+        refined = source + self._forward_refine3d(source)
+        bev = self._z_project(refined)
+        residual = self._forward_project2d(bev)
+        if output_size is not None and residual.shape[-2:] != output_size:
+            residual = F.interpolate(
+                residual, size=output_size, mode='bilinear',
+                align_corners=True)
+        return self.residual_scale * residual
+
+
+@BACKBONES.register_module()
 class Dual_Branch_Encoder(nn.Module):
     def __init__(
         self,
@@ -183,6 +402,23 @@ class Dual_Branch_Encoder(nn.Module):
         use_map_hfm=False,
         map_hfm_lower_source='vox3',
         map_hfm_with_cp=None,
+        map_highres_skip=False,
+        map_highres_hidden=128,
+        map_highres_detach=True,
+        map_highres_fusion='add',
+        use_map_z_aware_compression=False,
+        map_z_compression_type='conv3d',
+        map_height_attention_groups=4,
+        map_z_compression_detach=False,
+        map_z_compression_with_cp=None,
+        map_z_residual=None,
+        use_map_pre_backbone_adapter=False,
+        map_pre_backbone_adapter_type='res_bottleneck',
+        map_pre_backbone_adapter_hidden=64,
+        map_pre_backbone_adapter_detach=False,
+        map_pre_backbone_adapter_with_cp=None,
+        use_map_adapter=None,
+        map_adapter_type=None,
     ):
         super().__init__()
         self.with_cp = with_cp
@@ -196,6 +432,37 @@ class Dual_Branch_Encoder(nn.Module):
                 f'got {map_hfm_lower_source!r}.')
         self.map_hfm_lower_source = map_hfm_lower_source
         self.map_hfm_with_cp = with_cp if map_hfm_with_cp is None else map_hfm_with_cp
+        self.map_highres_skip = map_highres_skip
+        self.map_highres_detach = map_highres_detach
+        valid_highres_fusions = ('add', 'concat', 'gated')
+        if map_highres_fusion not in valid_highres_fusions:
+            raise ValueError(
+                'map_highres_fusion must be one of '
+                f'{valid_highres_fusions}, got {map_highres_fusion!r}.')
+        self.map_highres_fusion = map_highres_fusion
+        valid_z_compression_types = ('conv3d', 'height_attention')
+        if map_z_compression_type not in valid_z_compression_types:
+            raise ValueError(
+                'map_z_compression_type must be one of '
+                f'{valid_z_compression_types}, got {map_z_compression_type!r}.')
+        if map_height_attention_groups < 1:
+            raise ValueError('map_height_attention_groups must be >= 1.')
+        self.use_map_z_aware_compression = use_map_z_aware_compression
+        self.map_z_compression_type = map_z_compression_type
+        self.map_height_attention_groups = map_height_attention_groups
+        self.map_z_compression_detach = map_z_compression_detach
+        self.map_z_compression_with_cp = (
+            with_cp if map_z_compression_with_cp is None
+            else map_z_compression_with_cp)
+        if use_map_adapter is not None:
+            use_map_pre_backbone_adapter = use_map_adapter
+        if map_adapter_type is not None:
+            map_pre_backbone_adapter_type = map_adapter_type
+        self.use_map_pre_backbone_adapter = use_map_pre_backbone_adapter
+        self.map_pre_backbone_adapter_type = map_pre_backbone_adapter_type
+        self.map_pre_backbone_adapter_with_cp = (
+            with_cp if map_pre_backbone_adapter_with_cp is None
+            else map_pre_backbone_adapter_with_cp)
         if self.return_map_feature and not self.return_bev_feature:
             raise ValueError('return_map_feature=True requires return_bev_feature=True.')
         if self.return_map_feature and map_bev_encoder_neck is None:
@@ -210,6 +477,37 @@ class Dual_Branch_Encoder(nn.Module):
                     kernel_size=1,
                     padding=0,
                     stride=1)
+        map_x0_channels = down_sample_for_3d_pooling[1]
+        if self.use_map_z_aware_compression:
+            if self.map_z_compression_type == 'conv3d':
+                self.map_z_refine_3d = self._make_map_z_refine3d(vox_feat1)
+                self.map_height_attn = None
+                self.map_height_project = None
+            else:
+                self.map_z_refine_3d = None
+                self.map_height_attn = nn.Conv3d(
+                    vox_feat1, map_height_attention_groups, kernel_size=1)
+                self.map_height_project = nn.Conv2d(
+                    vox_feat1 * map_height_attention_groups,
+                    map_x0_channels,
+                    kernel_size=1)
+                nn.init.zeros_(self.map_height_attn.weight)
+                if self.map_height_attn.bias is not None:
+                    nn.init.zeros_(self.map_height_attn.bias)
+        else:
+            self.map_z_refine_3d = None
+            self.map_height_attn = None
+            self.map_height_project = None
+        self.map_pre_backbone_adapter = (
+            MapPreBackboneAdapter(
+                channels=map_x0_channels,
+                adapter_type=map_pre_backbone_adapter_type,
+                hidden_channels=map_pre_backbone_adapter_hidden,
+                residual_scale=1.0,
+                detach_input=map_pre_backbone_adapter_detach,
+                with_cp=self.map_pre_backbone_adapter_with_cp)
+            if self.use_map_pre_backbone_adapter else None
+        )
         self.bev_encoder_backbone = builder.build_backbone(bev_encoder_backbone)
 
         # Voxel encoder
@@ -243,6 +541,10 @@ class Dual_Branch_Encoder(nn.Module):
             builder.build_backbone(map_residual_adapter)
             if map_residual_adapter is not None else None
         )
+        self.map_z_residual = (
+            builder.build_backbone(map_z_residual)
+            if map_z_residual is not None else None
+        )
         if self.use_map_hfm:
             lower_vox_channels = vox_feat3
             self.map_hfm_layers = nn.ModuleList([
@@ -252,6 +554,48 @@ class Dual_Branch_Encoder(nn.Module):
             ])
         else:
             self.map_hfm_layers = None
+        if self.map_highres_skip:
+            if self.map_bev_encoder_neck is None:
+                raise ValueError('map_highres_skip=True requires map_bev_encoder_neck.')
+            highres_in = down_sample_for_3d_pooling[1]
+            highres_out = getattr(self.map_bev_encoder_neck, 'out_channels', None)
+            if highres_out is None:
+                raise ValueError(
+                    'map_highres_skip requires the map neck to expose out_channels.')
+            # Shallow stride-1 stack on the full-resolution pre-backbone BEV
+            # feature (pooled_x, 200x200). Gives the map head real high-res
+            # spatial detail instead of bilinearly upsampled 100x100 content.
+            # Final conv zero-init -> step-0 equals the baseline map feature.
+            self.map_highres_block = nn.Sequential(
+                nn.Conv2d(highres_in, map_highres_hidden, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(map_highres_hidden),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(map_highres_hidden, map_highres_hidden, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(map_highres_hidden),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(map_highres_hidden, highres_out, kernel_size=1),
+            )
+            nn.init.zeros_(self.map_highres_block[-1].weight)
+            if self.map_highres_block[-1].bias is not None:
+                nn.init.zeros_(self.map_highres_block[-1].bias)
+            if self.map_highres_fusion == 'gated':
+                self.map_highres_gate = nn.Conv2d(
+                    highres_out * 2, highres_out, kernel_size=1)
+                self.map_highres_concat = None
+            elif self.map_highres_fusion == 'concat':
+                self.map_highres_gate = None
+                self.map_highres_concat = nn.Conv2d(
+                    highres_out * 2, highres_out, kernel_size=1)
+                nn.init.zeros_(self.map_highres_concat.weight)
+                if self.map_highres_concat.bias is not None:
+                    nn.init.zeros_(self.map_highres_concat.bias)
+            else:
+                self.map_highres_gate = None
+                self.map_highres_concat = None
+        else:
+            self.map_highres_block = None
+            self.map_highres_gate = None
+            self.map_highres_concat = None
         self.voxelize_module = voxelize_module(
             in_dim = voxel_out_channels,
             )
@@ -303,6 +647,48 @@ class Dual_Branch_Encoder(nn.Module):
             nn.ReLU(),
         )
 
+    def _make_map_z_refine3d(self, channels):
+        block = nn.Sequential(
+            nn.Conv3d(
+                channels,
+                channels,
+                kernel_size=3,
+                padding=1,
+                groups=channels,
+                bias=False),
+            nn.BatchNorm3d(channels),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(channels, channels, kernel_size=1, bias=False),
+            nn.BatchNorm3d(channels),
+        )
+        nn.init.zeros_(block[-1].weight)
+        nn.init.zeros_(block[-1].bias)
+        return block
+
+    def _flatten_z_as_channels(self, x):
+        return torch.cat(x.unbind(dim=2), dim=1)
+
+    def _forward_map_z_refine3d(self, x):
+        if (self.map_z_compression_with_cp and self.training
+                and x.requires_grad):
+            return cp.checkpoint(self.map_z_refine_3d, x)
+        return self.map_z_refine_3d(x)
+
+    def _build_map_z_aware_x0(self, x):
+        source = x.detach() if self.map_z_compression_detach else x
+        if self.map_z_compression_type == 'conv3d':
+            refined = source + self._forward_map_z_refine3d(source)
+            return self.down_sample_for_3d_pooling(
+                self._flatten_z_as_channels(refined))
+
+        height_logits = self.map_height_attn(source)
+        height_weight = torch.softmax(height_logits, dim=2)
+        pooled = []
+        for k in range(self.map_height_attention_groups):
+            pooled.append(torch.sum(
+                source * height_weight[:, k:k + 1], dim=2))
+        return self.map_height_project(torch.cat(pooled, dim=1))
+
 
     def apply_checkpoint(self, layer, x):
         if self.with_cp and self.training:
@@ -349,9 +735,23 @@ class Dual_Branch_Encoder(nn.Module):
         vox3 = self.apply_checkpoint(self.vox_branch4, vox3)
         
         # BEV Branch
-        pooled_x = torch.cat(x.unbind(dim=2), 1)
+        pooled_x = self._flatten_z_as_channels(x)
         pooled_x = self.down_sample_for_3d_pooling(pooled_x)
+        use_map_specific_backbone = (
+            self.map_bev_encoder_neck is not None and (
+                self.use_map_z_aware_compression
+                or self.map_pre_backbone_adapter is not None))
         multi_scale_bev = self.bev_encoder_backbone(pooled_x)
+        map_pooled_x = pooled_x
+        map_multi_scale_bev = multi_scale_bev
+        if self.map_bev_encoder_neck is not None:
+            if self.use_map_z_aware_compression:
+                map_pooled_x = self._build_map_z_aware_x0(x)
+            if self.map_pre_backbone_adapter is not None:
+                map_pooled_x = self.map_pre_backbone_adapter(map_pooled_x)
+            map_multi_scale_bev = (
+                self.bev_encoder_backbone(map_pooled_x)
+                if use_map_specific_backbone else multi_scale_bev)
 
         map_bev_feature = None
         if self.map_bev_encoder_neck is not None:
@@ -359,16 +759,46 @@ class Dual_Branch_Encoder(nn.Module):
                 # Inject voxel-branch geometry into the map BEV path. Detach of
                 # the shared sources (if enabled) is handled inside the builder.
                 map_source = self._build_map_hfm_features(
-                    multi_scale_bev, vox_res, vox1, vox2, vox3)
+                    map_multi_scale_bev, vox_res, vox1, vox2, vox3)
             elif self.detach_map_feature:
-                map_source = [feat.detach() for feat in multi_scale_bev]
+                map_source = [feat.detach() for feat in map_multi_scale_bev]
             else:
-                map_source = multi_scale_bev
+                map_source = map_multi_scale_bev
             if self.map_residual_adapter is not None:
                 # 2D zero-init refinement, applied after the geometry injection.
                 map_source = self.map_residual_adapter(map_source)
             map_bev = self.map_bev_encoder_neck(map_source)
             map_bev_feature = map_bev[0] if isinstance(map_bev, (list, tuple)) else map_bev
+            if self.map_highres_skip:
+                # Real full-resolution (200x200) detail from the pre-backbone
+                # BEV. Source detached by default so map gradients don't reshape
+                # the occ-shared pooling; the block itself stays trainable.
+                highres_source = (
+                    map_pooled_x.detach()
+                    if self.map_highres_detach else map_pooled_x)
+                if (self.with_cp and self.training
+                        and highres_source.requires_grad):
+                    highres = cp.checkpoint(self.map_highres_block, highres_source)
+                else:
+                    highres = self.map_highres_block(highres_source)
+                if highres.shape[-2:] != map_bev_feature.shape[-2:]:
+                    highres = F.interpolate(
+                        highres, size=map_bev_feature.shape[-2:],
+                        mode='bilinear', align_corners=True)
+                if self.map_highres_fusion == 'gated':
+                    gate = torch.sigmoid(self.map_highres_gate(torch.cat(
+                        [map_bev_feature, highres], dim=1)))
+                    map_bev_feature = map_bev_feature + gate * highres
+                elif self.map_highres_fusion == 'concat':
+                    delta = self.map_highres_concat(torch.cat(
+                        [map_bev_feature, highres], dim=1))
+                    map_bev_feature = map_bev_feature + delta
+                else:
+                    map_bev_feature = map_bev_feature + highres
+            if self.map_z_residual is not None:
+                z_residual = self.map_z_residual(
+                    x, output_size=map_bev_feature.shape[-2:])
+                map_bev_feature = map_bev_feature + z_residual
 
         # Hierarchical Fusion Module
         B, C, Z, H, W = vox3.shape

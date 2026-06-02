@@ -1,6 +1,7 @@
 # Copyright (c) Phigent Robotics. All rights reserved.
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from .bevdet import BEVDet
 from mmdet3d.models import DETECTORS
@@ -18,6 +19,9 @@ class ProtoOccMapOnly(BEVDet):
                  bev_seg_head=None,
                  map_loss_weight=1.0,
                  train_depth=True,
+                 shared_feature_range=None,
+                 map_feature_range=None,
+                 map_feature_size=None,
                  **kwargs):
         super(ProtoOccMapOnly, self).__init__(**kwargs)
         self.pts_bbox_head = None
@@ -27,6 +31,22 @@ class ProtoOccMapOnly(BEVDet):
         self.bev_seg_head = build_head(bev_seg_head)
         self.map_loss_weight = map_loss_weight
         self.train_depth = train_depth
+        # Optional BEVFusion-aligned map grid: resample the map feature from the
+        # shared feature range (e.g. +-51.2m) onto the map eval grid
+        # (e.g. +-50m / 0.5m). Defaults keep the legacy single-grid behaviour.
+        self.shared_feature_range = (
+            torch.tensor(shared_feature_range, dtype=torch.float32)
+            if shared_feature_range is not None else None)
+        self.map_feature_range = (
+            None if map_feature_range is None
+            else torch.tensor(map_feature_range, dtype=torch.float32))
+        self.map_feature_size = (
+            None if map_feature_size is None
+            else tuple(int(v) for v in map_feature_size))
+        if self.map_feature_range is not None and self.shared_feature_range is None:
+            raise ValueError(
+                'map_feature_range requires shared_feature_range to resample '
+                'the map feature onto the map eval grid.')
 
     def image_encoder(self, img, stereo=False):
         imgs = img
@@ -91,6 +111,67 @@ class ProtoOccMapOnly(BEVDet):
                 f'map feature size {map_feature.shape[-2:]} does not match '
                 f'gt_masks_bev size {gt_masks_bev.shape[-2:]}.')
 
+    def _bev_xy_range(self, value, device, dtype):
+        value = value.to(device=device, dtype=dtype)
+        if value.numel() == 6:
+            return value[[0, 1, 3, 4]]
+        if value.numel() == 4:
+            return value
+        raise ValueError(
+            'Expected a BEV range with 4 values or an XYZ range with 6 values, '
+            f'but got {value.numel()} values.')
+
+    def _make_bev_grid(self, feature, source_range, target_range, target_size):
+        target_x, target_y = target_size
+        device = feature.device
+        dtype = feature.dtype
+        source = self._bev_xy_range(source_range, device, dtype)
+        target = self._bev_xy_range(target_range, device, dtype)
+
+        xs = (
+            torch.arange(target_x, device=device, dtype=dtype) + 0.5
+        ) * ((target[2] - target[0]) / target_x) + target[0]
+        ys = (
+            torch.arange(target_y, device=device, dtype=dtype) + 0.5
+        ) * ((target[3] - target[1]) / target_y) + target[1]
+
+        x_norm = 2.0 * (xs - source[0]) / (source[2] - source[0]) - 1.0
+        y_norm = 2.0 * (ys - source[1]) / (source[3] - source[1]) - 1.0
+        try:
+            grid_x, grid_y = torch.meshgrid(x_norm, y_norm, indexing='ij')
+        except TypeError:
+            grid_x, grid_y = torch.meshgrid(x_norm, y_norm)
+        # grid_sample treats dim 0 as image-y/H and dim 1 as image-x/W.
+        # This project stores BEV tensors as [x_cells, y_cells], so swap.
+        grid = torch.stack((grid_y, grid_x), dim=-1)
+        return grid.unsqueeze(0).expand(feature.shape[0], -1, -1, -1)
+
+    def _align_map_feature(self, map_feature):
+        if self.map_feature_range is None or self.map_feature_size is None:
+            return map_feature
+        if tuple(map_feature.shape[-2:]) == self.map_feature_size:
+            source = self._bev_xy_range(
+                self.shared_feature_range,
+                map_feature.device,
+                map_feature.dtype)
+            target = self._bev_xy_range(
+                self.map_feature_range,
+                map_feature.device,
+                map_feature.dtype)
+            if torch.allclose(source, target):
+                return map_feature
+        grid = self._make_bev_grid(
+            map_feature,
+            self.shared_feature_range,
+            self.map_feature_range,
+            self.map_feature_size)
+        return F.grid_sample(
+            map_feature,
+            grid,
+            mode='bilinear',
+            padding_mode='zeros',
+            align_corners=False)
+
     def forward_train(self,
                       points=None,
                       img_metas=None,
@@ -102,6 +183,7 @@ class ProtoOccMapOnly(BEVDet):
         voxel_feat, depth, pv_feat = self.extract_feat(
             img_inputs=img_inputs, img_metas=img_metas, **kwargs)
         map_feature = self.map_bev_encoder(voxel_feat)
+        map_feature = self._align_map_feature(map_feature)
 
         losses = {}
         if self.train_depth:
@@ -126,6 +208,7 @@ class ProtoOccMapOnly(BEVDet):
         voxel_feat, _, _ = self.extract_feat(
             img_inputs=img, img_metas=img_metas, **kwargs)
         map_feature = self.map_bev_encoder(voxel_feat)
+        map_feature = self._align_map_feature(map_feature)
         map_probs = self.bev_seg_head.predict(
             self.bev_seg_head(map_feature)).detach().cpu().numpy()
 

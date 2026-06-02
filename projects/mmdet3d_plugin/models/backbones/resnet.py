@@ -7,6 +7,11 @@ from mmdet3d.models import BACKBONES
 from typing import Optional, Union, Sequence
 import torch
 
+
+def _checkpoint_non_reentrant(function, *args):
+    return checkpoint.checkpoint(function, *args, use_reentrant=False)
+
+
 @BACKBONES.register_module()
 class CustomResNet(nn.Module):
     def __init__(
@@ -59,7 +64,7 @@ class CustomResNet(nn.Module):
         x_tmp = x
         for lid, layer in enumerate(self.layers):
             if self.with_cp:
-                x_tmp = checkpoint.checkpoint(layer, x_tmp)
+                x_tmp = _checkpoint_non_reentrant(layer, x_tmp)
             else:
                 x_tmp = layer(x_tmp)
             if lid in self.backbone_output_ids:
@@ -149,7 +154,7 @@ class CustomBEVBackbone(nn.Module):
         x_tmp = x
         for lid, layer in enumerate(self.layers):
             if self.with_cp:
-                x_tmp = checkpoint.checkpoint(layer, x_tmp)
+                x_tmp = _checkpoint_non_reentrant(layer, x_tmp)
             else:
                 x_tmp = layer(x_tmp)
             if lid in self.backbone_output_ids:
@@ -245,7 +250,7 @@ class CustomResNet3D(nn.Module):
         x_tmp = x
         for lid, layer in enumerate(self.layers):
             if self.with_cp:
-                x_tmp = checkpoint.checkpoint(layer, x_tmp)
+                x_tmp = _checkpoint_non_reentrant(layer, x_tmp)
             else:
                 x_tmp = layer(x_tmp)
             if lid in self.backbone_output_ids:

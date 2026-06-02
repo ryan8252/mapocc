@@ -5,4 +5,5 @@ from .efficientnet import CustomEfficientNet
 from .task_modules import MapTopologyEncoder
 
 __all__ = ['ResNet', 'CustomResNet', 'Dual_Branch_Encoder', 'MapOnly_BEV_Encoder',
-           'MapOnly_MTE_Encoder', 'CustomBEVBackbone', 'MapTopologyEncoder']
+           'MapOnly_MTE_Encoder', 'MapZResidualLayer', 'CustomBEVBackbone',
+           'MapTopologyEncoder']

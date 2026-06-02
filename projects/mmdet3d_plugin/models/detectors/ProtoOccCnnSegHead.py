@@ -5,6 +5,7 @@ from .bevdet import BEVDet
 from mmdet3d.models import DETECTORS
 from mmdet3d.models.builder import build_head
 import torch
+import torch.nn.functional as F
 from mmdet3d.models import builder
 
  
@@ -19,6 +20,10 @@ class ProtoOccCnnSegHead(BEVDet):
                  prototype_query_decoder=None,
                  bev_seg_head=None,
                  voxel_aware_map_ingest=None,
+                 shared_feature_range=None,
+                 occ_feature_range=None,
+                 map_feature_range=None,
+                 map_feature_size=None,
                  map_loss_weight=1.0,
                  **kwargs):
         super(ProtoOccCnnSegHead, self).__init__(**kwargs)
@@ -35,6 +40,18 @@ class ProtoOccCnnSegHead(BEVDet):
         self.voxel_aware_map_ingest = (
             build_head(voxel_aware_map_ingest)
             if voxel_aware_map_ingest is not None else None)
+        self.shared_feature_range = torch.tensor(
+            shared_feature_range if shared_feature_range is not None else pc_range,
+            dtype=torch.float32)
+        self.occ_feature_range = torch.tensor(
+            occ_feature_range if occ_feature_range is not None else pc_range,
+            dtype=torch.float32)
+        self.map_feature_range = (
+            None if map_feature_range is None
+            else torch.tensor(map_feature_range, dtype=torch.float32))
+        self.map_feature_size = (
+            None if map_feature_size is None
+            else tuple(int(v) for v in map_feature_size))
         self.map_loss_weight = map_loss_weight
 
     def _needs_pqd_query_info(self):
@@ -121,6 +138,115 @@ class ProtoOccCnnSegHead(BEVDet):
                 'map_bev_feature from Dual_Branch_Encoder.')
         return map_feature
 
+    def _range_to_xyz(self, value):
+        if value.numel() == 6:
+            return value
+        if value.numel() == 4:
+            return torch.tensor(
+                [value[0], value[1], 0.0, value[2], value[3], 1.0],
+                dtype=value.dtype,
+                device=value.device)
+        raise ValueError(
+            'Expected a range with 4 BEV values or 6 XYZ values, '
+            f'but got {value.numel()} values.')
+
+    def _feature_slices(self, feature_shape, source_range, target_range):
+        source_range = self._range_to_xyz(source_range)
+        target_range = self._range_to_xyz(target_range)
+        slices = []
+        for axis, size in enumerate(feature_shape):
+            source_min = float(source_range[axis])
+            source_max = float(source_range[axis + 3])
+            target_min = float(target_range[axis])
+            target_max = float(target_range[axis + 3])
+            if abs(source_min - target_min) < 1e-6 and abs(source_max - target_max) < 1e-6:
+                slices.append(slice(None))
+                continue
+            step = (source_max - source_min) / float(size)
+            start = int(round((target_min - source_min) / step))
+            end = int(round((target_max - source_min) / step))
+            if start < 0 or end > size or start >= end:
+                raise ValueError(
+                    'Target feature range must be inside source range. '
+                    f'axis={axis}, source=({source_min}, {source_max}), '
+                    f'target=({target_min}, {target_max}), size={size}.')
+            slices.append(slice(start, end))
+        return slices
+
+    def _crop_occ_feature(self, voxel_feature):
+        source_range = self.shared_feature_range.to(voxel_feature.device)
+        target_range = self.occ_feature_range.to(voxel_feature.device)
+        slices = self._feature_slices(
+            voxel_feature.shape[2:5], source_range, target_range)
+        return voxel_feature[
+            :,
+            :,
+            slices[0],
+            slices[1],
+            slices[2],
+        ]
+
+    def _bev_xy_range(self, value, device, dtype):
+        value = value.to(device=device, dtype=dtype)
+        if value.numel() == 6:
+            return value[[0, 1, 3, 4]]
+        if value.numel() == 4:
+            return value
+        raise ValueError(
+            'Expected a BEV range with 4 values or an XYZ range with 6 values, '
+            f'but got {value.numel()} values.')
+
+    def _make_bev_grid(self, feature, source_range, target_range, target_size):
+        target_x, target_y = target_size
+        device = feature.device
+        dtype = feature.dtype
+        source = self._bev_xy_range(source_range, device, dtype)
+        target = self._bev_xy_range(target_range, device, dtype)
+
+        xs = (
+            torch.arange(target_x, device=device, dtype=dtype) + 0.5
+        ) * ((target[2] - target[0]) / target_x) + target[0]
+        ys = (
+            torch.arange(target_y, device=device, dtype=dtype) + 0.5
+        ) * ((target[3] - target[1]) / target_y) + target[1]
+
+        x_norm = 2.0 * (xs - source[0]) / (source[2] - source[0]) - 1.0
+        y_norm = 2.0 * (ys - source[1]) / (source[3] - source[1]) - 1.0
+        try:
+            grid_x, grid_y = torch.meshgrid(x_norm, y_norm, indexing='ij')
+        except TypeError:
+            grid_x, grid_y = torch.meshgrid(x_norm, y_norm)
+        # grid_sample treats dim 0 as image-y/H and dim 1 as image-x/W.
+        # This project stores BEV tensors as [x_cells, y_cells], so swap.
+        grid = torch.stack((grid_y, grid_x), dim=-1)
+        return grid.unsqueeze(0).expand(feature.shape[0], -1, -1, -1)
+
+    def _align_map_feature(self, map_feature):
+        if self.map_feature_range is None or self.map_feature_size is None:
+            return map_feature
+        if tuple(map_feature.shape[-2:]) == self.map_feature_size:
+            source = self._bev_xy_range(
+                self.shared_feature_range,
+                map_feature.device,
+                map_feature.dtype)
+            target = self._bev_xy_range(
+                self.map_feature_range,
+                map_feature.device,
+                map_feature.dtype)
+            if torch.allclose(source, target):
+                return map_feature
+        grid = self._make_bev_grid(
+            map_feature,
+            self.shared_feature_range,
+            self.map_feature_range,
+            self.map_feature_size)
+        return F.grid_sample(
+            map_feature,
+            grid,
+            mode='bilinear',
+            padding_mode='zeros',
+            align_corners=False)
+
     def _check_map_feature_size(self, map_feature, gt_masks_bev):
         if gt_masks_bev is None:
             return
@@ -180,17 +306,18 @@ class ProtoOccCnnSegHead(BEVDet):
         encoder_output = self.dual_branch_encoder(voxel_feat)
         comprehensive_voxel_feature, bev_feature, map_bev_feature = \
             self._split_encoder_output(encoder_output)
+        occ_voxel_feature = self._crop_occ_feature(comprehensive_voxel_feature)
 
         # 3d CNN for generating Prototype
-        prototoype_occ_pred, mask_feat = self.cnn3d_decoder(comprehensive_voxel_feature.permute(0,1,4,2,3))
+        prototoype_occ_pred, mask_feat = self.cnn3d_decoder(occ_voxel_feature.permute(0,1,4,2,3))
             
         # Prototype Query Decoder (PQD)
-        B = comprehensive_voxel_feature.shape[0]
+        B = occ_voxel_feature.shape[0]
         img_metas = [{"pc_range": self.pc_range, "occ_size":self.grid_size} for i in range(B)]
         return_query_info = (
             self.bev_seg_head is not None and self._needs_pqd_query_info())
         pqd_outputs = self.prototype_query_decoder.forward_train(
-            comprehensive_voxel_feature,
+            occ_voxel_feature,
             img_metas,
             voxel_semantics,
             mask_camera,
@@ -214,8 +341,9 @@ class ProtoOccCnnSegHead(BEVDet):
             if gt_masks_bev is None:
                 raise ValueError('Expected `gt_masks_bev` when training ProtoOccCnnSegHead with a BEV segmentation head.')
             map_feature = self._select_map_feature(bev_feature, map_bev_feature)
+            map_feature = self._align_map_feature(map_feature)
             map_feature = self._apply_voxel_aware_map_ingest(
-                map_feature, comprehensive_voxel_feature, query_info)
+                map_feature, occ_voxel_feature, query_info)
             self._check_map_feature_size(map_feature, gt_masks_bev)
             bev_seg_logits = self.bev_seg_head(map_feature)
             map_losses = self.bev_seg_head.loss(bev_seg_logits, gt_masks_bev)
@@ -236,17 +364,18 @@ class ProtoOccCnnSegHead(BEVDet):
         encoder_output = self.dual_branch_encoder(voxel_feat)
         comprehensive_voxel_feature, bev_feature, map_bev_feature = \
             self._split_encoder_output(encoder_output)
+        occ_voxel_feature = self._crop_occ_feature(comprehensive_voxel_feature)
 
         # Prototype Query Generator
-        prototoype_occ_pred, mask_feat = self.cnn3d_decoder(comprehensive_voxel_feature.permute(0,1,4,2,3))
+        prototoype_occ_pred, mask_feat = self.cnn3d_decoder(occ_voxel_feature.permute(0,1,4,2,3))
 
         # Prototype Query Decoder (PQD)
-        B = comprehensive_voxel_feature.shape[0]
+        B = occ_voxel_feature.shape[0]
         img_metas_occ = [{"pc_range": self.pc_range, "occ_size":self.grid_size} for i in range(B)]
         return_query_info = (
             self.bev_seg_head is not None and self._needs_pqd_query_info())
         pqd_outputs = self.prototype_query_decoder.simple_test(
-            comprehensive_voxel_feature,
+            occ_voxel_feature,
             img_metas_occ,
             mask_feat,
             prototoype_occ_pred,
@@ -261,8 +390,9 @@ class ProtoOccCnnSegHead(BEVDet):
             return occ_preds
 
         map_feature = self._select_map_feature(bev_feature, map_bev_feature)
+        map_feature = self._align_map_feature(map_feature)
         map_feature = self._apply_voxel_aware_map_ingest(
-            map_feature, comprehensive_voxel_feature, query_info)
+            map_feature, occ_voxel_feature, query_info)
         bev_seg_probs = self.bev_seg_head.predict(self.bev_seg_head(map_feature)).detach().cpu().numpy()
         gt_masks_bev = self._normalize_map_targets(kwargs.get('gt_masks_bev'))
         if gt_masks_bev is not None:
