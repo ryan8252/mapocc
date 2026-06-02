@@ -2,6 +2,7 @@ from .ProtoOcc_longterm import *
 from .ProtoOcc import *
 from .ProtoOccMAESTRO2Task import *
 from .MAESTRO2Task import *
+from .MAESTROProtoOccHybrid2Task import *
 from .ProtoOcc_SemanticKITTI import *
 from .bevstereo4d import BEVStereo4D
 from .bevdepth4d import BEVDepth4D
@@ -15,4 +16,5 @@ __all__ = [
     'BEVDet4D',
     'ProtoOccMAESTRO2Task',
     'MAESTRO2Task',
+    'MAESTROProtoOccHybrid2Task',
 ]
