@@ -6,10 +6,10 @@
 # Submit from Nano4 login node:
 #   sbatch train_fpn_lateral_aspp_focal_dice_weighted_nano4.sh
 #
-# Default regime preserves the original global batch:
-#   8 GPUs * 2 samples/GPU = 16, lr = 2e-4.
-# Throughput-oriented H200 regime can be submitted as:
-#   sbatch --export=ALL,SAMPLES_PER_GPU=4,LR=4e-4 train_fpn_lateral_aspp_focal_dice_weighted_nano4.sh
+# Aggressive H200 regime:
+#   8 GPUs * 4 samples/GPU = 32, workers/GPU = 1, lr = 4e-4.
+# Nano4 H200 nodes have 2TB host memory; this launcher requests 1.5TB because
+# ProtoOcc map loading is host-memory sensitive.
 
 #SBATCH -J fpn_aspp_fdw
 #SBATCH --account=MST113104
@@ -18,7 +18,7 @@
 #SBATCH --ntasks-per-node=8
 #SBATCH --gres=gpu:8
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=256G
+#SBATCH --mem=1536G
 #SBATCH --time=48:00:00
 #SBATCH -o %x-%j.log
 #SBATCH -e %x-%j.log
@@ -52,9 +52,9 @@ WORK_DIR="${PROTOOCC_DIR}/work_dirs/ProtoOcc_multi_cnn_head_map_neck_fpn_lateral
 PRETRAIN_CKPT="${PROTOOCC_DIR}/ckpts/bevdet-r50-4d-depth-cbgs_depthnet_modify.pth"
 
 GPUS="${GPUS:-8}"
-SAMPLES_PER_GPU="${SAMPLES_PER_GPU:-2}"
-WORKERS_PER_GPU="${WORKERS_PER_GPU:-2}"
-LR="${LR:-2e-4}"
+SAMPLES_PER_GPU="${SAMPLES_PER_GPU:-4}"
+WORKERS_PER_GPU="${WORKERS_PER_GPU:-1}"
+LR="${LR:-4e-4}"
 
 if [ ! -d "${PROTOOCC_DIR}" ]; then
     echo "[ERROR] ProtoOcc directory not found: ${PROTOOCC_DIR}"
