@@ -724,6 +724,22 @@ class Dual_Branch_Encoder(nn.Module):
                 self._apply_checkpoint_multi(layer, bev_feature, voxel_feature))
         return map_hfm_features
 
+    def _get_map_bev_tensor(self, map_bev_feature):
+        if isinstance(map_bev_feature, dict):
+            map_bev_tensor = map_bev_feature.get('bev_feature', None)
+            if map_bev_tensor is None:
+                raise ValueError(
+                    'map_bev_feature dict must contain `bev_feature`.')
+            return map_bev_tensor
+        return map_bev_feature
+
+    def _set_map_bev_tensor(self, map_bev_feature, map_bev_tensor):
+        if isinstance(map_bev_feature, dict):
+            map_bev_feature = dict(map_bev_feature)
+            map_bev_feature['bev_feature'] = map_bev_tensor
+            return map_bev_feature
+        return map_bev_tensor
+
     def forward(self, x):
         # Voxel Branch
         # checkpoint is crucial for reducing GPU memory usage during training, but require longer training time.
@@ -773,6 +789,7 @@ class Dual_Branch_Encoder(nn.Module):
                 # Real full-resolution (200x200) detail from the pre-backbone
                 # BEV. Source detached by default so map gradients don't reshape
                 # the occ-shared pooling; the block itself stays trainable.
+                map_bev_tensor = self._get_map_bev_tensor(map_bev_feature)
                 highres_source = (
                     map_pooled_x.detach()
                     if self.map_highres_detach else map_pooled_x)
@@ -781,24 +798,28 @@ class Dual_Branch_Encoder(nn.Module):
                     highres = cp.checkpoint(self.map_highres_block, highres_source)
                 else:
                     highres = self.map_highres_block(highres_source)
-                if highres.shape[-2:] != map_bev_feature.shape[-2:]:
+                if highres.shape[-2:] != map_bev_tensor.shape[-2:]:
                     highres = F.interpolate(
-                        highres, size=map_bev_feature.shape[-2:],
+                        highres, size=map_bev_tensor.shape[-2:],
                         mode='bilinear', align_corners=True)
                 if self.map_highres_fusion == 'gated':
                     gate = torch.sigmoid(self.map_highres_gate(torch.cat(
-                        [map_bev_feature, highres], dim=1)))
-                    map_bev_feature = map_bev_feature + gate * highres
+                        [map_bev_tensor, highres], dim=1)))
+                    map_bev_tensor = map_bev_tensor + gate * highres
                 elif self.map_highres_fusion == 'concat':
                     delta = self.map_highres_concat(torch.cat(
-                        [map_bev_feature, highres], dim=1))
-                    map_bev_feature = map_bev_feature + delta
+                        [map_bev_tensor, highres], dim=1))
+                    map_bev_tensor = map_bev_tensor + delta
                 else:
-                    map_bev_feature = map_bev_feature + highres
+                    map_bev_tensor = map_bev_tensor + highres
+                map_bev_feature = self._set_map_bev_tensor(
+                    map_bev_feature, map_bev_tensor)
             if self.map_z_residual is not None:
+                map_bev_tensor = self._get_map_bev_tensor(map_bev_feature)
                 z_residual = self.map_z_residual(
-                    x, output_size=map_bev_feature.shape[-2:])
-                map_bev_feature = map_bev_feature + z_residual
+                    x, output_size=map_bev_tensor.shape[-2:])
+                map_bev_feature = self._set_map_bev_tensor(
+                    map_bev_feature, map_bev_tensor + z_residual)
 
         # Hierarchical Fusion Module
         B, C, Z, H, W = vox3.shape

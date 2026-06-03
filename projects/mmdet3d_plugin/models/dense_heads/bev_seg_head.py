@@ -5,10 +5,75 @@ from torch import nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from mmcv.cnn import ConvModule
+from mmcv.cnn import ConvModule, build_norm_layer
 from mmcv.runner import BaseModule
 
 from mmdet3d.models.builder import HEADS, build_loss
+
+
+def _zero_init_conv(module):
+    if isinstance(module, nn.Conv2d):
+        nn.init.constant_(module.weight, 0)
+        if module.bias is not None:
+            nn.init.constant_(module.bias, 0)
+
+
+class _BEVSegResBlock(nn.Module):
+    def __init__(self, channels, norm_cfg=dict(type='BN')):
+        super(_BEVSegResBlock, self).__init__()
+        self.conv1 = ConvModule(
+            channels,
+            channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False,
+            norm_cfg=norm_cfg,
+            act_cfg=dict(type='ReLU', inplace=True))
+        self.conv2 = ConvModule(
+            channels,
+            channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False,
+            norm_cfg=norm_cfg,
+            act_cfg=None)
+        self.conv2.apply(_zero_init_conv)
+
+    def forward(self, x):
+        return F.relu(x + self.conv2(self.conv1(x)), inplace=True)
+
+
+class _BEVSegConvNeXtBlock(nn.Module):
+    def __init__(self,
+                 channels,
+                 expansion=4,
+                 kernel_size=7,
+                 norm_cfg=dict(type='BN')):
+        super(_BEVSegConvNeXtBlock, self).__init__()
+        padding = kernel_size // 2
+        self.depthwise = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=kernel_size,
+            padding=padding,
+            groups=channels)
+        if norm_cfg is None:
+            self.norm = nn.Identity()
+        else:
+            self.norm = build_norm_layer(norm_cfg, channels)[1]
+        self.pointwise1 = nn.Conv2d(channels, channels * expansion, 1)
+        self.act = nn.GELU()
+        self.pointwise2 = nn.Conv2d(channels * expansion, channels, 1)
+        _zero_init_conv(self.pointwise2)
+
+    def forward(self, x):
+        residual = x
+        x = self.depthwise(x)
+        x = self.norm(x)
+        x = self.pointwise2(self.act(self.pointwise1(x)))
+        return residual + x
 
 
 @HEADS.register_module()
@@ -24,6 +89,28 @@ class BEVSegHead(BaseModule):
                  hidden_channels=128,
                  num_classes=6,
                  num_convs=2,
+                 bevseg_head_type='simple',
+                 bevseg_num_refine_blocks=2,
+                 use_dual_area_line_head=False,
+                 area_class_indices=None,
+                 line_class_indices=None,
+                 line_head_use_detail=False,
+                 line_detail_channels=0,
+                 use_map_aux_loss=False,
+                 map_aux_levels=('100', '50'),
+                 map_aux_weight_100=0.4,
+                 map_aux_weight_50=0.2,
+                 map_aux_downsample='maxpool',
+                 map_aux_in_channels=None,
+                 map_aux_hidden_channels=None,
+                 map_loss_type=None,
+                 map_dice_weight=1.0,
+                 map_focal_gamma=2.0,
+                 map_focal_alpha=0.25,
+                 map_lovasz_weight=1.0,
+                 use_map_class_weights=False,
+                 use_bev_coordconv=False,
+                 bev_coord_type='xy',
                  norm_cfg=dict(type='BN'),
                  with_cp=False,
                  loss_bce=None,
@@ -44,9 +131,31 @@ class BEVSegHead(BaseModule):
         super(BEVSegHead, self).__init__()
         self.with_cp = with_cp
         self.num_classes = num_classes
+        self.bevseg_head_type = self._normalize_head_type(bevseg_head_type)
+        self.bevseg_num_refine_blocks = int(bevseg_num_refine_blocks)
+        self.use_dual_area_line_head = bool(use_dual_area_line_head)
+        self.line_head_use_detail = bool(line_head_use_detail)
+        self.line_detail_channels = int(line_detail_channels or 0)
+        self.use_map_aux_loss = bool(use_map_aux_loss)
+        self.map_aux_levels = self._parse_aux_levels(map_aux_levels)
+        self.map_aux_weights = {
+            '100': float(map_aux_weight_100),
+            '50': float(map_aux_weight_50),
+        }
+        self.map_aux_downsample = self._normalize_aux_downsample(
+            map_aux_downsample)
+        self.map_loss_type = self._normalize_map_loss_type(map_loss_type)
+        self.use_map_lovasz = self.map_loss_type == 'focal_lovasz'
+        self.map_lovasz_weight = float(map_lovasz_weight)
+        self.use_map_class_weights = bool(use_map_class_weights)
+        self.use_bev_coordconv = bool(use_bev_coordconv)
+        self.bev_coord_type = self._normalize_coord_type(bev_coord_type)
         self.map_loss_balance_mode = self._normalize_balance_mode(
             map_loss_balance_mode)
         self.map_class_weights = self._parse_class_weights(map_class_weights)
+        if (self.use_map_class_weights
+                and self.map_loss_balance_mode == 'none'):
+            self.map_loss_balance_mode = 'class_static'
         self.overlay_class_indices = self._parse_overlay_indices(
             overlay_class_indices)
         self.overlay_pos_weight = self._parse_overlay_values(
@@ -65,28 +174,280 @@ class BEVSegHead(BaseModule):
             map_balance_class_names)
         self._map_balance_debug_step = 0
         self._validate_balance_cfg()
+        loss_bce, loss_dice, loss_focal = self._resolve_map_loss_cfgs(
+            loss_bce,
+            loss_dice,
+            loss_focal,
+            map_dice_weight,
+            map_focal_gamma,
+            map_focal_alpha)
 
-        blocks = []
-        current_channels = in_channels
-        for _ in range(num_convs):
-            blocks.append(
-                ConvModule(
-                    current_channels,
-                    hidden_channels,
-                    kernel_size=3,
-                    stride=1,
-                    padding=1,
-                    bias=False,
-                    norm_cfg=norm_cfg,
-                    act_cfg=dict(type='ReLU', inplace=True),
-                ))
-            current_channels = hidden_channels
-        self.decoder = nn.Sequential(*blocks)
-        self.predictor = nn.Conv2d(current_channels, num_classes, kernel_size=1)
+        if self.use_bev_coordconv:
+            coord_channels = self._num_coord_channels()
+            self.coord_proj = ConvModule(
+                in_channels + coord_channels,
+                in_channels,
+                kernel_size=1,
+                bias=False,
+                norm_cfg=norm_cfg,
+                act_cfg=dict(type='ReLU', inplace=True))
+        else:
+            self.coord_proj = None
+
+        if self.use_dual_area_line_head:
+            self.area_class_indices = self._parse_head_indices(
+                area_class_indices, 'area_class_indices')
+            self.line_class_indices = self._parse_head_indices(
+                line_class_indices, 'line_class_indices')
+            self._validate_dual_head_indices()
+            if self.line_head_use_detail and self.line_detail_channels <= 0:
+                raise ValueError(
+                    'line_head_use_detail=True requires '
+                    'line_detail_channels > 0.')
+
+            self.decoder = None
+            self.predictor = None
+            self.area_decoder, area_channels = self._build_decoder(
+                in_channels,
+                hidden_channels,
+                num_convs,
+                norm_cfg)
+            line_in_channels = in_channels
+            if self.line_head_use_detail:
+                line_in_channels += self.line_detail_channels
+            self.line_decoder, line_channels = self._build_decoder(
+                line_in_channels,
+                hidden_channels,
+                num_convs,
+                norm_cfg)
+            self.area_predictor = nn.Conv2d(
+                area_channels, len(self.area_class_indices), kernel_size=1)
+            self.line_predictor = nn.Conv2d(
+                line_channels, len(self.line_class_indices), kernel_size=1)
+        else:
+            self.area_class_indices = []
+            self.line_class_indices = []
+            self.decoder, current_channels = self._build_decoder(
+                in_channels,
+                hidden_channels,
+                num_convs,
+                norm_cfg)
+            self.predictor = nn.Conv2d(
+                current_channels, num_classes, kernel_size=1)
+
+        self.map_aux_heads = nn.ModuleDict()
+        if self.use_map_aux_loss:
+            aux_in_channels = self._parse_aux_in_channels(
+                map_aux_in_channels, in_channels)
+            aux_hidden_channels = (
+                hidden_channels if map_aux_hidden_channels is None
+                else int(map_aux_hidden_channels))
+            for level in self.map_aux_levels:
+                self.map_aux_heads[level] = nn.Sequential(
+                    ConvModule(
+                        aux_in_channels[level],
+                        aux_hidden_channels,
+                        kernel_size=3,
+                        padding=1,
+                        bias=False,
+                        norm_cfg=norm_cfg,
+                        act_cfg=dict(type='ReLU', inplace=True)),
+                    nn.Conv2d(
+                        aux_hidden_channels, num_classes, kernel_size=1))
 
         self.loss_bce = build_loss(loss_bce) if loss_bce is not None else None
         self.loss_dice = build_loss(loss_dice) if loss_dice is not None else None
         self.loss_focal = build_loss(loss_focal) if loss_focal is not None else None
+
+    def _normalize_map_loss_type(self, loss_type):
+        if loss_type is None:
+            return None
+        loss_type = str(loss_type).lower()
+        aliases = {
+            'ce': 'bce',
+            'sigmoid_bce': 'bce',
+            'dice_bce': 'bce_dice',
+            'focal+dice': 'focal_dice',
+            'bce+dice': 'bce_dice',
+        }
+        loss_type = aliases.get(loss_type, loss_type)
+        valid_types = {'bce', 'bce_dice', 'focal', 'focal_dice',
+                       'focal_lovasz'}
+        if loss_type not in valid_types:
+            raise ValueError(
+                f'Unsupported map_loss_type: {loss_type}. '
+                f'Expected one of {sorted(valid_types)}.')
+        return loss_type
+
+    def _resolve_map_loss_cfgs(self,
+                               loss_bce,
+                               loss_dice,
+                               loss_focal,
+                               map_dice_weight,
+                               map_focal_gamma,
+                               map_focal_alpha):
+        if self.map_loss_type is None:
+            return loss_bce, loss_dice, loss_focal
+
+        bce_cfg = dict(
+            type='CrossEntropyLoss',
+            use_sigmoid=True,
+            reduction='mean',
+            loss_weight=1.0)
+        dice_cfg = dict(
+            type='DiceLoss',
+            use_sigmoid=True,
+            activate=True,
+            reduction='mean',
+            naive_dice=True,
+            loss_weight=float(map_dice_weight))
+        focal_cfg = dict(
+            type='BinaryMaskFocalLoss',
+            use_sigmoid=True,
+            gamma=float(map_focal_gamma),
+            alpha=float(map_focal_alpha),
+            reduction='mean',
+            loss_weight=1.0)
+
+        loss_bce = bce_cfg if self.map_loss_type in ('bce', 'bce_dice') else None
+        loss_dice = dice_cfg if self.map_loss_type in ('bce_dice', 'focal_dice') else None
+        loss_focal = (
+            focal_cfg
+            if self.map_loss_type in ('focal', 'focal_dice', 'focal_lovasz')
+            else None)
+        return loss_bce, loss_dice, loss_focal
+
+    def _parse_aux_levels(self, levels):
+        if levels is None:
+            return []
+        levels = [str(level) for level in levels]
+        valid_levels = {'100', '50'}
+        for level in levels:
+            if level not in valid_levels:
+                raise ValueError(
+                    f'Unsupported map aux level: {level}. '
+                    f'Expected one of {sorted(valid_levels)}.')
+        if len(set(levels)) != len(levels):
+            raise ValueError('map_aux_levels must not contain duplicates.')
+        return levels
+
+    def _normalize_aux_downsample(self, downsample):
+        downsample = 'maxpool' if downsample is None else str(downsample).lower()
+        valid = {'maxpool', 'nearest'}
+        if downsample not in valid:
+            raise ValueError(
+                f'Unsupported map_aux_downsample: {downsample}. '
+                f'Expected one of {sorted(valid)}.')
+        return downsample
+
+    def _parse_aux_in_channels(self, aux_in_channels, in_channels):
+        default_channels = int(in_channels) * 2
+        if aux_in_channels is None:
+            return {level: default_channels for level in self.map_aux_levels}
+        if isinstance(aux_in_channels, int):
+            return {level: int(aux_in_channels) for level in self.map_aux_levels}
+        parsed = {}
+        for level in self.map_aux_levels:
+            if level not in aux_in_channels:
+                raise ValueError(
+                    f'map_aux_in_channels must define level {level}.')
+            parsed[level] = int(aux_in_channels[level])
+        return parsed
+
+    def _normalize_coord_type(self, coord_type):
+        coord_type = 'xy' if coord_type is None else str(coord_type).lower()
+        valid_types = {'xy', 'xyr', 'xyrtheta'}
+        if coord_type not in valid_types:
+            raise ValueError(
+                f'Unsupported bev_coord_type: {coord_type}. '
+                f'Expected one of {sorted(valid_types)}.')
+        return coord_type
+
+    def _num_coord_channels(self):
+        if self.bev_coord_type == 'xy':
+            return 2
+        if self.bev_coord_type == 'xyr':
+            return 3
+        return 4
+
+    def _normalize_head_type(self, head_type):
+        head_type = 'simple' if head_type is None else str(head_type).lower()
+        valid_types = {'simple', 'res_refine', 'convnext'}
+        if head_type not in valid_types:
+            raise ValueError(
+                f'Unsupported bevseg_head_type: {head_type}. '
+                f'Expected one of {sorted(valid_types)}.')
+        return head_type
+
+    def _build_decoder(self,
+                       in_channels,
+                       hidden_channels,
+                       num_convs,
+                       norm_cfg):
+        blocks = []
+        current_channels = in_channels
+        if self.bevseg_head_type == 'simple':
+            for _ in range(num_convs):
+                blocks.append(
+                    ConvModule(
+                        current_channels,
+                        hidden_channels,
+                        kernel_size=3,
+                        stride=1,
+                        padding=1,
+                        bias=False,
+                        norm_cfg=norm_cfg,
+                        act_cfg=dict(type='ReLU', inplace=True),
+                    ))
+                current_channels = hidden_channels
+            return nn.Sequential(*blocks), current_channels
+
+        blocks.append(
+            ConvModule(
+                current_channels,
+                hidden_channels,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                bias=False,
+                norm_cfg=norm_cfg,
+                act_cfg=dict(type='ReLU', inplace=True),
+            ))
+        current_channels = hidden_channels
+        for _ in range(self.bevseg_num_refine_blocks):
+            if self.bevseg_head_type == 'res_refine':
+                blocks.append(_BEVSegResBlock(current_channels, norm_cfg))
+            else:
+                blocks.append(_BEVSegConvNeXtBlock(current_channels, norm_cfg=norm_cfg))
+        return nn.Sequential(*blocks), current_channels
+
+    def _parse_head_indices(self, indices, name):
+        if indices is None:
+            raise ValueError(
+                f'{name} must be set when use_dual_area_line_head=True.')
+        indices = [int(index) for index in indices]
+        if not indices:
+            raise ValueError(f'{name} must not be empty.')
+        for index in indices:
+            if index < 0 or index >= self.num_classes:
+                raise ValueError(
+                    f'{name} contains out-of-range index {index} for '
+                    f'num_classes={self.num_classes}.')
+        if len(set(indices)) != len(indices):
+            raise ValueError(f'{name} must not contain duplicate indices.')
+        return indices
+
+    def _validate_dual_head_indices(self):
+        all_indices = self.area_class_indices + self.line_class_indices
+        if len(set(all_indices)) != len(all_indices):
+            raise ValueError(
+                'area_class_indices and line_class_indices must not overlap.')
+        expected = set(range(self.num_classes))
+        if set(all_indices) != expected:
+            raise ValueError(
+                'area_class_indices and line_class_indices must cover every '
+                f'map class exactly once; got {sorted(all_indices)} for '
+                f'num_classes={self.num_classes}.')
 
     def _normalize_balance_mode(self, mode):
         if mode is None:
@@ -205,34 +566,208 @@ class BEVSegHead(BaseModule):
             raise ValueError('dynamic_overlay_eps must be greater than zero.')
 
     def forward(self, bev_feature):
-        if self.with_cp and self.training:
-            bev_feature = checkpoint(self.decoder, bev_feature)
+        bev_feature, detail_feature, aux_features = self._split_forward_inputs(
+            bev_feature)
+        bev_feature = self._apply_coordconv(bev_feature)
+
+        if self.use_dual_area_line_head:
+            seg_logits = self._forward_dual_head(bev_feature, detail_feature)
         else:
-            bev_feature = self.decoder(bev_feature)
-        return self.predictor(bev_feature)
+            decoded_feature = self._run_decoder(self.decoder, bev_feature)
+            seg_logits = self.predictor(decoded_feature)
+
+        if self.training and self.use_map_aux_loss:
+            outputs = dict(bev_seg_logits=seg_logits)
+            for level in self.map_aux_levels:
+                if level not in aux_features:
+                    raise ValueError(
+                        f'Missing aux feature level `{level}` for '
+                        'use_map_aux_loss=True.')
+                outputs[f'aux_logits_{level}'] = self.map_aux_heads[level](
+                    aux_features[level])
+            return outputs
+
+        return seg_logits
+
+    def _run_decoder(self, decoder, x):
+        if self.with_cp and self.training:
+            return checkpoint(decoder, x)
+        return decoder(x)
+
+    def _forward_dual_head(self, bev_feature, detail_feature=None):
+        area_feat = self._run_decoder(self.area_decoder, bev_feature)
+        area_logits = self.area_predictor(area_feat)
+
+        line_input = bev_feature
+        if self.line_head_use_detail:
+            detail_feature = self._prepare_detail_feature(
+                detail_feature, bev_feature)
+            line_input = torch.cat([bev_feature, detail_feature], dim=1)
+        line_feat = self._run_decoder(self.line_decoder, line_input)
+        line_logits = self.line_predictor(line_feat)
+
+        seg_logits = bev_feature.new_zeros(
+            bev_feature.shape[0],
+            self.num_classes,
+            bev_feature.shape[2],
+            bev_feature.shape[3])
+        area_indices = torch.tensor(
+            self.area_class_indices,
+            device=bev_feature.device,
+            dtype=torch.long)
+        line_indices = torch.tensor(
+            self.line_class_indices,
+            device=bev_feature.device,
+            dtype=torch.long)
+        seg_logits.index_copy_(1, area_indices, area_logits)
+        seg_logits.index_copy_(1, line_indices, line_logits)
+        return seg_logits
+
+    def _split_forward_inputs(self, bev_feature):
+        detail_feature = None
+        aux_features = {}
+        if isinstance(bev_feature, dict):
+            detail_feature = bev_feature.get('detail_feature', None)
+            aux_features = bev_feature.get('aux_features', {}) or {}
+            bev_feature = bev_feature.get('bev_feature', None)
+            if bev_feature is None:
+                raise ValueError(
+                    'BEVSegHead dict input must contain `bev_feature`.')
+        elif isinstance(bev_feature, (list, tuple)):
+            if not bev_feature:
+                raise ValueError('BEVSegHead tuple/list input must not be empty.')
+            detail_feature = bev_feature[1] if len(bev_feature) > 1 else None
+            aux_features = bev_feature[2] if len(bev_feature) > 2 else {}
+            bev_feature = bev_feature[0]
+        aux_features = {str(level): feat
+                        for level, feat in aux_features.items()}
+        return bev_feature, detail_feature, aux_features
+
+    def _build_bev_coord(self, bev_feature):
+        batch_size, _, height, width = bev_feature.shape
+        device = bev_feature.device
+        dtype = bev_feature.dtype
+        ys = torch.linspace(-1.0, 1.0, height, device=device, dtype=dtype)
+        xs = torch.linspace(-1.0, 1.0, width, device=device, dtype=dtype)
+        try:
+            grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')
+        except TypeError:
+            grid_y, grid_x = torch.meshgrid(ys, xs)
+        coords = [grid_x, grid_y]
+        if self.bev_coord_type in ('xyr', 'xyrtheta'):
+            radius = torch.sqrt(grid_x * grid_x + grid_y * grid_y)
+            radius = radius / radius.new_tensor(2.0).sqrt()
+            coords.append(radius)
+        if self.bev_coord_type == 'xyrtheta':
+            theta = torch.atan2(grid_y, grid_x) / grid_x.new_tensor(3.141592653589793)
+            coords.append(theta)
+        coord = torch.stack(coords, dim=0).unsqueeze(0)
+        return coord.expand(batch_size, -1, -1, -1)
+
+    def _apply_coordconv(self, bev_feature):
+        if not self.use_bev_coordconv:
+            return bev_feature
+        coord = self._build_bev_coord(bev_feature)
+        return self.coord_proj(torch.cat([bev_feature, coord], dim=1))
+
+    def _prepare_detail_feature(self, detail_feature, bev_feature):
+        if detail_feature is None:
+            shape = (
+                bev_feature.shape[0],
+                self.line_detail_channels,
+                bev_feature.shape[2],
+                bev_feature.shape[3])
+            return bev_feature.new_zeros(shape)
+        if detail_feature.shape[2:] != bev_feature.shape[2:]:
+            detail_feature = F.interpolate(
+                detail_feature,
+                size=bev_feature.shape[2:],
+                mode='bilinear',
+                align_corners=True)
+        if detail_feature.shape[1] != self.line_detail_channels:
+            raise ValueError(
+                'line detail feature channel mismatch: expected '
+                f'{self.line_detail_channels}, got {detail_feature.shape[1]}.')
+        return detail_feature
 
     def loss(self, seg_logits, gt_masks_bev):
         gt_masks_bev = gt_masks_bev.float()
+        if isinstance(seg_logits, dict):
+            final_logits = seg_logits.get('bev_seg_logits', None)
+            if final_logits is None:
+                raise ValueError(
+                    'BEVSegHead loss dict must contain `bev_seg_logits`.')
+            losses = self._loss_single(final_logits, gt_masks_bev)
+            for level in self.map_aux_levels:
+                key = f'aux_logits_{level}'
+                if key not in seg_logits:
+                    continue
+                aux_gt = self._downsample_aux_target(
+                    gt_masks_bev, seg_logits[key].shape[-2:])
+                aux_losses = self._loss_single(
+                    seg_logits[key],
+                    aux_gt,
+                    prefix=f'loss_map_aux_{level}',
+                    loss_scale=self.map_aux_weights[level])
+                losses.update(aux_losses)
+            return losses
+
+        return self._loss_single(seg_logits, gt_masks_bev)
+
+    def _loss_single(self,
+                     seg_logits,
+                     gt_masks_bev,
+                     prefix='loss_map',
+                     loss_scale=1.0):
         if self.map_loss_balance_mode != 'none':
-            return self._balanced_loss(seg_logits, gt_masks_bev)
+            return self._balanced_loss(
+                seg_logits, gt_masks_bev, prefix, loss_scale)
 
         losses = {}
 
         if self.loss_bce is not None:
-            losses['loss_map_bce'] = self.loss_bce(seg_logits, gt_masks_bev)
+            losses[f'{prefix}_bce'] = (
+                self.loss_bce(seg_logits, gt_masks_bev) * loss_scale)
 
         if self.loss_focal is not None:
-            losses['loss_map_focal'] = self.loss_focal(seg_logits, gt_masks_bev)
+            losses[f'{prefix}_focal'] = (
+                self.loss_focal(seg_logits, gt_masks_bev) * loss_scale)
 
         if self.loss_dice is not None:
-            losses['loss_map_dice'] = self.loss_dice(
+            losses[f'{prefix}_dice'] = self.loss_dice(
                 seg_logits.reshape(-1, *seg_logits.shape[2:]),
                 gt_masks_bev.reshape(-1, *gt_masks_bev.shape[2:]),
-            )
+            ) * loss_scale
+
+        if self.use_map_lovasz:
+            losses[f'{prefix}_lovasz'] = (
+                self.map_lovasz_weight
+                * self._lovasz_hinge_loss_per_class(
+                    seg_logits, gt_masks_bev).mean()
+                * loss_scale)
 
         return losses
 
-    def _balanced_loss(self, seg_logits, gt_masks_bev):
+    def _downsample_aux_target(self, gt_masks_bev, target_size):
+        if tuple(gt_masks_bev.shape[-2:]) == tuple(target_size):
+            return gt_masks_bev
+        if self.map_aux_downsample == 'nearest':
+            return F.interpolate(
+                gt_masks_bev.float(), size=target_size, mode='nearest')
+        in_h, in_w = gt_masks_bev.shape[-2:]
+        out_h, out_w = target_size
+        if in_h % out_h == 0 and in_w % out_w == 0:
+            return F.max_pool2d(
+                gt_masks_bev.float(),
+                kernel_size=(in_h // out_h, in_w // out_w),
+                stride=(in_h // out_h, in_w // out_w))
+        return F.adaptive_max_pool2d(gt_masks_bev.float(), target_size)
+
+    def _balanced_loss(self,
+                       seg_logits,
+                       gt_masks_bev,
+                       prefix='loss_map',
+                       loss_scale=1.0):
         if seg_logits.shape != gt_masks_bev.shape:
             raise ValueError(
                 'BEVSegHead balanced loss expects seg_logits and '
@@ -253,8 +788,22 @@ class BEVSegHead(BaseModule):
                 seg_logits, gt_masks_bev, reduction='none')
             bce_weighted = bce_per_pixel * bce_weight
             bce_loss_weight = float(getattr(self.loss_bce, 'loss_weight', 1.0))
-            losses['loss_map_bce'] = bce_loss_weight * bce_weighted.mean()
+            losses[f'{prefix}_bce'] = (
+                loss_scale * bce_loss_weight * bce_weighted.mean())
             bce_contrib = bce_loss_weight * bce_weighted.mean(dim=(0, 2, 3))
+
+        focal_contrib = None
+        if self.loss_focal is not None:
+            losses[f'{prefix}_focal'] = loss_scale * self.loss_focal(
+                seg_logits,
+                gt_masks_bev,
+                weight=bce_weight,
+                reduction_override='mean')
+            focal_contrib = self.loss_focal(
+                seg_logits,
+                gt_masks_bev,
+                weight=bce_weight,
+                reduction_override='none').mean(dim=(0, 2, 3))
 
         dice_contrib = None
         if self.loss_dice is not None:
@@ -263,10 +812,26 @@ class BEVSegHead(BaseModule):
             dice_weighted = dice_per_class * dice_weight
             dice_loss_weight = float(
                 getattr(self.loss_dice, 'loss_weight', 1.0))
-            losses['loss_map_dice'] = dice_loss_weight * dice_weighted.mean()
+            losses[f'{prefix}_dice'] = (
+                loss_scale * dice_loss_weight * dice_weighted.mean())
             dice_contrib = dice_loss_weight * dice_weighted.mean(dim=0)
 
-        self._log_balance_debug(balance_info, bce_contrib, dice_contrib)
+        lovasz_contrib = None
+        if self.use_map_lovasz:
+            lovasz_per_class = self._lovasz_hinge_loss_per_class(
+                seg_logits, gt_masks_bev)
+            lovasz_weights = dice_weight.mean(dim=0)
+            lovasz_weighted = lovasz_per_class * lovasz_weights
+            losses[f'{prefix}_lovasz'] = (
+                loss_scale * self.map_lovasz_weight * lovasz_weighted.mean())
+            lovasz_contrib = self.map_lovasz_weight * lovasz_weighted
+
+        self._log_balance_debug(
+            balance_info,
+            bce_contrib,
+            dice_contrib,
+            focal_contrib,
+            lovasz_contrib)
         return losses
 
     def _build_balance_weights(self, gt_masks_bev):
@@ -362,6 +927,38 @@ class BEVSegHead(BaseModule):
 
         return 1 - dice_score
 
+    def _lovasz_grad(self, gt_sorted):
+        p = gt_sorted.numel()
+        gts = gt_sorted.sum()
+        intersection = gts - gt_sorted.float().cumsum(0)
+        union = gts + (1.0 - gt_sorted.float()).cumsum(0)
+        jaccard = 1.0 - intersection / union.clamp_min(1e-6)
+        if p > 1:
+            jaccard[1:p] = jaccard[1:p] - jaccard[0:-1]
+        return jaccard
+
+    def _lovasz_hinge_flat(self, logits, labels):
+        if labels.numel() == 0:
+            return logits.sum() * 0.0
+        labels = labels.float()
+        signs = 2.0 * labels - 1.0
+        errors = 1.0 - logits * signs
+        errors_sorted, perm = torch.sort(errors, dim=0, descending=True)
+        gt_sorted = labels[perm]
+        grad = self._lovasz_grad(gt_sorted)
+        return torch.dot(F.relu(errors_sorted), grad)
+
+    def _lovasz_hinge_loss_per_class(self, seg_logits, gt_masks_bev):
+        per_class_losses = []
+        for class_index in range(seg_logits.shape[1]):
+            class_losses = []
+            for batch_index in range(seg_logits.shape[0]):
+                class_losses.append(self._lovasz_hinge_flat(
+                    seg_logits[batch_index, class_index].reshape(-1),
+                    gt_masks_bev[batch_index, class_index].reshape(-1)))
+            per_class_losses.append(torch.stack(class_losses).mean())
+        return torch.stack(per_class_losses)
+
     def _format_class_values(self, values, precision=4):
         if values is None:
             return 'none'
@@ -377,7 +974,12 @@ class BEVSegHead(BaseModule):
             parts.append(f'{name}:{formatted}')
         return ', '.join(parts)
 
-    def _log_balance_debug(self, balance_info, bce_contrib, dice_contrib):
+    def _log_balance_debug(self,
+                           balance_info,
+                           bce_contrib,
+                           dice_contrib,
+                           focal_contrib=None,
+                           lovasz_contrib=None):
         if not self.map_balance_debug:
             return
         step = self._map_balance_debug_step
@@ -400,6 +1002,10 @@ class BEVSegHead(BaseModule):
             f'{self._format_class_values(balance_info["ref_ratio"], 6)}) '
             'bce_contrib=('
             f'{self._format_class_values(bce_contrib, 4)}) '
+            'focal_contrib=('
+            f'{self._format_class_values(focal_contrib, 4)}) '
+            'lovasz_contrib=('
+            f'{self._format_class_values(lovasz_contrib, 4)}) '
             'dice_contrib=('
             f'{self._format_class_values(dice_contrib, 4)})')
 

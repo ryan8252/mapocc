@@ -87,6 +87,80 @@ Implemented after the check:
 - Composition smoke config: `ProtoOcc_multi_cnn_head_map_neck_stage123.py`.
 - Validation: `python -m py_compile` passed for the modified encoder and new configs; `conda run -n mapocc` encoder forward smoke passed for all five new configs with output shapes `(1,48,16,16,16)`, `(1,48,16,16)`, `(1,128,16,16)` on synthetic `[1,80,16,16,16]` input.
 
+## Codex Pre-Implementation Overlap Check for Sections 4-6 - 2026-06-02
+
+Checked before implementing Sections 4-6:
+
+- Section 4 exact implementation was not found. Existing `Custom_FPN_LSS` still directly concatenates raw pyramid levels (`640+320`, then `256+160`) without same-channel lateral projections, and no `use_fpn_lateral_projection`, `use_fpn_global_context`, ASPP, or PPM flag was found. Related but different prior modules exist: `MapHFMFusionLayer` injects Z-collapsed voxel context before the map neck, and `PerScaleMapResidualAdapter` refines each BEV scale before the map neck. They do not replace the internal FPN scale-fusion rule. Related result: `work_dirs/ProtoOcc_multi_cnn_head_map_neck_adapter/epoch_24_ema.pth`, Occ mIoU `39.64`, Map mIoU `46.74`, `ped_crossing 42.88`, `stop_line 28.62`, `divider 34.19`.
+- Section 5 exact implementation was not found. `BEVSegHead` was still the shallow `num_convs` stack plus one `1x1` predictor, without `bevseg_head_type='res_refine'|'convnext'` or residual refinement blocks. Existing `ProtoMapHead` / `ProtoMapHeadV2` configs are related map-head replacements, not the same as strengthening the current `BEVSegHead`.
+- Section 6 exact implementation was not found. No current `BEVSegHead` split area-like and line-like map classes into separate decoders with configurable `area_class_indices` / `line_class_indices`, and no result was found for an area-line dual-head ablation.
+- Clean reference baseline for Sections 4-6 remains `work_dirs/ProtoOcc_multi_cnn_head_map_neck_TWCC/epoch_24_ema.pth` with `map_loss_weight=4`, Occ mIoU `39.72`, Map mIoU `45.79`.
+
+Implemented after the check:
+
+- Section 4: `Custom_FPN_LSS` now supports `use_fpn_lateral_projection=True`, `fpn_lateral_in_channels`, `fpn_projection_channels`, `use_fpn_global_context=True`, and `fpn_global_context_type='aspp'|'ppm'`. New configs: `ProtoOcc_multi_cnn_head_map_neck_fpn_lateral.py` and `ProtoOcc_multi_cnn_head_map_neck_fpn_lateral_aspp.py`.
+- Section 5: `BEVSegHead` now supports `bevseg_head_type='simple'|'res_refine'|'convnext'` and `bevseg_num_refine_blocks`. The default `simple` path keeps the old `decoder + predictor` structure. New configs: `ProtoOcc_multi_cnn_head_map_neck_bevseg_res_refine.py` and `ProtoOcc_multi_cnn_head_map_neck_bevseg_convnext.py`.
+- Section 6: `BEVSegHead` now supports `use_dual_area_line_head=True` with configurable `area_class_indices`, `line_class_indices`, and `line_head_use_detail`. The final output remains `(B, num_map_classes, 200, 200)` with logits restored to original class order. New config: `ProtoOcc_multi_cnn_head_map_neck_dual_area_line_head.py`.
+- Composition smoke config: `ProtoOcc_multi_cnn_head_map_neck_stage456.py`. Use the single-section configs first for attribution; stage456 is only for combined-path sanity checks.
+- Validation: `python -m py_compile` passed for the modified neck/head and six new configs; `git diff --check` passed; `conda run -n mapocc` config/build/forward smoke passed for all six new configs with neck output `(1,128,200,200)` and logits `(1,6,200,200)` on synthetic inputs. The original `ProtoOcc_multi_cnn_head_map_neck.py` baseline config also passed the same shape smoke.
+
+## Codex Pre-Implementation Overlap Check for Sections 7-9 - 2026-06-02
+
+Checked before implementing Sections 7-9:
+
+- Section 7 exact implementation was not found. `Custom_FPN_LSS` returned the final `128ch` map feature only and did not expose the internal `100x100` / `50x50` map features for auxiliary map supervision.
+- Section 8 had partial prior support: `BEVSegHead` already accepted explicit `loss_bce`, `loss_dice`, and `loss_focal` configs, and also had a `class_static` balance mode. Existing focal configs were focal-only variants, not the requested `map_loss_type='focal_dice'` interface with optional static class weights.
+- Section 9 exact implementation was not found. No `use_bev_coordconv` / `bev_coord_type` flag or BEV coordinate projection was present in `BEVSegHead`.
+
+Implemented after the check:
+
+- Section 7: `Custom_FPN_LSS` now supports `return_map_aux_features=True` and returns `aux_features['100']` / `aux_features['50']` from the internal FPN fusion stages. `BEVSegHead` now supports `use_map_aux_loss=True`, `map_aux_levels`, `map_aux_weight_100`, `map_aux_weight_50`, and max-pool GT downsampling. New config: `ProtoOcc_multi_cnn_head_map_neck_aux_loss.py`.
+- Section 8: `BEVSegHead` now supports `map_loss_type='bce'|'bce_dice'|'focal'|'focal_dice'|'focal_lovasz'`, `map_dice_weight`, `map_focal_gamma`, `map_focal_alpha`, `map_lovasz_weight`, `use_map_class_weights`, and `map_class_weights`. Class weights apply to BCE/Focal per-pixel losses and Dice/Lovasz per-class losses. New config: `ProtoOcc_multi_cnn_head_map_neck_focal_dice_weighted.py`.
+- Section 9: `BEVSegHead` now supports `use_bev_coordconv=True` with `bev_coord_type='xy'|'xyr'|'xyrtheta'`, concatenates dynamic BEV coordinate channels, and projects back to the original map feature channel count before the decoder. New config: `ProtoOcc_multi_cnn_head_map_neck_coordconv_xy.py`.
+- Composition smoke config: `ProtoOcc_multi_cnn_head_map_neck_stage789.py`. Use the single-section configs first for clean attribution; stage789 is only for combined-path sanity checks.
+- Validation: `python -m py_compile` passed for the modified encoder/neck/head/detector files and four new configs; `conda run -n mapocc` neck/head synthetic forward + loss smoke passed for all four new configs with final logits `(1,6,200,200)`; `conda run -n mapocc` full `Dual_Branch_Encoder` small-input forward passed with outputs `(1,48,16,16,16)`, `(1,48,16,16)`, `(1,128,16,16)`.
+
+## Empirical Usefulness Summary - 2026-06-03
+
+Usefulness here means there is local evidence under the same 1-epoch /
+1-quarter nuScenes smoke protocol unless explicitly marked as a 24-epoch
+result. All smoke evals use the full val set (`6019` samples) and the EMA
+checkpoint when available.
+
+### Methods that are useful for our current branch
+
+| Plan section | Method / config | Evidence | Decision |
+| --- | --- | --- | --- |
+| Section 8 | `focal_dice` map loss with static rare/thin class weights, `ProtoOcc_multi_cnn_head_map_neck_focal_dice_weighted.py` | Smoke rank 2: Map mean iou@max `0.191608`, OCC mIoU `27.49`, thin classes became non-zero: `ped_crossing=0.062106`, `stop_line=0.078230`, `divider=0.146944`. | Useful. Keep this as the default loss-side change for thin map classes. |
+| Section 4 | FPN lateral projection + ASPP global context, `ProtoOcc_multi_cnn_head_map_neck_fpn_lateral_aspp.py` | Smoke rank 3 from the raw eval dict: Map mean iou@max `0.187836`, OCC mIoU `25.56`. This improved the feature path, but by itself still left `ped_crossing=0.0` and weak stop-line IoU. | Useful as a feature-side change, especially when paired with Section 8. Not sufficient alone for thin classes. |
+| Sections 4 + 8 | `ProtoOcc_multi_cnn_head_map_neck_fpn_lateral_aspp_focal_dice_weighted.py` | Smoke rank 1: Map mean iou@max `0.220636`, OCC mIoU `26.61`, `ped_crossing=0.068804`, `stop_line=0.090866`, `divider=0.173588`. It beats Section 8 alone (`0.191608`) and Section 4 alone (`0.187836`). | Strongest current candidate. Use this for the next longer run / TWCC nano4 run. |
+| Related to Section 3 | Existing per-scale map residual adapter, `ProtoOcc_multi_cnn_head_map_neck_adapter.py` | 24-epoch full run was better than the clean TWCC baseline: Map mIoU `46.74` vs baseline `45.79`, with `ped_crossing=42.88`, `stop_line=28.62`, `divider=34.19`. The 1-epoch smoke was only `0.167216`, so this seems training-length dependent. | Useful long-run signal, but do not treat the 1-epoch smoke as proof. Consider as a later add-on after the Section 4 + 8 candidate is validated for more epochs. |
+
+### Methods not yet useful as standalone smoke changes
+
+| Plan section | Method / config | Smoke result | Decision |
+| --- | --- | --- | --- |
+| Section 7 | Auxiliary map supervision, `ProtoOcc_multi_cnn_head_map_neck_aux_loss.py` | Map mean iou@max `0.171397`; thin classes mostly remained weak (`ped_crossing=0.0`, `stop_line=0.001920`, `divider=0.103686`). | Not a current mainline change. Revisit only in combination with stronger loss/feature settings. |
+| Section 6 | Dual area/line head, `ProtoOcc_multi_cnn_head_map_neck_dual_area_line_head.py` | Map mean iou@max `0.167525`; `ped_crossing=0.0`, `stop_line=0.015571`, `divider=0.097174`. | Not useful standalone. |
+| Section 9 | BEV CoordConv XY, `ProtoOcc_multi_cnn_head_map_neck_coordconv_xy.py` | Map mean iou@max `0.166692`; `ped_crossing=0.0`, `stop_line=0.007365`, `divider=0.089257`. | Not useful standalone. |
+| Section 5 | Stronger BEVSegHead (`res_refine`, `convnext`) | `res_refine`: `0.161818`; `convnext`: `0.154764`; thin classes remained weak. | Not useful standalone in this branch. |
+| Section 1 | High-resolution gated skip, `ProtoOcc_multi_cnn_head_map_neck_highres_gated.py` | Map mean iou@max `0.161200`; thin classes weak. | Not useful standalone. |
+| Section 2 | Z-aware compression (`conv3d`, `height_attention`) | `conv3d`: `0.131500`; `heightattn_k4`: `0.076000`. | Avoid for now; it likely damages the map/OCC feature path under this setup. |
+| Section 3 exact variant | Pre-backbone 200x200 adapter, `ProtoOcc_multi_cnn_head_map_neck_pre_adapter.py` | Map mean iou@max `0.154400`. | Not useful standalone, despite the related per-scale adapter having long-run evidence. |
+
+### Current recommendation
+
+Do not stack all nine plan ideas. The most defensible current path is:
+
+```text
+128ch map neck + FPN lateral projection + ASPP + focal_dice weighted map loss
+```
+
+Use `projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck_fpn_lateral_aspp_focal_dice_weighted.py`
+as the next main candidate. If this survives a longer run, the next add-on to
+test should be the related per-scale adapter from `ProtoOcc_multi_cnn_head_map_neck_adapter.py`,
+not the weaker standalone smoke variants.
+
 ---
 
 # 1. Add 200x200 High-Resolution Detail Skip
@@ -1077,5 +1151,3 @@ Before coding, inspect the repository and identify:
 9. Whether occupancy and map branches share the same BEV feature.
 
 Do not assume all class names. Search the codebase first and make the smallest clean modifications necessary.
-
-

@@ -103,12 +103,21 @@ class ProtoOccMapOnly(BEVDet):
             gt_masks_bev = gt_masks_bev.unsqueeze(0)
         return gt_masks_bev.float()
 
+    def _get_map_feature_tensor(self, map_feature):
+        if isinstance(map_feature, dict):
+            map_tensor = map_feature.get('bev_feature', None)
+            if map_tensor is None:
+                raise ValueError('map_feature dict must contain `bev_feature`.')
+            return map_tensor
+        return map_feature
+
     def _check_map_feature_size(self, map_feature, gt_masks_bev):
         if gt_masks_bev is None:
             return
-        if map_feature.shape[-2:] != gt_masks_bev.shape[-2:]:
+        map_tensor = self._get_map_feature_tensor(map_feature)
+        if map_tensor.shape[-2:] != gt_masks_bev.shape[-2:]:
             raise ValueError(
-                f'map feature size {map_feature.shape[-2:]} does not match '
+                f'map feature size {map_tensor.shape[-2:]} does not match '
                 f'gt_masks_bev size {gt_masks_bev.shape[-2:]}.')
 
     def _bev_xy_range(self, value, device, dtype):
@@ -146,7 +155,7 @@ class ProtoOccMapOnly(BEVDet):
         grid = torch.stack((grid_y, grid_x), dim=-1)
         return grid.unsqueeze(0).expand(feature.shape[0], -1, -1, -1)
 
-    def _align_map_feature(self, map_feature):
+    def _align_map_tensor(self, map_feature):
         if self.map_feature_range is None or self.map_feature_size is None:
             return map_feature
         if tuple(map_feature.shape[-2:]) == self.map_feature_size:
@@ -171,6 +180,35 @@ class ProtoOccMapOnly(BEVDet):
             mode='bilinear',
             padding_mode='zeros',
             align_corners=False)
+
+    def _align_map_aux_tensor(self, map_feature):
+        if self.map_feature_range is None or self.map_feature_size is None:
+            return map_feature
+        grid = self._make_bev_grid(
+            map_feature,
+            self.shared_feature_range,
+            self.map_feature_range,
+            map_feature.shape[-2:])
+        return F.grid_sample(
+            map_feature,
+            grid,
+            mode='bilinear',
+            padding_mode='zeros',
+            align_corners=False)
+
+    def _align_map_feature(self, map_feature):
+        if not isinstance(map_feature, dict):
+            return self._align_map_tensor(map_feature)
+
+        aligned = dict(map_feature)
+        aligned['bev_feature'] = self._align_map_tensor(
+            self._get_map_feature_tensor(map_feature))
+        aux_features = map_feature.get('aux_features', {}) or {}
+        aligned['aux_features'] = {
+            str(level): self._align_map_aux_tensor(feature)
+            for level, feature in aux_features.items()
+        }
+        return aligned
 
     def forward_train(self,
                       points=None,
