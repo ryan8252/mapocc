@@ -40,6 +40,7 @@ GPUS="${GPUS:-8}"
 SAMPLES_PER_GPU="${SAMPLES_PER_GPU:-4}"
 WORKERS_PER_GPU="${WORKERS_PER_GPU:-1}"
 LR="${LR:-4e-4}"
+TRAIN_ANN_FILE="${TRAIN_ANN_FILE:-}"
 
 if [ ! -d "${PROTOOCC_DIR}" ]; then
     echo "[ERROR] ProtoOcc directory not found: ${PROTOOCC_DIR}"
@@ -85,6 +86,9 @@ echo "[INFO] Workers per GPU: ${WORKERS_PER_GPU}"
 echo "[INFO] Global batch size: $((GPUS * SAMPLES_PER_GPU))"
 echo "[INFO] Learning rate: ${LR}"
 echo "[INFO] PORT: ${PORT}"
+if [ -n "${TRAIN_ANN_FILE}" ]; then
+    echo "[INFO] Train ann_file override: ${TRAIN_ANN_FILE}"
+fi
 
 SINGULARITY_BIND_ARGS=(--bind /home/u2336262:/home/u2336262)
 if [ -n "${EXTRA_BINDS:-}" ]; then
@@ -106,6 +110,7 @@ export SAMPLES_PER_GPU="$6"
 export WORKERS_PER_GPU="$7"
 export LR="$8"
 export PORT="$9"
+export TRAIN_ANN_FILE="${10}"
 
 export CUDA_HOME=/usr/local/cuda
 export PATH="${ENV_PATH}/bin:${CUDA_HOME}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -126,11 +131,24 @@ python -c "import torch; print(\"[INFO] Torch:\", torch.__version__, torch.versi
 python -c "import mmcv, mmdet, mmseg; print(\"[INFO] OpenMMLab:\", mmcv.__version__, mmdet.__version__, mmseg.__version__)"
 nvcc --version
 
-bash tools/dist_train.sh "${CONFIG}" "${GPUS}" --work-dir "${WORK_DIR}" \
-    --cfg-options \
-    data.samples_per_gpu="${SAMPLES_PER_GPU}" \
-    data.workers_per_gpu="${WORKERS_PER_GPU}" \
+pwd
+ls -ld data data/nuscenes
+ls -lh data/nuscenes/*infos*.pkl
+python -c "import os; from mmcv import Config; cfg = Config.fromfile(os.environ[\"CONFIG\"]); ann = os.environ.get(\"TRAIN_ANN_FILE\") or cfg.data.train.ann_file; print(\"[INFO] Train ann_file:\", ann); assert os.path.exists(ann), \"train ann_file not found: \" + ann"
+python -c "import os; from mmcv import Config; cfg = Config.fromfile(os.environ[\"CONFIG\"]); ann = cfg.data.val.ann_file; print(\"[INFO] Val ann_file:\", ann); assert os.path.exists(ann), \"val ann_file not found: \" + ann"
+
+CFG_OPTIONS=(
+    data.samples_per_gpu="${SAMPLES_PER_GPU}"
+    data.workers_per_gpu="${WORKERS_PER_GPU}"
     optimizer.lr="${LR}"
+)
+
+if [ -n "${TRAIN_ANN_FILE}" ]; then
+    CFG_OPTIONS+=(data.train.ann_file="${TRAIN_ANN_FILE}")
+fi
+
+bash tools/dist_train.sh "${CONFIG}" "${GPUS}" --work-dir "${WORK_DIR}" \
+    --cfg-options "${CFG_OPTIONS[@]}"
 ' _ \
     "${CONDA_ENV}" \
     "${PROTOOCC_DIR}" \
@@ -140,4 +158,5 @@ bash tools/dist_train.sh "${CONFIG}" "${GPUS}" --work-dir "${WORK_DIR}" \
     "${SAMPLES_PER_GPU}" \
     "${WORKERS_PER_GPU}" \
     "${LR}" \
-    "${PORT}"
+    "${PORT}" \
+    "${TRAIN_ANN_FILE}"
