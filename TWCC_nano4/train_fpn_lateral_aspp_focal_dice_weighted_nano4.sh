@@ -30,7 +30,7 @@ module load singularity/4.3.7
 
 CONDA_ENV="${CONDA_ENV:-/home/u2336262/.conda/envs/unimapocc}"
 PROTOOCC_DIR="${PROTOOCC_DIR:-/home/u2336262/Desktop/artc_2026/mapocc}"
-SIF="${SIF:-/home/u2336262/Desktop/artc_2026/containers/cuda117-cudnn8-devel-ubuntu20.04.sif}"
+SIF="${SIF:-/home/u2336262/Desktop/artc_2026/containers/cuda118-cudnn8-devel-ubuntu20.04.sif}"
 
 CONFIG="projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck_fpn_lateral_aspp_focal_dice_weighted.py"
 WORK_DIR="${PROTOOCC_DIR}/work_dirs/ProtoOcc_multi_cnn_head_map_neck_fpn_lateral_aspp_focal_dice_weighted_nano4_h200"
@@ -122,7 +122,7 @@ cd "${PROTOOCC_DIR}"
 
 echo "[INFO] Container CUDA_HOME: ${CUDA_HOME}"
 echo "[INFO] Python: $(python -c "import sys; print(sys.executable)")"
-python -c "import torch; print(\"[INFO] Torch:\", torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+python -c "import torch; print(\"[INFO] Torch:\", torch.__version__, torch.version.cuda, torch.cuda.is_available()); assert torch.version.cuda == \"11.8\", torch.version.cuda; print(torch.ones(1, device=\"cuda\"))"
 python -c "import mmcv, mmdet, mmseg; print(\"[INFO] OpenMMLab:\", mmcv.__version__, mmdet.__version__, mmseg.__version__)"
 nvcc --version
 

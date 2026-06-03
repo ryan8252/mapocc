@@ -2,7 +2,7 @@
 
 # Nano4 / 25a-lgn01 preflight test for the Singularity + unimapocc env.
 # This job does not start training. It only checks container GPU access,
-# Python package versions, CUDA alignment, OpenMMLab imports, mmcv CUDA ops,
+# Python package versions, CUDA 11.8 alignment, OpenMMLab imports, mmcv CUDA ops,
 # project plugin import, config loading, and key file paths.
 #
 # Submit with the Nano4 GPU dev partition:
@@ -29,7 +29,7 @@ module load singularity/4.3.7
 
 CONDA_ENV="${CONDA_ENV:-/home/u2336262/.conda/envs/unimapocc}"
 PROTOOCC_DIR="${PROTOOCC_DIR:-/home/u2336262/Desktop/artc_2026/mapocc}"
-SIF="${SIF:-/home/u2336262/Desktop/artc_2026/containers/cuda117-cudnn8-devel-ubuntu20.04.sif}"
+SIF="${SIF:-/home/u2336262/Desktop/artc_2026/containers/cuda118-cudnn8-devel-ubuntu20.04.sif}"
 CONFIG="${CONFIG:-projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck_fpn_lateral_aspp_focal_dice_weighted.py}"
 PRETRAIN_CKPT="${PRETRAIN_CKPT:-${PROTOOCC_DIR}/ckpts/bevdet-r50-4d-depth-cbgs_depthnet_modify.pth}"
 
@@ -87,7 +87,7 @@ echo "[CHECK] Python executable"
 python -c "import sys; print(sys.executable)"
 
 echo "[CHECK] Torch CUDA"
-python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available(), torch.cuda.get_device_name(0)); print(torch.ones(1, device=\"cuda\"))"
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available(), torch.cuda.get_device_name(0)); assert torch.version.cuda == \"11.8\", torch.version.cuda; print(torch.ones(1, device=\"cuda\"))"
 
 echo "[CHECK] NumPy / NetworkX"
 python -c "import numpy as np, networkx as nx; print(np.__version__, nx.__version__)"
