@@ -19,9 +19,9 @@
 #SBATCH --account=MST113104
 #SBATCH -p normal
 #SBATCH -N 1
-#SBATCH --ntasks-per-node=8
+#SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:8
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=32
 #SBATCH --mem=1536G
 #SBATCH --time=48:00:00
 #SBATCH -o %x-%j.log
@@ -128,13 +128,18 @@ if [ -n "${TRAIN_ANN_FILE}" ]; then
 else
     echo "[INFO] Train ann_file override: disabled, using config default"
 fi
+echo "[CHECK] Host nvidia-smi before container"
+nvidia-smi
 
 SINGULARITY_BIND_ARGS=(--bind /home/u2336262:/home/u2336262)
 if [ -n "${EXTRA_BINDS:-}" ]; then
     SINGULARITY_BIND_ARGS+=(--bind "${EXTRA_BINDS}")
 fi
 
-singularity exec --cleanenv --nv \
+srun --ntasks=1 \
+    --cpus-per-task="${SLURM_CPUS_PER_TASK:-32}" \
+    --gres="gpu:${GPUS}" \
+    singularity exec --cleanenv --nv \
     "${SINGULARITY_BIND_ARGS[@]}" \
     "${SIF}" \
     bash -c '
@@ -176,6 +181,8 @@ export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 cd "${PROTOOCC_DIR}"
 mkdir -p "${WORK_DIR}"
 
+echo "[CHECK] Container nvidia-smi"
+nvidia-smi
 echo "[CHECK] Container CUDA_HOME: ${CUDA_HOME}"
 echo "[CHECK] Python: $(python -c "import sys; print(sys.executable)")"
 python -c "import torch; print(\"[CHECK] Torch:\", torch.__version__, torch.version.cuda, torch.cuda.is_available()); assert torch.version.cuda == \"11.8\", torch.version.cuda; print(torch.ones(1, device=\"cuda\"))"
