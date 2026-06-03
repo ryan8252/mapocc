@@ -15,9 +15,10 @@ _base_ = ['./ProtoOcc_multi_cnn_head_map_neck.py']
 #   map supervision:       [-50, 50] x/y, 0.5m -> BEVFusion 200 x 200
 #   LSS depth:             [1.0, 60.0] m, 0.5m  -> 118 bins (was 45m / 88 bins)
 #
-# NOTE: the pretrained depthnet in `load_from` was trained with 88 depth bins; its
-# final depth-prediction layer will be skipped on load (shape mismatch) and relearned,
-# so the depth loss will start higher for the first few epochs. This is expected.
+# NOTE: the current `load_from` checkpoint already has a 118-bin
+# `depth_net.depth_conv.4`, so the final depth-prediction layer is compatible
+# with this 60m setup. If this config is paired with a true 88-bin checkpoint,
+# that final layer must be filtered or reinitialized.
 
 occ_point_cloud_range = [-40.0, -40.0, -1.0, 40.0, 40.0, 5.4]
 shared_feature_range = [-51.2, -51.2, -1.0, 51.2, 51.2, 5.4]
