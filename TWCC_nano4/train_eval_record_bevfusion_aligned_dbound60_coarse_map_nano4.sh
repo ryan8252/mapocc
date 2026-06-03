@@ -131,7 +131,10 @@ fi
 echo "[CHECK] Host nvidia-smi before container"
 nvidia-smi
 
-SINGULARITY_BIND_ARGS=(--bind /home/u2336262:/home/u2336262)
+SINGULARITY_BIND_ARGS=(
+    --bind /home/u2336262:/home/u2336262
+    --bind /work:/work
+)
 if [ -n "${EXTRA_BINDS:-}" ]; then
     SINGULARITY_BIND_ARGS+=(--bind "${EXTRA_BINDS}")
 fi

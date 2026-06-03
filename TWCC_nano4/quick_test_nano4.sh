@@ -1,18 +1,32 @@
 #!/bin/bash
 
-# Nano4 / 25a-lgn01 generic quick-test launcher for ProtoOcc configs.
+# =====================================================================
+# Nano4 / 25a-lgn01 Singularity sbatch generic QUICK-TEST launcher.
 #
-# Only edit this line for the common case:
-CONFIG_NAME="${CONFIG_NAME:-ProtoOcc_multi_cnn_head_map_neck_bevfusion_aligned_dbound60_coarse_map.py}"
+# 用法 (你唯一要改的就是 config 名稱)：
 #
-# Submit from the ProtoOcc repo on Nano4:
-#   sbatch TWCC_nano4/quick_test_config_nano4.sh
+#   方法 A — 直接當參數丟給 sbatch（推薦，不用改檔案）：
+#       sbatch TWCC_nano4/quick_test_nano4.sh ProtoOcc_multi_cnn_head_map_neck_fpn_lateral_aspp
 #
-# This always runs a quick smoke test:
-#   1 epoch, 1/4 nuScenes train split, samples_per_gpu=2,
-#   train -> eval epoch_1_ema.pth -> result.md with raw eval output.
+#   方法 B — 改下面的 CONFIG_NAME_DEFAULT 這一行，然後：
+#       sbatch TWCC_nano4/quick_test_nano4.sh
+#
+# config 名稱可以是：
+#   - 純名稱            : ProtoOcc_multi_cnn_head_map_neck_fpn_lateral_aspp
+#   - 加 .py            : ProtoOcc_multi_cnn_head_map_neck_fpn_lateral_aspp.py
+#   - 完整相對路徑      : projects/configs/ProtoOcc/xxx.py
+# 三種都會自動正規化。
+#
+# 預設為 smoke 快測：1 epoch + nuScenes train 1/4 split，train -> eval -> result.md。
+# 每個 config 會自動產生獨立 work_dir，互不覆蓋。
+#
+# 跑完整訓練：
+#   RUN_MODE=full sbatch --export=ALL TWCC_nano4/quick_test_nano4.sh <config>
+#
+# Quick-test 預設資源：8 GPUs * 2 samples/GPU = 16, workers/GPU = 1, lr = 2e-4。
+# =====================================================================
 
-#SBATCH -J quick_cfg_test
+#SBATCH -J quick_test
 #SBATCH --account=MST113104
 #SBATCH -p normal
 #SBATCH -N 1
@@ -20,7 +34,7 @@ CONFIG_NAME="${CONFIG_NAME:-ProtoOcc_multi_cnn_head_map_neck_bevfusion_aligned_d
 #SBATCH --gres=gpu:8
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=1536G
-#SBATCH --time=24:00:00
+#SBATCH --time=48:00:00
 #SBATCH -o %x-%j.log
 #SBATCH -e %x-%j.log
 
@@ -29,27 +43,52 @@ set -euo pipefail
 module purge
 module load singularity/4.3.7
 
+# ---------------------------------------------------------------------
+# 只要改這一行（或用 sbatch quick_test_nano4.sh <config> 當參數覆蓋它）
+# ---------------------------------------------------------------------
+CONFIG_NAME_DEFAULT="ProtoOcc_multi_cnn_head_map_neck_bevfusion_aligned_dbound60_coarse_map"
+
 CONDA_ENV="${CONDA_ENV:-/home/u2336262/.conda/envs/unimapocc}"
 PROTOOCC_DIR="${PROTOOCC_DIR:-/home/u2336262/Desktop/artc_2026/mapocc}"
 SIF="${SIF:-/home/u2336262/Desktop/artc_2026/containers/cuda118-cudnn8-devel-ubuntu20.04.sif}"
 
-CONFIG_DIR="${CONFIG_DIR:-projects/configs/ProtoOcc}"
-if [[ "${CONFIG_NAME}" == */* ]]; then
-    CONFIG="${CONFIG_NAME}"
-else
-    CONFIG="${CONFIG_DIR}/${CONFIG_NAME}"
-fi
-CONFIG_BASENAME="$(basename "${CONFIG}")"
-CONFIG_STEM="${CONFIG_BASENAME%.py}"
+# 解析 config：可吃 $1 參數 -> 環境變數 CONFIG -> 上面的預設值。
+CONFIG_INPUT="${1:-${CONFIG:-${CONFIG_NAME_DEFAULT}}}"
+CONFIG_INPUT="${CONFIG_INPUT%.py}"           # 去掉結尾 .py（如果有）
+case "${CONFIG_INPUT}" in
+    */*) CONFIG="${CONFIG_INPUT}.py" ;;                                   # 已含路徑
+    *)   CONFIG="projects/configs/ProtoOcc/${CONFIG_INPUT}.py" ;;         # 純名稱
+esac
+CONFIG_TAG="$(basename "${CONFIG}" .py)"
 
-WORK_DIR="${WORK_DIR:-${PROTOOCC_DIR}/work_dirs/quicktest_${CONFIG_STEM}_1quarter_nano4_h200}"
+PRETRAIN_CKPT="${PRETRAIN_CKPT:-${PROTOOCC_DIR}/ckpts/bevdet-r50-4d-depth-cbgs_depthnet_modify.pth}"
+
+RUN_MODE="${RUN_MODE:-smoke}"
+case "${RUN_MODE}" in
+    smoke)
+        DEFAULT_EPOCHS=1
+        DEFAULT_TRAIN_ANN_FILE="data/nuscenes/bevdetv2-nuscenes_infos_train_1quarter_seed0.pkl"
+        DEFAULT_WORK_DIR="${PROTOOCC_DIR}/work_dirs/quick_test_${CONFIG_TAG}_1quarter_nano4"
+        ;;
+    full)
+        DEFAULT_EPOCHS=24
+        DEFAULT_TRAIN_ANN_FILE=""
+        DEFAULT_WORK_DIR="${PROTOOCC_DIR}/work_dirs/${CONFIG_TAG}_nano4_full"
+        ;;
+    *)
+        echo "[ERROR] RUN_MODE must be smoke or full, got: ${RUN_MODE}"
+        exit 1
+        ;;
+esac
+
+WORK_DIR="${WORK_DIR:-${DEFAULT_WORK_DIR}}"
 GPUS="${GPUS:-8}"
 SAMPLES_PER_GPU="${SAMPLES_PER_GPU:-2}"
 WORKERS_PER_GPU="${WORKERS_PER_GPU:-1}"
 LR="${LR:-2e-4}"
-EPOCHS="${EPOCHS:-1}"
-TRAIN_ANN_FILE="${TRAIN_ANN_FILE:-data/nuscenes/bevdetv2-nuscenes_infos_train_1quarter_seed0.pkl}"
-CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-1}"
+EPOCHS="${EPOCHS:-${DEFAULT_EPOCHS}}"
+TRAIN_ANN_FILE="${TRAIN_ANN_FILE:-${DEFAULT_TRAIN_ANN_FILE}}"
+CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-${EPOCHS}}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-999}"
 EVAL_TIMEOUT_MIN="${EVAL_TIMEOUT_MIN:-90}"
 FORCE_TRAIN="${FORCE_TRAIN:-0}"
@@ -78,7 +117,12 @@ fi
 
 if [ ! -f "${PROTOOCC_DIR}/${CONFIG}" ]; then
     echo "[ERROR] Config not found: ${PROTOOCC_DIR}/${CONFIG}"
-    echo "[HINT] Edit CONFIG_NAME near the top of this script."
+    echo "[HINT] 可用的 config 列在: ${PROTOOCC_DIR}/projects/configs/ProtoOcc/"
+    exit 1
+fi
+
+if [ ! -f "${PRETRAIN_CKPT}" ]; then
+    echo "[ERROR] Pretrained checkpoint not found: ${PRETRAIN_CKPT}"
     exit 1
 fi
 
@@ -90,7 +134,8 @@ echo "[INFO] SLURM_JOB_NODELIST: ${SLURM_JOB_NODELIST:-n/a}"
 echo "[INFO] ProtoOcc dir: ${PROTOOCC_DIR}"
 echo "[INFO] Conda env: ${CONDA_ENV}"
 echo "[INFO] Singularity image: ${SIF}"
-echo "[INFO] Config name: ${CONFIG_NAME}"
+echo "[INFO] Run mode: ${RUN_MODE}"
+echo "[INFO] Config tag: ${CONFIG_TAG}"
 echo "[INFO] Config: ${CONFIG}"
 echo "[INFO] Work dir: ${WORK_DIR}"
 echo "[INFO] GPUs: ${GPUS}"
@@ -99,14 +144,23 @@ echo "[INFO] Workers per GPU: ${WORKERS_PER_GPU}"
 echo "[INFO] Global batch size: $((GPUS * SAMPLES_PER_GPU))"
 echo "[INFO] Learning rate: ${LR}"
 echo "[INFO] Epochs: ${EPOCHS}"
-echo "[INFO] Train ann_file override: ${TRAIN_ANN_FILE}"
+echo "[INFO] Checkpoint interval: ${CHECKPOINT_INTERVAL}"
+echo "[INFO] Eval interval during train: ${EVAL_INTERVAL}"
 echo "[INFO] Train port: ${TRAIN_PORT}"
 echo "[INFO] Eval port: ${EVAL_PORT}"
 echo "[INFO] Eval timeout: ${EVAL_TIMEOUT_MIN}m"
+if [ -n "${TRAIN_ANN_FILE}" ]; then
+    echo "[INFO] Train ann_file override: ${TRAIN_ANN_FILE}"
+else
+    echo "[INFO] Train ann_file override: disabled, using config default"
+fi
 echo "[CHECK] Host nvidia-smi before container"
 nvidia-smi
 
-SINGULARITY_BIND_ARGS=(--bind /home/u2336262:/home/u2336262)
+SINGULARITY_BIND_ARGS=(
+    --bind /home/u2336262:/home/u2336262
+    --bind /work:/work
+)
 if [ -n "${EXTRA_BINDS:-}" ]; then
     SINGULARITY_BIND_ARGS+=(--bind "${EXTRA_BINDS}")
 fi
@@ -139,7 +193,8 @@ export TRAIN_STDOUT="${16}"
 export EVAL_STDOUT="${17}"
 export RESULT_MD="${18}"
 export FORCE_TRAIN="${19}"
-export CONFIG_NAME="${20}"
+export RUN_MODE="${20}"
+export PRETRAIN_CKPT="${21}"
 
 export CUDA_HOME=/usr/local/cuda
 export PATH="${ENV_PATH}/bin:${CUDA_HOME}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -162,10 +217,12 @@ echo "[CHECK] Python: $(python -c "import sys; print(sys.executable)")"
 python -c "import torch; print(\"[CHECK] Torch:\", torch.__version__, torch.version.cuda, torch.cuda.is_available()); assert torch.version.cuda == \"11.8\", torch.version.cuda; print(torch.ones(1, device=\"cuda\"))"
 python -c "import mmcv, mmdet, mmseg; print(\"[CHECK] OpenMMLab:\", mmcv.__version__, mmdet.__version__, mmseg.__version__)"
 python -c "import importlib; importlib.import_module(\"projects.mmdet3d_plugin\"); print(\"[CHECK] projects.mmdet3d_plugin OK\")"
-python -c "import os; from mmcv import Config; cfg = Config.fromfile(os.environ[\"CONFIG\"]); ann = os.environ[\"TRAIN_ANN_FILE\"]; print(\"[CHECK] train ann_file:\", ann); assert os.path.exists(ann), \"train ann_file not found: \" + ann; val = cfg.data.val.ann_file; print(\"[CHECK] val ann_file:\", val); assert os.path.exists(val), \"val ann_file not found: \" + val; load_from = cfg.get(\"load_from\", None); print(\"[CHECK] load_from:\", load_from); assert (not load_from) or os.path.exists(load_from), \"load_from not found: \" + str(load_from)"
+
+python -c "import os; from mmcv import Config; cfg = Config.fromfile(os.environ[\"CONFIG\"]); ann = os.environ.get(\"TRAIN_ANN_FILE\") or cfg.data.train.ann_file; print(\"[CHECK] train ann_file:\", ann); assert os.path.exists(ann), \"train ann_file not found: \" + ann"
+python -c "import os; from mmcv import Config; cfg = Config.fromfile(os.environ[\"CONFIG\"]); ann = cfg.data.val.ann_file; print(\"[CHECK] val ann_file:\", ann); assert os.path.exists(ann), \"val ann_file not found: \" + ann"
+python -c "import os; assert os.path.exists(os.environ[\"PRETRAIN_CKPT\"]), os.environ[\"PRETRAIN_CKPT\"]; print(\"[CHECK] pretrain ckpt OK:\", os.environ[\"PRETRAIN_CKPT\"])"
 
 CFG_OPTIONS=(
-    data.train.ann_file="${TRAIN_ANN_FILE}"
     data.samples_per_gpu="${SAMPLES_PER_GPU}"
     data.workers_per_gpu="${WORKERS_PER_GPU}"
     optimizer.lr="${LR}"
@@ -173,6 +230,10 @@ CFG_OPTIONS=(
     evaluation.interval="${EVAL_INTERVAL}"
     checkpoint_config.interval="${CHECKPOINT_INTERVAL}"
 )
+
+if [ -n "${TRAIN_ANN_FILE}" ]; then
+    CFG_OPTIONS+=(data.train.ann_file="${TRAIN_ANN_FILE}")
+fi
 
 select_ckpt() {
     local exact_ema="${WORK_DIR}/epoch_${EPOCHS}_ema.pth"
@@ -214,7 +275,6 @@ result_md = Path(os.environ["RESULT_MD"])
 train_stdout = Path(os.environ["TRAIN_STDOUT"])
 eval_stdout = Path(os.environ["EVAL_STDOUT"])
 config = os.environ["CONFIG"]
-config_name = os.environ["CONFIG_NAME"]
 ckpt = os.environ.get("RESULT_CKPT", "")
 train_status = os.environ.get("RESULT_TRAIN_STATUS", "unknown")
 eval_status = os.environ.get("RESULT_EVAL_STATUS", "unknown")
@@ -290,7 +350,7 @@ map_rows = [(k, f"{v:.6f}") for k, v in sorted(maps.items()) if k != mean_key]
 if mean_key in maps:
     map_rows.append(("**mean**", f"**{maps[mean_key]:.6f}**"))
 
-title = f"# Quick Test Result - {work_dir.name}"
+title = f"# Eval Result - {work_dir.name}"
 if result_md.exists():
     title = f"## Rerun - {datetime.now().strftime(time_fmt)}"
 
@@ -309,12 +369,13 @@ Date: {datetime.now().strftime(date_fmt)}
 
 ## Run
 
-- Config name: {config_name}
 - Config: {config}
 - Work dir: {os.environ["WORK_DIR"]}
+- Run mode: {os.environ["RUN_MODE"]}
+- Protocol: quick test ({os.environ["RUN_MODE"]} mode); train -> eval -> result.md
 - Train status: {train_status}
 - Eval status: {eval_status}
-- Train split override: {os.environ["TRAIN_ANN_FILE"]}
+- Train split override: {os.environ.get("TRAIN_ANN_FILE") or "config default"}
 - Train schedule: {os.environ["EPOCHS"]} epoch, samples_per_gpu={os.environ["SAMPLES_PER_GPU"]}, workers_per_gpu={os.environ["WORKERS_PER_GPU"]}, lr={os.environ["LR"]}
 - Train stdout: {train_stdout}
 - Eval checkpoint: {ckpt or "n/a"}
@@ -434,4 +495,5 @@ exit "${EVAL_CODE}"
     "${EVAL_STDOUT}" \
     "${RESULT_MD}" \
     "${FORCE_TRAIN}" \
-    "${CONFIG_NAME}"
+    "${RUN_MODE}" \
+    "${PRETRAIN_CKPT}"
