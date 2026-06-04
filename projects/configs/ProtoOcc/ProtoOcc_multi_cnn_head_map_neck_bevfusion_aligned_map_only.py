@@ -8,6 +8,10 @@ _base_ = ['./ProtoOcc_multi_cnn_head_map_neck_map_only.py']
 #   shared feature: +-51.2m / 0.4m -> 256 x 256
 #   map supervision: +-50m / 0.5m  -> BEVFusion 200 x 200 (grid_sample aligned)
 # No occupancy branch -> pure map ceiling.
+#
+# Use the same focal-only map objective as the aligned focal128 MTL baseline so
+# this run answers the intended upper-bound question instead of testing the old
+# BCE+Dice map-only objective.
 
 dataset_type = 'NuScenesDatasetMultitask'
 nusc_version = 'v1.0-trainval'
@@ -88,6 +92,17 @@ model = dict(
     map_feature_range=map_feature_range,
     map_feature_size=map_feature_size,
     img_view_transformer=dict(grid_config=grid_config_3dpool),
+    map_loss_weight=128.0,
+    bev_seg_head=dict(
+        loss_bce=None,
+        loss_dice=None,
+        loss_focal=dict(
+            type='BinaryMaskFocalLoss',
+            use_sigmoid=True,
+            gamma=2.0,
+            alpha=-1.0,
+            reduction='mean',
+            loss_weight=1.0)),
 )
 
 bda_aug_conf = dict(
