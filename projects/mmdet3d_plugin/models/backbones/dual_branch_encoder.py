@@ -6,6 +6,14 @@ import torch.utils.checkpoint as cp
 from mmdet3d.models import builder
 import torch
 
+
+def _gate_logit(init_value):
+    init_value = float(init_value)
+    init_value = min(max(init_value, 1e-4), 1.0 - 1e-4)
+    value = torch.tensor(init_value / (1.0 - init_value))
+    return torch.log(value).item()
+
+
 class voxelize_module(nn.Module):
     def __init__(
             self,
@@ -34,15 +42,26 @@ class PerScaleMapResidualAdapter(nn.Module):
                  in_channels=[160, 320, 640],
                  residual_scale=1.0,
                  with_cp=False,
-                 detach_input=False):
+                 detach_input=False,
+                 learnable_residual_gate=False,
+                 residual_gate_init=0.1):
         super().__init__()
         self.in_channels = list(in_channels)
         self.residual_scale = residual_scale
         self.with_cp = with_cp
         self.detach_input = detach_input
+        self.learnable_residual_gate = bool(learnable_residual_gate)
         self.blocks = nn.ModuleList([
             self._make_block(channels) for channels in self.in_channels
         ])
+        if self.learnable_residual_gate:
+            gate_logit = _gate_logit(residual_gate_init)
+            self.residual_gates = nn.ParameterList([
+                nn.Parameter(torch.full((1,), gate_logit))
+                for _ in self.in_channels
+            ])
+        else:
+            self.residual_gates = None
 
     def _make_block(self, channels):
         block = nn.Sequential(
@@ -77,13 +96,20 @@ class PerScaleMapResidualAdapter(nn.Module):
                 f'Expected {len(self.blocks)} BEV feature scales, got {len(feats)}.')
 
         outputs = []
-        for feat, block, channels in zip(feats, self.blocks, self.in_channels):
+        gates = (
+            self.residual_gates if self.residual_gates is not None
+            else [None] * len(self.blocks))
+        for feat, block, channels, gate in zip(
+                feats, self.blocks, self.in_channels, gates):
             if feat.shape[1] != channels:
                 raise ValueError(
                     f'Expected {channels} channels, got {feat.shape[1]}.')
             source = feat.detach() if self.detach_input else feat
             residual = self._forward_block(block, source)
-            outputs.append(source + self.residual_scale * residual)
+            scale = self.residual_scale
+            if gate is not None:
+                scale = scale * torch.sigmoid(gate).view(1, 1, 1, 1)
+            outputs.append(source + scale * residual)
 
         return tuple(outputs) if isinstance(feats, tuple) else outputs
 
@@ -182,10 +208,16 @@ class MapHFMFusionLayer(nn.Module):
     only instantiated internally by ``Dual_Branch_Encoder``.
     """
 
-    def __init__(self, bev_channels, voxel_channels, hidden_channels=None):
+    def __init__(self,
+                 bev_channels,
+                 voxel_channels,
+                 hidden_channels=None,
+                 learnable_residual_gate=False,
+                 residual_gate_init=0.1):
         super().__init__()
         self.bev_channels = bev_channels
         self.voxel_channels = voxel_channels
+        self.learnable_residual_gate = bool(learnable_residual_gate)
         hidden_channels = hidden_channels or bev_channels
         self.fusion = nn.Sequential(
             nn.Conv2d(
@@ -206,6 +238,11 @@ class MapHFMFusionLayer(nn.Module):
         nn.init.zeros_(self.fusion[-1].weight)
         if self.fusion[-1].bias is not None:
             nn.init.zeros_(self.fusion[-1].bias)
+        if self.learnable_residual_gate:
+            self.residual_gate = nn.Parameter(
+                torch.full((1,), _gate_logit(residual_gate_init)))
+        else:
+            self.residual_gate = None
 
     def _collapse_voxel_bev(self, voxel_feature):
         if voxel_feature.dim() != 5:
@@ -239,6 +276,8 @@ class MapHFMFusionLayer(nn.Module):
                 mode='bilinear',
                 align_corners=True)
         delta = self.fusion(torch.cat([bev_feature, voxel_bev], dim=1))
+        if self.residual_gate is not None:
+            delta = torch.sigmoid(self.residual_gate).view(1, 1, 1, 1) * delta
         return bev_feature + delta
 
 
@@ -402,6 +441,8 @@ class Dual_Branch_Encoder(nn.Module):
         use_map_hfm=False,
         map_hfm_lower_source='vox3',
         map_hfm_with_cp=None,
+        map_hfm_learnable_residual_gate=False,
+        map_hfm_residual_gate_init=0.1,
         map_highres_skip=False,
         map_highres_hidden=128,
         map_highres_detach=True,
@@ -432,6 +473,9 @@ class Dual_Branch_Encoder(nn.Module):
                 f'got {map_hfm_lower_source!r}.')
         self.map_hfm_lower_source = map_hfm_lower_source
         self.map_hfm_with_cp = with_cp if map_hfm_with_cp is None else map_hfm_with_cp
+        self.map_hfm_learnable_residual_gate = bool(
+            map_hfm_learnable_residual_gate)
+        self.map_hfm_residual_gate_init = float(map_hfm_residual_gate_init)
         self.map_highres_skip = map_highres_skip
         self.map_highres_detach = map_highres_detach
         valid_highres_fusions = ('add', 'concat', 'gated')
@@ -548,9 +592,21 @@ class Dual_Branch_Encoder(nn.Module):
         if self.use_map_hfm:
             lower_vox_channels = vox_feat3
             self.map_hfm_layers = nn.ModuleList([
-                MapHFMFusionLayer(bev_feat_ch1, vox_feat2),
-                MapHFMFusionLayer(bev_feat_ch2, vox_feat2),
-                MapHFMFusionLayer(bev_feat_ch3, lower_vox_channels),
+                MapHFMFusionLayer(
+                    bev_feat_ch1,
+                    vox_feat2,
+                    learnable_residual_gate=self.map_hfm_learnable_residual_gate,
+                    residual_gate_init=self.map_hfm_residual_gate_init),
+                MapHFMFusionLayer(
+                    bev_feat_ch2,
+                    vox_feat2,
+                    learnable_residual_gate=self.map_hfm_learnable_residual_gate,
+                    residual_gate_init=self.map_hfm_residual_gate_init),
+                MapHFMFusionLayer(
+                    bev_feat_ch3,
+                    lower_vox_channels,
+                    learnable_residual_gate=self.map_hfm_learnable_residual_gate,
+                    residual_gate_init=self.map_hfm_residual_gate_init),
             ])
         else:
             self.map_hfm_layers = None

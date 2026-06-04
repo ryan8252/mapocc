@@ -15,6 +15,13 @@ def _zero_init_conv(module):
             nn.init.constant_(module.bias, 0)
 
 
+def _gate_logit(init_value):
+    init_value = float(init_value)
+    init_value = min(max(init_value, 1e-4), 1.0 - 1e-4)
+    value = torch.tensor(init_value / (1.0 - init_value))
+    return torch.log(value).item()
+
+
 @NECKS.register_module()
 class FPN_LSS(nn.Module):
     def __init__(self,
@@ -89,6 +96,8 @@ class Custom_FPN_LSS(nn.Module):
                  use_fpn_global_context=False,
                  fpn_global_context_type='aspp',
                  fpn_context_channels=None,
+                 fpn_context_learnable_gate=False,
+                 fpn_context_gate_init=0.1,
                  return_map_aux_features=False,
                  map_aux_feature_levels=('100', '50')):
         super(Custom_FPN_LSS, self).__init__()
@@ -102,6 +111,8 @@ class Custom_FPN_LSS(nn.Module):
         self.map_aux_feature_levels = tuple(str(level)
                                             for level in map_aux_feature_levels)
         self.fpn_global_context_type = str(fpn_global_context_type).lower()
+        self.fpn_context_learnable_gate = bool(fpn_context_learnable_gate)
+        self.fpn_context_gate_init = float(fpn_context_gate_init)
         self.fpn_projection_channels = int(fpn_projection_channels)
         self.up = nn.Upsample(
             scale_factor=scale_factor, mode='bilinear', align_corners=True)
@@ -117,7 +128,11 @@ class Custom_FPN_LSS(nn.Module):
         if self.use_fpn_global_context:
             low_channels = self.fpn_lateral_in_channels[2]
             self.fpn_global_context = self._build_global_context(
-                low_channels, fpn_context_channels, norm_cfg)
+                low_channels,
+                fpn_context_channels,
+                norm_cfg,
+                self.fpn_context_learnable_gate,
+                self.fpn_context_gate_init)
         else:
             self.fpn_global_context = None
 
@@ -234,25 +249,40 @@ class Custom_FPN_LSS(nn.Module):
                 '`fpn_lateral_in_channels` explicitly.')
         return (level0_channels, level1_channels, level2_channels)
 
-    def _build_global_context(self, in_channels, context_channels, norm_cfg):
+    def _build_global_context(self,
+                              in_channels,
+                              context_channels,
+                              norm_cfg,
+                              learnable_gate,
+                              gate_init):
         if self.fpn_global_context_type == 'aspp':
             return _FPNASPPContext(
                 in_channels,
                 context_channels=context_channels,
-                norm_cfg=norm_cfg)
+                norm_cfg=norm_cfg,
+                learnable_residual_gate=learnable_gate,
+                residual_gate_init=gate_init)
         if self.fpn_global_context_type == 'ppm':
             return _FPNPPMContext(
                 in_channels,
                 context_channels=context_channels,
-                norm_cfg=norm_cfg)
+                norm_cfg=norm_cfg,
+                learnable_residual_gate=learnable_gate,
+                residual_gate_init=gate_init)
         raise ValueError(
             'Unsupported fpn_global_context_type: '
             f'{self.fpn_global_context_type}. Expected "aspp" or "ppm".')
 
 
 class _FPNASPPContext(nn.Module):
-    def __init__(self, in_channels, context_channels=None, norm_cfg=dict(type='BN')):
+    def __init__(self,
+                 in_channels,
+                 context_channels=None,
+                 norm_cfg=dict(type='BN'),
+                 learnable_residual_gate=False,
+                 residual_gate_init=0.1):
         super(_FPNASPPContext, self).__init__()
+        self.learnable_residual_gate = bool(learnable_residual_gate)
         if context_channels is None:
             context_channels = max(in_channels // 4, 32)
         self.branches = nn.ModuleList()
@@ -282,6 +312,11 @@ class _FPNASPPContext(nn.Module):
             norm_cfg=None,
             act_cfg=None)
         self.project.apply(_zero_init_conv)
+        if self.learnable_residual_gate:
+            self.residual_gate = nn.Parameter(
+                torch.full((1,), _gate_logit(residual_gate_init)))
+        else:
+            self.residual_gate = None
 
     def forward(self, x):
         out = [branch(x) for branch in self.branches]
@@ -290,7 +325,10 @@ class _FPNASPPContext(nn.Module):
         pooled = F.interpolate(
             pooled, size=x.shape[2:], mode='bilinear', align_corners=True)
         out.append(pooled)
-        return x + self.project(torch.cat(out, dim=1))
+        delta = self.project(torch.cat(out, dim=1))
+        if self.residual_gate is not None:
+            delta = torch.sigmoid(self.residual_gate).view(1, 1, 1, 1) * delta
+        return x + delta
 
 
 class _FPNPPMContext(nn.Module):
@@ -298,8 +336,11 @@ class _FPNPPMContext(nn.Module):
                  in_channels,
                  context_channels=None,
                  pool_scales=(1, 2, 3, 6),
-                 norm_cfg=dict(type='BN')):
+                 norm_cfg=dict(type='BN'),
+                 learnable_residual_gate=False,
+                 residual_gate_init=0.1):
         super(_FPNPPMContext, self).__init__()
+        self.learnable_residual_gate = bool(learnable_residual_gate)
         if context_channels is None:
             context_channels = max(in_channels // len(pool_scales), 32)
         self.pool_scales = tuple(pool_scales)
@@ -322,6 +363,11 @@ class _FPNPPMContext(nn.Module):
             norm_cfg=None,
             act_cfg=None)
         self.project.apply(_zero_init_conv)
+        if self.learnable_residual_gate:
+            self.residual_gate = nn.Parameter(
+                torch.full((1,), _gate_logit(residual_gate_init)))
+        else:
+            self.residual_gate = None
 
     def forward(self, x):
         out = [x]
@@ -331,4 +377,7 @@ class _FPNPPMContext(nn.Module):
             pooled = F.interpolate(
                 pooled, size=x.shape[2:], mode='bilinear', align_corners=True)
             out.append(pooled)
-        return x + self.project(torch.cat(out, dim=1))
+        delta = self.project(torch.cat(out, dim=1))
+        if self.residual_gate is not None:
+            delta = torch.sigmoid(self.residual_gate).view(1, 1, 1, 1) * delta
+        return x + delta

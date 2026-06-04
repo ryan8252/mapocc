@@ -1151,3 +1151,178 @@ Before coding, inspect the repository and identify:
 9. Whether occupancy and map branches share the same BEV feature.
 
 Do not assume all class names. Search the codebase first and make the smallest clean modifications necessary.
+
+---
+
+# 10. Thin-Class Boundary Auxiliary Target
+
+## Motivation
+
+The useful current path already improves map features and map loss, but the
+remaining decision target is still concentrated in thin classes:
+
+```text
+ped_crossing
+stop_line
+divider
+```
+
+These classes can occupy only 1 to 3 pixels. A normal final-mask loss asks the
+model to learn exact thin geometry immediately, which is brittle early in
+training and can leave thin logits near zero.
+
+## Required Implementation
+
+Keep the final `bev_seg_logits` supervised by the original map GT. Add only an
+auxiliary thin-region target:
+
+```text
+gt_masks_bev:            (B, 6, 200, 200)
+thin_gt = gt[:, [1,3,5]]
+thin_region = maxpool(thin_gt, kernel=2*d+1, stride=1, padding=d)
+```
+
+Use `thin_region` as an auxiliary target on the same thin-class logits. The
+main target remains the original, non-dilated GT.
+
+## Config Flags
+
+```python
+use_thin_boundary_aux_loss = True
+thin_boundary_class_indices = [1, 3, 5]
+thin_boundary_dilation = 2
+thin_boundary_loss_weight = 0.2
+thin_boundary_use_focal = True
+thin_boundary_use_dice = True
+```
+
+## Expected Loss Terms
+
+```text
+loss_map_focal
+loss_map_dice
+loss_map_thin_boundary_focal
+loss_map_thin_boundary_dice
+```
+
+## Ablation
+
+Compare:
+
+```text
+combined candidate
+combined candidate + thin boundary auxiliary target
+```
+
+Judge mainly on `ped_crossing`, `stop_line`, and `divider`, including fixed
+thresholds, not only optimistic `iou@max`.
+
+---
+
+# 11. Learnable Residual Gates for Map Add-ons
+
+## Motivation
+
+The useful map add-ons are residual or additive:
+
+```text
+MapHFMFusionLayer:          bev + delta_hfm
+PerScaleMapResidualAdapter: feat + delta_adapter
+FPN ASPP context:           x + delta_aspp
+```
+
+The residual shape is safe, but each add-on currently has a fixed residual
+strength. A learnable gate lets the model decide how much geometry/context/refine
+signal to use per module.
+
+## Required Implementation
+
+Add optional learnable gates at the residual add sites:
+
+```python
+out = source + sigmoid(gate) * delta
+```
+
+Initialize gates to a small nonzero value such as `0.1`. Keep the residual
+projection itself zero-initialized so step-0 behavior stays identical to the
+ungated combined candidate.
+
+## Config Flags
+
+```python
+map_hfm_learnable_residual_gate = True
+map_hfm_residual_gate_init = 0.1
+
+map_residual_adapter = dict(
+    learnable_residual_gate=True,
+    residual_gate_init=0.1)
+
+map_bev_encoder_neck = dict(
+    fpn_context_learnable_gate=True,
+    fpn_context_gate_init=0.1)
+```
+
+## Ablation
+
+Compare:
+
+```text
+combined candidate
+combined candidate + gates on HFM / adapter / ASPP
+```
+
+Debug by logging or inspecting the learned sigmoid gate values after training.
+
+---
+
+# 12. Thin-Class ROI Residual Refinement
+
+## Motivation
+
+A full query decoder or heavy segmentation head risks replacing the protected
+`128ch map neck -> BEVSegHead` path. A smaller option is to refine only the
+regions where thin classes are likely to exist.
+
+## Required Implementation
+
+Use the current thin-class logits to build an ROI:
+
+```text
+thin_score = max(sigmoid(logits[:, thin_indices]), dim=class)
+roi = thin_score >= threshold
+roi = roi OR topk(thin_score, min_pixels)
+roi = maxpool(roi, dilation)
+```
+
+The ROI must be derived from predictions, not GT, so train and test behavior
+match. Use detached logits to build the ROI, then apply a zero-init residual
+refiner on the decoded map feature:
+
+```python
+delta_thin_logits = thin_roi_refiner(decoded_feature) * roi
+logits[:, thin_indices] = logits[:, thin_indices] + delta_thin_logits
+```
+
+## Config Flags
+
+```python
+use_thin_roi_refinement = True
+thin_roi_class_indices = [1, 3, 5]
+thin_roi_threshold = 0.35
+thin_roi_min_pixels = 64
+thin_roi_dilation = 2
+thin_roi_hidden_channels = 64
+```
+
+## Ablation
+
+Compare:
+
+```text
+combined candidate
+combined candidate + thin ROI residual refinement
+```
+
+Main failure mode: the ROI becomes empty or too sparse early in training. Keep
+the top-k fallback enabled so every sample has at least a small refinement
+region.

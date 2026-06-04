@@ -103,6 +103,18 @@ class BEVSegHead(BaseModule):
                  map_aux_downsample='maxpool',
                  map_aux_in_channels=None,
                  map_aux_hidden_channels=None,
+                 use_thin_boundary_aux_loss=False,
+                 thin_boundary_class_indices=None,
+                 thin_boundary_dilation=2,
+                 thin_boundary_loss_weight=0.2,
+                 thin_boundary_use_focal=True,
+                 thin_boundary_use_dice=True,
+                 use_thin_roi_refinement=False,
+                 thin_roi_class_indices=None,
+                 thin_roi_threshold=0.35,
+                 thin_roi_min_pixels=64,
+                 thin_roi_dilation=2,
+                 thin_roi_hidden_channels=None,
                  map_loss_type=None,
                  map_dice_weight=1.0,
                  map_focal_gamma=2.0,
@@ -144,6 +156,22 @@ class BEVSegHead(BaseModule):
         }
         self.map_aux_downsample = self._normalize_aux_downsample(
             map_aux_downsample)
+        self.use_thin_boundary_aux_loss = bool(use_thin_boundary_aux_loss)
+        self.thin_boundary_class_indices = self._parse_optional_class_indices(
+            thin_boundary_class_indices, 'thin_boundary_class_indices')
+        self.thin_boundary_dilation = int(thin_boundary_dilation)
+        self.thin_boundary_loss_weight = float(thin_boundary_loss_weight)
+        self.thin_boundary_use_focal = bool(thin_boundary_use_focal)
+        self.thin_boundary_use_dice = bool(thin_boundary_use_dice)
+        self.use_thin_roi_refinement = bool(use_thin_roi_refinement)
+        self.thin_roi_class_indices = self._parse_optional_class_indices(
+            thin_roi_class_indices, 'thin_roi_class_indices')
+        self.thin_roi_threshold = float(thin_roi_threshold)
+        self.thin_roi_min_pixels = int(thin_roi_min_pixels)
+        self.thin_roi_dilation = int(thin_roi_dilation)
+        self.thin_roi_hidden_channels = (
+            None if thin_roi_hidden_channels is None
+            else int(thin_roi_hidden_channels))
         self.map_loss_type = self._normalize_map_loss_type(map_loss_type)
         self.use_map_lovasz = self.map_loss_type == 'focal_lovasz'
         self.map_lovasz_weight = float(map_lovasz_weight)
@@ -173,6 +201,7 @@ class BEVSegHead(BaseModule):
         self.map_balance_class_names = self._parse_class_names(
             map_balance_class_names)
         self._map_balance_debug_step = 0
+        self._validate_thin_cfg()
         self._validate_balance_cfg()
         loss_bce, loss_dice, loss_focal = self._resolve_map_loss_cfgs(
             loss_bce,
@@ -234,6 +263,26 @@ class BEVSegHead(BaseModule):
                 norm_cfg)
             self.predictor = nn.Conv2d(
                 current_channels, num_classes, kernel_size=1)
+            if self.use_thin_roi_refinement:
+                roi_hidden = (
+                    current_channels if self.thin_roi_hidden_channels is None
+                    else self.thin_roi_hidden_channels)
+                self.thin_roi_refiner = nn.Sequential(
+                    ConvModule(
+                        current_channels,
+                        roi_hidden,
+                        kernel_size=3,
+                        padding=1,
+                        bias=False,
+                        norm_cfg=norm_cfg,
+                        act_cfg=dict(type='ReLU', inplace=True)),
+                    nn.Conv2d(
+                        roi_hidden,
+                        len(self.thin_roi_class_indices),
+                        kernel_size=1))
+                self.thin_roi_refiner[-1].apply(_zero_init_conv)
+            else:
+                self.thin_roi_refiner = None
 
         self.map_aux_heads = nn.ModuleDict()
         if self.use_map_aux_loss:
@@ -437,6 +486,43 @@ class BEVSegHead(BaseModule):
             raise ValueError(f'{name} must not contain duplicate indices.')
         return indices
 
+    def _parse_optional_class_indices(self, indices, name):
+        if indices is None:
+            return []
+        indices = [int(index) for index in indices]
+        for index in indices:
+            if index < 0 or index >= self.num_classes:
+                raise ValueError(
+                    f'{name} contains out-of-range index {index} for '
+                    f'num_classes={self.num_classes}.')
+        if len(set(indices)) != len(indices):
+            raise ValueError(f'{name} must not contain duplicate indices.')
+        return indices
+
+    def _validate_thin_cfg(self):
+        if (self.use_thin_boundary_aux_loss
+                and not self.thin_boundary_class_indices):
+            raise ValueError(
+                'use_thin_boundary_aux_loss=True requires '
+                'thin_boundary_class_indices.')
+        if self.thin_boundary_dilation < 0:
+            raise ValueError('thin_boundary_dilation must be >= 0.')
+        if self.thin_boundary_loss_weight < 0:
+            raise ValueError('thin_boundary_loss_weight must be >= 0.')
+        if self.use_thin_roi_refinement:
+            if self.use_dual_area_line_head:
+                raise ValueError(
+                    'use_thin_roi_refinement=True currently supports only '
+                    'the single BEVSegHead decoder path.')
+            if not self.thin_roi_class_indices:
+                raise ValueError(
+                    'use_thin_roi_refinement=True requires '
+                    'thin_roi_class_indices.')
+        if self.thin_roi_min_pixels < 0:
+            raise ValueError('thin_roi_min_pixels must be >= 0.')
+        if self.thin_roi_dilation < 0:
+            raise ValueError('thin_roi_dilation must be >= 0.')
+
     def _validate_dual_head_indices(self):
         all_indices = self.area_class_indices + self.line_class_indices
         if len(set(all_indices)) != len(all_indices):
@@ -575,6 +661,8 @@ class BEVSegHead(BaseModule):
         else:
             decoded_feature = self._run_decoder(self.decoder, bev_feature)
             seg_logits = self.predictor(decoded_feature)
+            seg_logits = self._apply_thin_roi_refinement(
+                decoded_feature, seg_logits)
 
         if self.training and self.use_map_aux_loss:
             outputs = dict(bev_seg_logits=seg_logits)
@@ -690,6 +778,39 @@ class BEVSegHead(BaseModule):
                 f'{self.line_detail_channels}, got {detail_feature.shape[1]}.')
         return detail_feature
 
+    def _apply_thin_roi_refinement(self, decoded_feature, seg_logits):
+        if not self.use_thin_roi_refinement:
+            return seg_logits
+        indices = torch.tensor(
+            self.thin_roi_class_indices,
+            device=seg_logits.device,
+            dtype=torch.long)
+        roi = self._build_thin_roi(seg_logits, indices)
+        delta = self.thin_roi_refiner(decoded_feature) * roi
+        refined = seg_logits.clone()
+        refined[:, indices] = refined[:, indices] + delta
+        return refined
+
+    def _build_thin_roi(self, seg_logits, indices):
+        scores = seg_logits[:, indices].detach().sigmoid().amax(
+            dim=1, keepdim=True)
+        roi = scores >= self.thin_roi_threshold
+        if self.thin_roi_min_pixels > 0:
+            flat_scores = scores.flatten(1)
+            topk = min(self.thin_roi_min_pixels, flat_scores.shape[1])
+            threshold = flat_scores.topk(topk, dim=1).values[:, -1]
+            threshold = threshold.view(-1, 1, 1, 1)
+            roi = roi | (scores >= threshold)
+        roi = roi.float()
+        if self.thin_roi_dilation > 0:
+            kernel = 2 * self.thin_roi_dilation + 1
+            roi = F.max_pool2d(
+                roi,
+                kernel_size=kernel,
+                stride=1,
+                padding=self.thin_roi_dilation)
+        return roi
+
     def loss(self, seg_logits, gt_masks_bev):
         gt_masks_bev = gt_masks_bev.float()
         if isinstance(seg_logits, dict):
@@ -698,6 +819,8 @@ class BEVSegHead(BaseModule):
                 raise ValueError(
                     'BEVSegHead loss dict must contain `bev_seg_logits`.')
             losses = self._loss_single(final_logits, gt_masks_bev)
+            losses.update(self._thin_boundary_aux_loss(
+                final_logits, gt_masks_bev))
             for level in self.map_aux_levels:
                 key = f'aux_logits_{level}'
                 if key not in seg_logits:
@@ -712,7 +835,9 @@ class BEVSegHead(BaseModule):
                 losses.update(aux_losses)
             return losses
 
-        return self._loss_single(seg_logits, gt_masks_bev)
+        losses = self._loss_single(seg_logits, gt_masks_bev)
+        losses.update(self._thin_boundary_aux_loss(seg_logits, gt_masks_bev))
+        return losses
 
     def _loss_single(self,
                      seg_logits,
@@ -746,6 +871,43 @@ class BEVSegHead(BaseModule):
                     seg_logits, gt_masks_bev).mean()
                 * loss_scale)
 
+        return losses
+
+    def _thin_boundary_aux_loss(self, seg_logits, gt_masks_bev):
+        if not self.use_thin_boundary_aux_loss:
+            return {}
+        indices = torch.tensor(
+            self.thin_boundary_class_indices,
+            device=seg_logits.device,
+            dtype=torch.long)
+        thin_logits = seg_logits[:, indices]
+        thin_target = gt_masks_bev[:, indices].float()
+        if self.thin_boundary_dilation > 0:
+            kernel = 2 * self.thin_boundary_dilation + 1
+            thin_target = F.max_pool2d(
+                thin_target,
+                kernel_size=kernel,
+                stride=1,
+                padding=self.thin_boundary_dilation)
+
+        losses = {}
+        weight = self.thin_boundary_loss_weight
+        if self.thin_boundary_use_focal and self.loss_focal is not None:
+            losses['loss_map_thin_boundary_focal'] = (
+                weight * self.loss_focal(thin_logits, thin_target))
+        elif self.loss_bce is not None:
+            losses['loss_map_thin_boundary_bce'] = (
+                weight * self.loss_bce(thin_logits, thin_target))
+        else:
+            losses['loss_map_thin_boundary_bce'] = (
+                weight * F.binary_cross_entropy_with_logits(
+                    thin_logits, thin_target))
+
+        if self.thin_boundary_use_dice and self.loss_dice is not None:
+            losses['loss_map_thin_boundary_dice'] = (
+                weight * self.loss_dice(
+                    thin_logits.reshape(-1, *thin_logits.shape[2:]),
+                    thin_target.reshape(-1, *thin_target.shape[2:])))
         return losses
 
     def _downsample_aux_target(self, gt_masks_bev, target_size):
