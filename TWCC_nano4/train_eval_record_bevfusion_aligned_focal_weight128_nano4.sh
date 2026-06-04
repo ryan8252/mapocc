@@ -27,11 +27,12 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SUBMIT_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
+export PROTOOCC_DIR="${PROTOOCC_DIR:-/home/u2336262/Desktop/artc_2026/mapocc}"
 
 export RUN_MODE="${RUN_MODE:-full}"
 export CONFIG="${CONFIG:-projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck_bevfusion_aligned_focal_weight128.py}"
-export WORK_DIR="${WORK_DIR:-${PROTOOCC_DIR:-/home/u2336262/Desktop/artc_2026/mapocc}/work_dirs/ProtoOcc_multi_cnn_head_map_neck_bevfusion_aligned_focal_weight128_nano4_h200}"
+export WORK_DIR="${WORK_DIR:-${PROTOOCC_DIR}/work_dirs/ProtoOcc_multi_cnn_head_map_neck_bevfusion_aligned_focal_weight128_nano4_h200}"
 
 # Aggressive H200 regime: 8 GPUs * 4 samples/GPU = 32, workers/GPU = 4.
 # LR is scaled to 4e-4 for this doubled global batch.
@@ -45,4 +46,15 @@ export EVAL_INTERVAL="${EVAL_INTERVAL:-999}"
 export EVAL_TIMEOUT_MIN="${EVAL_TIMEOUT_MIN:-180}"
 export TRAIN_ANN_FILE="${TRAIN_ANN_FILE:-}"
 
-exec bash "${SCRIPT_DIR}/quick_test_nano4.sh" "${CONFIG}"
+if [ -f "${SUBMIT_DIR}/TWCC_nano4/quick_test_nano4.sh" ]; then
+    QUICK_TEST="${SUBMIT_DIR}/TWCC_nano4/quick_test_nano4.sh"
+elif [ -f "${PROTOOCC_DIR}/TWCC_nano4/quick_test_nano4.sh" ]; then
+    QUICK_TEST="${PROTOOCC_DIR}/TWCC_nano4/quick_test_nano4.sh"
+else
+    echo "[ERROR] quick_test_nano4.sh not found."
+    echo "[ERROR] Checked: ${SUBMIT_DIR}/TWCC_nano4/quick_test_nano4.sh"
+    echo "[ERROR] Checked: ${PROTOOCC_DIR}/TWCC_nano4/quick_test_nano4.sh"
+    exit 1
+fi
+
+exec bash "${QUICK_TEST}" "${CONFIG}"
