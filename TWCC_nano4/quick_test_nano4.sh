@@ -341,6 +341,7 @@ occ_miou, occ, maps = parse_eval(eval_text)
 
 train_keys = [
     "loss", "loss_map_bce", "loss_map_focal", "loss_map_dice",
+    "loss_map_active_gate_focal", "loss_map_active_gate_dice",
     "loss_segmentation", "loss_depth", "grad_norm",
 ]
 train_rows = [(k, train_metrics[k]) for k in train_keys if k in train_metrics]

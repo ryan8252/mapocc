@@ -1326,3 +1326,108 @@ combined candidate + thin ROI residual refinement
 Main failure mode: the ROI becomes empty or too sparse early in training. Keep
 the top-k fallback enabled so every sample has at least a small refinement
 region.
+
+---
+
+# 13. Smoke Result Record for Directions 10-12
+
+Date: 2026-06-05
+
+Comparison ruler:
+
+```text
+1 epoch
+1/4 nuScenes train split
+single local 4090 smoke run
+EMA checkpoint eval
+metric: miou map-miou
+```
+
+Reference baseline for this comparison:
+
+```text
+projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck_hfm_adapter_fpn_lateral_aspp_focal_dice_weighted.py
+work_dirs/smoke_ProtoOcc_multi_cnn_head_map_neck_hfm_adapter_fpn_lateral_aspp_focal_dice_weighted_1quarter_4090/result.md
+```
+
+Baseline smoke result:
+
+| Metric | Value |
+| --- | ---: |
+| OCC mIoU | 27.54 |
+| map mean IoU@max | 0.219697 |
+| thin avg: ped_crossing / stop_line / divider | 0.111283 |
+| ped_crossing | 0.069360 |
+| stop_line | 0.090233 |
+| divider | 0.174255 |
+
+## Direction 10: Thin-Class Boundary Auxiliary Target
+
+Result file:
+
+```text
+work_dirs/smoke_ProtoOcc_multi_cnn_head_map_neck_hfm_adapter_fpn_lateral_aspp_focal_dice_weighted_thin_boundary_1quarter_4090/result.md
+```
+
+| Metric | Value | Delta vs baseline |
+| --- | ---: | ---: |
+| OCC mIoU | 27.79 | +0.25 |
+| map mean IoU@max | 0.220669 | +0.000972 |
+| thin avg: ped_crossing / stop_line / divider | 0.112686 | +0.001404 |
+| ped_crossing | 0.070159 | +0.000799 |
+| stop_line | 0.089970 | -0.000263 |
+| divider | 0.177930 | +0.003675 |
+
+Judgment: keep. This is the only one of the three new directions that improves
+same-ruler map mean, thin-class average, divider, and OCC mIoU at the same time.
+The gain is small in 1-epoch smoke scale, but it is directionally useful and
+does not show a stability regression.
+
+Next check: run a longer Nano4/H200 job before treating it as a real result.
+
+## Direction 11: Learnable Residual Gates for Map Add-ons
+
+Result file:
+
+```text
+work_dirs/smoke_ProtoOcc_multi_cnn_head_map_neck_hfm_adapter_fpn_lateral_aspp_focal_dice_weighted_residual_gates_1quarter_4090/result.md
+```
+
+| Metric | Value | Delta vs baseline |
+| --- | ---: | ---: |
+| OCC mIoU | 26.53 | -1.01 |
+| map mean IoU@max | 0.206450 | -0.013248 |
+| thin avg: ped_crossing / stop_line / divider | 0.100369 | -0.010914 |
+| ped_crossing | 0.066097 | -0.003263 |
+| stop_line | 0.080010 | -0.010223 |
+| divider | 0.154999 | -0.019256 |
+
+Judgment: do not adopt in this form. The 0.1 gate initialization suppresses
+useful residual paths too strongly for a 1-epoch smoke run. If this direction is
+retried, test larger initial gates such as 0.5 or gate only the riskiest add-on
+instead of gating HFM, adapter, and ASPP together.
+
+## Direction 12: Thin-Class ROI Residual Refinement
+
+Result file:
+
+```text
+work_dirs/smoke_ProtoOcc_multi_cnn_head_map_neck_hfm_adapter_fpn_lateral_aspp_focal_dice_weighted_thin_roi_refine_1quarter_4090/result.md
+```
+
+| Metric | Value | Delta vs baseline |
+| --- | ---: | ---: |
+| OCC mIoU | 25.19 | -2.35 |
+| map mean IoU@max | 0.218582 | -0.001116 |
+| thin avg: ped_crossing / stop_line / divider | 0.108898 | -0.002384 |
+| ped_crossing | 0.071407 | +0.002047 |
+| stop_line | 0.090007 | -0.000226 |
+| divider | 0.165281 | -0.008974 |
+
+Judgment: do not adopt as-is. It improves ped_crossing slightly, but loses
+divider enough to make thin-class average and map mean worse. The likely issue
+is that prediction-derived ROI is not reliable enough early in training, so the
+refiner helps isolated crossings but disturbs long thin lines.
+
+Potential retry: build the ROI from a softer score map or add a boundary-guided
+ROI warmup instead of hard threshold plus top-k from the current thin logits.

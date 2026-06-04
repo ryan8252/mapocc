@@ -115,6 +115,16 @@ class BEVSegHead(BaseModule):
                  thin_roi_min_pixels=64,
                  thin_roi_dilation=2,
                  thin_roi_hidden_channels=None,
+                 use_map_active_enhance_gate=False,
+                 map_active_gate_channels=1,
+                 map_active_gate_hidden_channels=None,
+                 map_active_gate_class_groups=None,
+                 map_active_gate_dilations=0,
+                 map_active_gate_beta=0.5,
+                 map_active_gate_loss_weight=0.2,
+                 map_active_gate_use_focal=True,
+                 map_active_gate_use_dice=True,
+                 map_active_gate_init_bias=-4.0,
                  map_loss_type=None,
                  map_dice_weight=1.0,
                  map_focal_gamma=2.0,
@@ -172,6 +182,20 @@ class BEVSegHead(BaseModule):
         self.thin_roi_hidden_channels = (
             None if thin_roi_hidden_channels is None
             else int(thin_roi_hidden_channels))
+        self.use_map_active_enhance_gate = bool(use_map_active_enhance_gate)
+        self.map_active_gate_channels = int(map_active_gate_channels)
+        self.map_active_gate_hidden_channels = (
+            None if map_active_gate_hidden_channels is None
+            else int(map_active_gate_hidden_channels))
+        self.map_active_gate_beta = float(map_active_gate_beta)
+        self.map_active_gate_loss_weight = float(map_active_gate_loss_weight)
+        self.map_active_gate_use_focal = bool(map_active_gate_use_focal)
+        self.map_active_gate_use_dice = bool(map_active_gate_use_dice)
+        self.map_active_gate_init_bias = float(map_active_gate_init_bias)
+        self.map_active_gate_class_groups = self._parse_active_gate_groups(
+            map_active_gate_class_groups)
+        self.map_active_gate_dilations = self._parse_active_gate_dilations(
+            map_active_gate_dilations)
         self.map_loss_type = self._normalize_map_loss_type(map_loss_type)
         self.use_map_lovasz = self.map_loss_type == 'focal_lovasz'
         self.map_lovasz_weight = float(map_lovasz_weight)
@@ -202,6 +226,7 @@ class BEVSegHead(BaseModule):
             map_balance_class_names)
         self._map_balance_debug_step = 0
         self._validate_thin_cfg()
+        self._validate_active_gate_cfg()
         self._validate_balance_cfg()
         loss_bce, loss_dice, loss_focal = self._resolve_map_loss_cfgs(
             loss_bce,
@@ -263,6 +288,29 @@ class BEVSegHead(BaseModule):
                 norm_cfg)
             self.predictor = nn.Conv2d(
                 current_channels, num_classes, kernel_size=1)
+            if self.use_map_active_enhance_gate:
+                gate_hidden = (
+                    current_channels
+                    if self.map_active_gate_hidden_channels is None
+                    else self.map_active_gate_hidden_channels)
+                self.map_active_gate = nn.Sequential(
+                    ConvModule(
+                        current_channels,
+                        gate_hidden,
+                        kernel_size=3,
+                        padding=1,
+                        bias=False,
+                        norm_cfg=norm_cfg,
+                        act_cfg=dict(type='ReLU', inplace=True)),
+                    nn.Conv2d(
+                        gate_hidden,
+                        self.map_active_gate_channels,
+                        kernel_size=1))
+                nn.init.constant_(
+                    self.map_active_gate[-1].bias,
+                    self.map_active_gate_init_bias)
+            else:
+                self.map_active_gate = None
             if self.use_thin_roi_refinement:
                 roi_hidden = (
                     current_channels if self.thin_roi_hidden_channels is None
@@ -499,6 +547,38 @@ class BEVSegHead(BaseModule):
             raise ValueError(f'{name} must not contain duplicate indices.')
         return indices
 
+    def _parse_active_gate_groups(self, groups):
+        if groups is None:
+            if self.map_active_gate_channels == 1:
+                return [list(range(self.num_classes))]
+            raise ValueError(
+                'map_active_gate_class_groups must be set when '
+                'map_active_gate_channels > 1.')
+        parsed = []
+        for group in groups:
+            indices = [int(index) for index in group]
+            if not indices:
+                raise ValueError(
+                    'map_active_gate_class_groups must not contain an empty '
+                    'group.')
+            for index in indices:
+                if index < 0 or index >= self.num_classes:
+                    raise ValueError(
+                        'map_active_gate_class_groups contains '
+                        f'out-of-range index {index} for '
+                        f'num_classes={self.num_classes}.')
+            if len(set(indices)) != len(indices):
+                raise ValueError(
+                    'map_active_gate_class_groups must not contain duplicate '
+                    'indices inside one group.')
+            parsed.append(indices)
+        return parsed
+
+    def _parse_active_gate_dilations(self, dilations):
+        if isinstance(dilations, int):
+            return [int(dilations) for _ in range(self.map_active_gate_channels)]
+        return [int(dilation) for dilation in dilations]
+
     def _validate_thin_cfg(self):
         if (self.use_thin_boundary_aux_loss
                 and not self.thin_boundary_class_indices):
@@ -522,6 +602,30 @@ class BEVSegHead(BaseModule):
             raise ValueError('thin_roi_min_pixels must be >= 0.')
         if self.thin_roi_dilation < 0:
             raise ValueError('thin_roi_dilation must be >= 0.')
+
+    def _validate_active_gate_cfg(self):
+        if not self.use_map_active_enhance_gate:
+            return
+        if self.use_dual_area_line_head:
+            raise ValueError(
+                'use_map_active_enhance_gate=True currently supports only '
+                'the single BEVSegHead decoder path.')
+        if self.map_active_gate_channels <= 0:
+            raise ValueError('map_active_gate_channels must be positive.')
+        if len(self.map_active_gate_class_groups) != self.map_active_gate_channels:
+            raise ValueError(
+                'map_active_gate_class_groups length must match '
+                'map_active_gate_channels.')
+        if len(self.map_active_gate_dilations) != self.map_active_gate_channels:
+            raise ValueError(
+                'map_active_gate_dilations length must match '
+                'map_active_gate_channels.')
+        if any(dilation < 0 for dilation in self.map_active_gate_dilations):
+            raise ValueError('map_active_gate_dilations must be >= 0.')
+        if self.map_active_gate_beta < 0:
+            raise ValueError('map_active_gate_beta must be >= 0.')
+        if self.map_active_gate_loss_weight < 0:
+            raise ValueError('map_active_gate_loss_weight must be >= 0.')
 
     def _validate_dual_head_indices(self):
         all_indices = self.area_class_indices + self.line_class_indices
@@ -658,24 +762,40 @@ class BEVSegHead(BaseModule):
 
         if self.use_dual_area_line_head:
             seg_logits = self._forward_dual_head(bev_feature, detail_feature)
+            gate_logits = None
         else:
             decoded_feature = self._run_decoder(self.decoder, bev_feature)
+            decoded_feature, gate_logits = self._apply_map_active_gate(
+                decoded_feature)
             seg_logits = self.predictor(decoded_feature)
             seg_logits = self._apply_thin_roi_refinement(
                 decoded_feature, seg_logits)
 
-        if self.training and self.use_map_aux_loss:
+        if self.training and (
+                self.use_map_aux_loss or self.use_map_active_enhance_gate):
             outputs = dict(bev_seg_logits=seg_logits)
-            for level in self.map_aux_levels:
-                if level not in aux_features:
-                    raise ValueError(
-                        f'Missing aux feature level `{level}` for '
-                        'use_map_aux_loss=True.')
-                outputs[f'aux_logits_{level}'] = self.map_aux_heads[level](
-                    aux_features[level])
+            if gate_logits is not None:
+                outputs['map_active_gate_logits'] = gate_logits
+            if self.use_map_aux_loss:
+                for level in self.map_aux_levels:
+                    if level not in aux_features:
+                        raise ValueError(
+                            f'Missing aux feature level `{level}` for '
+                            'use_map_aux_loss=True.')
+                    outputs[f'aux_logits_{level}'] = self.map_aux_heads[level](
+                        aux_features[level])
             return outputs
 
         return seg_logits
+
+    def _apply_map_active_gate(self, decoded_feature):
+        if not self.use_map_active_enhance_gate:
+            return decoded_feature, None
+        gate_logits = self.map_active_gate(decoded_feature)
+        spatial_gate = gate_logits.sigmoid().amax(dim=1, keepdim=True)
+        enhanced = decoded_feature * (
+            1.0 + self.map_active_gate_beta * spatial_gate)
+        return enhanced, gate_logits
 
     def _run_decoder(self, decoder, x):
         if self.with_cp and self.training:
@@ -821,6 +941,9 @@ class BEVSegHead(BaseModule):
             losses = self._loss_single(final_logits, gt_masks_bev)
             losses.update(self._thin_boundary_aux_loss(
                 final_logits, gt_masks_bev))
+            losses.update(self._map_active_gate_loss(
+                seg_logits.get('map_active_gate_logits', None),
+                gt_masks_bev))
             for level in self.map_aux_levels:
                 key = f'aux_logits_{level}'
                 if key not in seg_logits:
@@ -837,6 +960,58 @@ class BEVSegHead(BaseModule):
 
         losses = self._loss_single(seg_logits, gt_masks_bev)
         losses.update(self._thin_boundary_aux_loss(seg_logits, gt_masks_bev))
+        return losses
+
+    def _build_map_active_gate_target(self, gt_masks_bev, target_size):
+        targets = []
+        for indices, dilation in zip(
+                self.map_active_gate_class_groups,
+                self.map_active_gate_dilations):
+            index_tensor = torch.tensor(
+                indices,
+                device=gt_masks_bev.device,
+                dtype=torch.long)
+            target = gt_masks_bev[:, index_tensor].amax(
+                dim=1, keepdim=True).float()
+            if dilation > 0:
+                kernel = 2 * dilation + 1
+                target = F.max_pool2d(
+                    target,
+                    kernel_size=kernel,
+                    stride=1,
+                    padding=dilation)
+            if tuple(target.shape[-2:]) != tuple(target_size):
+                target = F.interpolate(
+                    target, size=target_size, mode='nearest')
+            targets.append(target)
+        return torch.cat(targets, dim=1)
+
+    def _map_active_gate_loss(self, gate_logits, gt_masks_bev):
+        if not self.use_map_active_enhance_gate or gate_logits is None:
+            return {}
+        target = self._build_map_active_gate_target(
+            gt_masks_bev, gate_logits.shape[-2:])
+        losses = {}
+        weight = self.map_active_gate_loss_weight
+        if weight <= 0:
+            return losses
+
+        if self.map_active_gate_use_focal and self.loss_focal is not None:
+            losses['loss_map_active_gate_focal'] = (
+                weight * self.loss_focal(gate_logits, target))
+        elif self.loss_bce is not None:
+            losses['loss_map_active_gate_bce'] = (
+                weight * self.loss_bce(gate_logits, target))
+        else:
+            losses['loss_map_active_gate_bce'] = (
+                weight * F.binary_cross_entropy_with_logits(
+                    gate_logits, target))
+
+        if self.map_active_gate_use_dice and self.loss_dice is not None:
+            losses['loss_map_active_gate_dice'] = (
+                weight * self.loss_dice(
+                    gate_logits.reshape(-1, *gate_logits.shape[2:]),
+                    target.reshape(-1, *target.shape[2:])))
         return losses
 
     def _loss_single(self,
