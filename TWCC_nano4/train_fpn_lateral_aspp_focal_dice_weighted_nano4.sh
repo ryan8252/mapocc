@@ -18,10 +18,10 @@
 #SBATCH --ntasks-per-node=8
 #SBATCH --gres=gpu:8
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=1536G
+#SBATCH --mem=1024G
 #SBATCH --time=48:00:00
-#SBATCH -o %x-%j.log
-#SBATCH -e %x-%j.log
+#SBATCH -o %j.log
+#SBATCH -e %j.log
 
 set -euo pipefail
 
@@ -38,7 +38,7 @@ PRETRAIN_CKPT="${PROTOOCC_DIR}/ckpts/bevdet-r50-4d-depth-cbgs_depthnet_modify.pt
 
 GPUS="${GPUS:-8}"
 SAMPLES_PER_GPU="${SAMPLES_PER_GPU:-4}"
-WORKERS_PER_GPU="${WORKERS_PER_GPU:-1}"
+WORKERS_PER_GPU="${WORKERS_PER_GPU:-4}"
 LR="${LR:-4e-4}"
 TRAIN_ANN_FILE="${TRAIN_ANN_FILE:-}"
 

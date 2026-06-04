@@ -31,9 +31,9 @@
 #SBATCH -p normal
 #SBATCH -N 1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:8
-#SBATCH --cpus-per-task=32
-#SBATCH --mem=1536G
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=256G
 #SBATCH --time=48:00:00
 #SBATCH -o %x-%j.log
 #SBATCH -e %x-%j.log
@@ -45,8 +45,9 @@ module load singularity/4.3.7
 
 # ---------------------------------------------------------------------
 # 只要改這一行（或用 sbatch quick_test_nano4.sh <config> 當參數覆蓋它）
+# 預設為 45m / 88-bin 主線基準 config（dbound60 那種 118-bin 是特例）。
 # ---------------------------------------------------------------------
-CONFIG_NAME_DEFAULT="ProtoOcc_multi_cnn_head_map_neck_bevfusion_aligned_dbound60_coarse_map"
+CONFIG_NAME_DEFAULT="ProtoOcc_multi_cnn_head_map_neck"
 
 CONDA_ENV="${CONDA_ENV:-/home/u2336262/.conda/envs/unimapocc}"
 PROTOOCC_DIR="${PROTOOCC_DIR:-/home/u2336262/Desktop/artc_2026/mapocc}"
@@ -68,7 +69,7 @@ case "${RUN_MODE}" in
     smoke)
         DEFAULT_EPOCHS=1
         DEFAULT_TRAIN_ANN_FILE="data/nuscenes/bevdetv2-nuscenes_infos_train_1quarter_seed0.pkl"
-        DEFAULT_WORK_DIR="${PROTOOCC_DIR}/work_dirs/quick_test_${CONFIG_TAG}_1quarter_nano4"
+        DEFAULT_WORK_DIR="${PROTOOCC_DIR}/work_dirs/quick_test_${CONFIG_TAG}_1quarter_nano4_1gpu"
         ;;
     full)
         DEFAULT_EPOCHS=24
@@ -82,7 +83,7 @@ case "${RUN_MODE}" in
 esac
 
 WORK_DIR="${WORK_DIR:-${DEFAULT_WORK_DIR}}"
-GPUS="${GPUS:-8}"
+GPUS="${GPUS:-1}"
 SAMPLES_PER_GPU="${SAMPLES_PER_GPU:-2}"
 WORKERS_PER_GPU="${WORKERS_PER_GPU:-1}"
 LR="${LR:-2e-4}"

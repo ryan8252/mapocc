@@ -60,8 +60,17 @@ if [ -n "${TRAIN_ANN_FILE}" ]; then
     echo "[INFO] Train ann_file override: ${TRAIN_ANN_FILE}"
 fi
 
+SINGULARITY_BIND_ARGS=(
+    --bind /home/u2336262:/home/u2336262
+    --bind /work:/work
+)
+
+if [ -n "${EXTRA_BINDS:-}" ]; then
+    SINGULARITY_BIND_ARGS+=(--bind "${EXTRA_BINDS}")
+fi
+
 singularity exec --cleanenv --nv \
-    --bind /home/u2336262:/home/u2336262 \
+    "${SINGULARITY_BIND_ARGS[@]}" \
     "${SIF}" \
     bash -c '
 set -euo pipefail
