@@ -20,15 +20,15 @@
 
 #SBATCH -J aligned_maponly
 #SBATCH --account=MST113104
-#SBATCH -p 8gpus
+#SBATCH -p 16gpus
 #SBATCH -N 1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:8
 #SBATCH --cpus-per-task=32
-#SBATCH --mem=1536G
+#SBATCH --mem=1024G
 #SBATCH --time=48:00:00
-#SBATCH -o %x-%j.log
-#SBATCH -e %x-%j.log
+#SBATCH -o %j.log
+#SBATCH -e %j.log
 
 set -euo pipefail
 
@@ -57,7 +57,7 @@ case "${RUN_MODE}" in
         DEFAULT_GPUS=8
         DEFAULT_SAMPLES_PER_GPU=4
         DEFAULT_WORKERS_PER_GPU=4
-        DEFAULT_LR=4e-4
+        DEFAULT_LR=2e-4
         ;;
     *)
         echo "[ERROR] RUN_MODE must be smoke or full, got: ${RUN_MODE}"
@@ -65,16 +65,21 @@ case "${RUN_MODE}" in
         ;;
 esac
 
-# H200 full-regime defaults: 8 GPUs * 4 samples/GPU = 32, lr=4e-4.
+# H200 full-regime defaults: 8 GPUs * 4 samples/GPU = batch 32, lr=2e-4
+# (lr aligned to batch size -- same batch 32 as the proven map-only baseline
+# that trains stably at 2e-4; the old 4e-4 diverged at epoch 11).
 # Smoke defaults: 1 GPU * 2 samples/GPU, lr=2e-4, matching prior 1-GPU
-# quick-test practice instead of accidentally using the full-regime LR.
+# quick-test practice.
 export GPUS="${GPUS:-${DEFAULT_GPUS}}"
 export SAMPLES_PER_GPU="${SAMPLES_PER_GPU:-${DEFAULT_SAMPLES_PER_GPU}}"
 export WORKERS_PER_GPU="${WORKERS_PER_GPU:-${DEFAULT_WORKERS_PER_GPU}}"
 export LR="${LR:-${DEFAULT_LR}}"
 export EPOCHS="${EPOCHS:-${DEFAULT_EPOCHS}}"
-export CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-${EPOCHS}}"
-export EVAL_INTERVAL="${EVAL_INTERVAL:-999}"
+# Aligned to the proven map-only config (checkpoint every 3 epochs, eval every
+# epoch) so divergence is visible mid-run and the best/pre-divergence weights
+# are recoverable instead of only keeping the final epoch.
+export CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-3}"
+export EVAL_INTERVAL="${EVAL_INTERVAL:-1}"
 export EVAL_TIMEOUT_MIN="${EVAL_TIMEOUT_MIN:-${DEFAULT_EVAL_TIMEOUT_MIN}}"
 export TRAIN_ANN_FILE="${TRAIN_ANN_FILE:-${DEFAULT_TRAIN_ANN_FILE}}"
 export WORK_DIR="${WORK_DIR:-${DEFAULT_WORK_DIR}}"
