@@ -23,6 +23,78 @@ def _gate_logit(init_value):
 
 
 @NECKS.register_module()
+class LSSFPN(nn.Module):
+    """BEVFusion-style LSS FPN neck for a two-level BEV decoder pyramid."""
+
+    def __init__(self,
+                 in_indices,
+                 in_channels,
+                 out_channels,
+                 scale_factor=1):
+        super(LSSFPN, self).__init__()
+        self.in_indices = tuple(in_indices)
+        self.in_channels = tuple(in_channels)
+        self.out_channels = out_channels
+        self.scale_factor = scale_factor
+
+        self.fuse = nn.Sequential(
+            nn.Conv2d(
+                self.in_channels[0] + self.in_channels[1],
+                out_channels,
+                kernel_size=1,
+                bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(
+                out_channels,
+                out_channels,
+                kernel_size=3,
+                padding=1,
+                bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True))
+
+        if self.scale_factor > 1:
+            self.upsample = nn.Sequential(
+                nn.Upsample(
+                    scale_factor=self.scale_factor,
+                    mode='bilinear',
+                    align_corners=True),
+                nn.Conv2d(
+                    out_channels,
+                    out_channels,
+                    kernel_size=3,
+                    padding=1,
+                    bias=False),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True))
+        else:
+            self.upsample = None
+
+    def forward(self, feats):
+        x1 = feats[self.in_indices[0]]
+        x2 = feats[self.in_indices[1]]
+        if x1.shape[1] != self.in_channels[0]:
+            raise ValueError(
+                f'LSSFPN expected {self.in_channels[0]} channels at '
+                f'index {self.in_indices[0]}, got {x1.shape[1]}.')
+        if x2.shape[1] != self.in_channels[1]:
+            raise ValueError(
+                f'LSSFPN expected {self.in_channels[1]} channels at '
+                f'index {self.in_indices[1]}, got {x2.shape[1]}.')
+
+        x1 = F.interpolate(
+            x1,
+            size=x2.shape[-2:],
+            mode='bilinear',
+            align_corners=True)
+        x = self.fuse(torch.cat([x1, x2], dim=1))
+        if self.upsample is not None:
+            x = self.upsample(x)
+        return x
+
+
+@NECKS.register_module()
 class FPN_LSS(nn.Module):
     def __init__(self,
                  in_channels,

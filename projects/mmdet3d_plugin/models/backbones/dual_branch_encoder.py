@@ -943,6 +943,55 @@ class MapOnly_BEV_Encoder(nn.Module):
 
 
 @BACKBONES.register_module()
+class MapOnly_BEVFusion_Encoder(nn.Module):
+    """Map-only BEVFusion-style 2D decoder.
+
+    The intended input is a 2D LSS BEV feature [B, C, H, W], produced by a
+    one-bin zbound and collapse_z=True. A 5D fallback is kept for diagnostics.
+    """
+
+    def __init__(self,
+                 bev_decoder_backbone=None,
+                 bev_decoder_neck=None,
+                 z_collapse='sum'):
+        super().__init__()
+        if bev_decoder_backbone is None:
+            raise ValueError(
+                'MapOnly_BEVFusion_Encoder requires bev_decoder_backbone.')
+        if bev_decoder_neck is None:
+            raise ValueError(
+                'MapOnly_BEVFusion_Encoder requires bev_decoder_neck.')
+        self.z_collapse = str(z_collapse)
+        self.bev_decoder_backbone = builder.build_backbone(
+            bev_decoder_backbone)
+        self.bev_decoder_neck = builder.build_neck(bev_decoder_neck)
+
+    def _collapse_if_needed(self, x):
+        if x.dim() == 4:
+            return x
+        if x.dim() != 5:
+            raise ValueError(
+                'MapOnly_BEVFusion_Encoder expects a 4D BEV feature or a '
+                f'5D voxel feature, got shape {tuple(x.shape)}.')
+        if self.z_collapse == 'sum':
+            return x.sum(dim=2)
+        if self.z_collapse == 'mean':
+            return x.mean(dim=2)
+        if self.z_collapse == 'max':
+            return x.max(dim=2).values
+        if self.z_collapse == 'cat':
+            return torch.cat(x.unbind(dim=2), dim=1)
+        raise ValueError(
+            f'Unsupported z_collapse={self.z_collapse}. Expected one of '
+            '"sum", "mean", "max", or "cat".')
+
+    def forward(self, x):
+        x = self._collapse_if_needed(x)
+        multi_scale_bev = self.bev_decoder_backbone(x)
+        return self.bev_decoder_neck(multi_scale_bev)
+
+
+@BACKBONES.register_module()
 class MapOnly_MTE_Encoder(nn.Module):
     """Map-only encoder using a MapTopologyEncoder (learned softmax-Z pooling)
     in place of ``MapOnly_BEV_Encoder``'s fixed cat-Z flatten + shared BEV
