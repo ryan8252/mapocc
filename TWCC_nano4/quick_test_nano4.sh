@@ -23,18 +23,18 @@
 # 跑完整訓練：
 #   RUN_MODE=full sbatch --export=ALL TWCC_nano4/quick_test_nano4.sh <config>
 #
-# Quick-test 預設資源：8 GPUs * 2 samples/GPU = 16, workers/GPU = 1, lr = 2e-4。
+# Quick-test 預設資源：2 GPUs * 2 samples/GPU = 4, workers/GPU = 1, lr = 2e-4。
 # =====================================================================
 
 #SBATCH -J quick_test
 #SBATCH --account=MST113104
-#SBATCH -p normal
+#SBATCH -p dev
 #SBATCH -N 1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=256G
-#SBATCH --time=48:00:00
+#SBATCH --gres=gpu:2
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=512G
+#SBATCH --time=4:00:00
 #SBATCH -o %x-%j.log
 #SBATCH -e %x-%j.log
 
@@ -69,7 +69,7 @@ case "${RUN_MODE}" in
     smoke)
         DEFAULT_EPOCHS=1
         DEFAULT_TRAIN_ANN_FILE="data/nuscenes/bevdetv2-nuscenes_infos_train_1quarter_seed0.pkl"
-        DEFAULT_WORK_DIR="${PROTOOCC_DIR}/work_dirs/quick_test_${CONFIG_TAG}_1quarter_nano4_1gpu"
+        DEFAULT_WORK_DIR="${PROTOOCC_DIR}/work_dirs/quick_test_${CONFIG_TAG}_1quarter_nano4_2gpu"
         ;;
     full)
         DEFAULT_EPOCHS=24
@@ -83,7 +83,7 @@ case "${RUN_MODE}" in
 esac
 
 WORK_DIR="${WORK_DIR:-${DEFAULT_WORK_DIR}}"
-GPUS="${GPUS:-1}"
+GPUS="${GPUS:-2}"
 SAMPLES_PER_GPU="${SAMPLES_PER_GPU:-2}"
 WORKERS_PER_GPU="${WORKERS_PER_GPU:-1}"
 LR="${LR:-2e-4}"
