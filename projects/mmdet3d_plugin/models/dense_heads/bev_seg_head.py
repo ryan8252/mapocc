@@ -129,6 +129,8 @@ class BEVSegHead(BaseModule):
                  map_dice_weight=1.0,
                  map_focal_gamma=2.0,
                  map_focal_alpha=0.25,
+                 map_focal_loss_mode='shared',
+                 map_focal_loss_class_names=None,
                  map_lovasz_weight=1.0,
                  use_map_class_weights=False,
                  use_bev_coordconv=False,
@@ -199,6 +201,8 @@ class BEVSegHead(BaseModule):
         self.map_loss_type = self._normalize_map_loss_type(map_loss_type)
         self.use_map_lovasz = self.map_loss_type == 'focal_lovasz'
         self.map_lovasz_weight = float(map_lovasz_weight)
+        self.map_focal_loss_mode = self._normalize_focal_loss_mode(
+            map_focal_loss_mode)
         self.use_map_class_weights = bool(use_map_class_weights)
         self.use_bev_coordconv = bool(use_bev_coordconv)
         self.bev_coord_type = self._normalize_coord_type(bev_coord_type)
@@ -223,7 +227,9 @@ class BEVSegHead(BaseModule):
         self.map_balance_debug = bool(map_balance_debug)
         self.map_balance_debug_interval = int(map_balance_debug_interval)
         self.map_balance_class_names = self._parse_class_names(
-            map_balance_class_names)
+            map_balance_class_names, 'map_balance_class_names')
+        self.map_focal_loss_class_names = self._parse_class_names(
+            map_focal_loss_class_names, 'map_focal_loss_class_names')
         self._map_balance_debug_step = 0
         self._validate_thin_cfg()
         self._validate_active_gate_cfg()
@@ -375,6 +381,27 @@ class BEVSegHead(BaseModule):
                 f'Unsupported map_loss_type: {loss_type}. '
                 f'Expected one of {sorted(valid_types)}.')
         return loss_type
+
+    def _normalize_focal_loss_mode(self, mode):
+        if mode is None:
+            return 'shared'
+        mode = str(mode).lower()
+        aliases = {
+            'default': 'shared',
+            'global': 'shared',
+            'bevfusion': 'classwise_sum',
+            'classwise': 'classwise_sum',
+            'classwise_bevfusion': 'classwise_sum',
+            'classwise_avg': 'classwise_mean',
+            'classwise_average': 'classwise_mean',
+        }
+        mode = aliases.get(mode, mode)
+        valid_modes = {'shared', 'classwise_sum', 'classwise_mean'}
+        if mode not in valid_modes:
+            raise ValueError(
+                f'Unsupported map_focal_loss_mode: {mode}. '
+                f'Expected one of {sorted(valid_modes)}.')
+        return mode
 
     def _resolve_map_loss_cfgs(self,
                                loss_bce,
@@ -707,13 +734,13 @@ class BEVSegHead(BaseModule):
             f'{len(self.overlay_class_indices)} for overlay classes, or have '
             f'length {self.num_classes} for all map classes.')
 
-    def _parse_class_names(self, class_names):
+    def _parse_class_names(self, class_names, cfg_name='class_names'):
         if class_names is None:
             return [f'class_{index}' for index in range(self.num_classes)]
         class_names = list(class_names)
         if len(class_names) != self.num_classes:
             raise ValueError(
-                'map_balance_class_names length must match num_classes: '
+                f'{cfg_name} length must match num_classes: '
                 f'{len(class_names)} vs {self.num_classes}.')
         return class_names
 
@@ -1030,8 +1057,8 @@ class BEVSegHead(BaseModule):
                 self.loss_bce(seg_logits, gt_masks_bev) * loss_scale)
 
         if self.loss_focal is not None:
-            losses[f'{prefix}_focal'] = (
-                self.loss_focal(seg_logits, gt_masks_bev) * loss_scale)
+            losses.update(self._focal_loss(
+                seg_logits, gt_masks_bev, prefix, loss_scale))
 
         if self.loss_dice is not None:
             losses[f'{prefix}_dice'] = self.loss_dice(
@@ -1046,6 +1073,36 @@ class BEVSegHead(BaseModule):
                     seg_logits, gt_masks_bev).mean()
                 * loss_scale)
 
+        return losses
+
+    def _focal_loss(self,
+                    seg_logits,
+                    gt_masks_bev,
+                    prefix='loss_map',
+                    loss_scale=1.0):
+        if self.map_focal_loss_mode == 'shared':
+            return {
+                f'{prefix}_focal':
+                self.loss_focal(seg_logits, gt_masks_bev) * loss_scale
+            }
+
+        if seg_logits.shape[1] != self.num_classes:
+            raise ValueError(
+                'Classwise map focal loss expects seg_logits channel count '
+                f'to match num_classes={self.num_classes}, but got '
+                f'{seg_logits.shape[1]}.')
+
+        class_scale = float(loss_scale)
+        if self.map_focal_loss_mode == 'classwise_mean':
+            class_scale = class_scale / max(self.num_classes, 1)
+
+        losses = {}
+        for class_index, class_name in enumerate(
+                self.map_focal_loss_class_names):
+            losses[f'{prefix}_{class_name}_focal'] = (
+                self.loss_focal(
+                    seg_logits[:, class_index],
+                    gt_masks_bev[:, class_index]) * class_scale)
         return losses
 
     def _thin_boundary_aux_loss(self, seg_logits, gt_masks_bev):

@@ -345,6 +345,11 @@ train_keys = [
     "loss_segmentation", "loss_depth", "grad_norm",
 ]
 train_rows = [(k, train_metrics[k]) for k in train_keys if k in train_metrics]
+seen_train_keys = {k for k, _ in train_rows}
+for key in sorted(train_metrics):
+    if key.startswith("loss_map_") and key not in seen_train_keys:
+        train_rows.append((key, train_metrics[key]))
+        seen_train_keys.add(key)
 occ_rows = list(occ.items())
 if occ_miou is not None:
     occ_rows.append(("mIoU", f"**{occ_miou}**"))
