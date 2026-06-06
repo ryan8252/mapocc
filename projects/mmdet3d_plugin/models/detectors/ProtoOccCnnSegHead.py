@@ -25,6 +25,12 @@ class ProtoOccCnnSegHead(BEVDet):
                  map_feature_range=None,
                  map_feature_size=None,
                  map_loss_weight=1.0,
+                 use_occ2map_prior=False,
+                 occ2map_prior_detach=True,
+                 occ2map_prior_feature_range=None,
+                 occ2map_prior_context_z=3,
+                 occ2map_prior_output_z_indices=(0, 1),
+                 occ2map_prior_class_ids=(11, 13),
                  **kwargs):
         super(ProtoOccCnnSegHead, self).__init__(**kwargs)
         self.pts_bbox_head = None # useless
@@ -53,6 +59,60 @@ class ProtoOccCnnSegHead(BEVDet):
             None if map_feature_size is None
             else tuple(int(v) for v in map_feature_size))
         self.map_loss_weight = map_loss_weight
+        self.use_occ2map_prior = bool(use_occ2map_prior)
+        self.occ2map_prior_detach = bool(occ2map_prior_detach)
+        if occ2map_prior_feature_range is None:
+            if map_feature_range is not None:
+                occ2map_prior_feature_range = [
+                    map_feature_range[0],
+                    map_feature_range[1],
+                    float(self.shared_feature_range[2]),
+                    map_feature_range[2],
+                    map_feature_range[3],
+                    float(self.shared_feature_range[5]),
+                ]
+            else:
+                occ2map_prior_feature_range = self.shared_feature_range.tolist()
+        self.occ2map_prior_feature_range = torch.tensor(
+            occ2map_prior_feature_range, dtype=torch.float32)
+        self.occ2map_prior_context_z = int(occ2map_prior_context_z)
+        self.occ2map_prior_output_z_indices = tuple(
+            int(index) for index in occ2map_prior_output_z_indices)
+        self.occ2map_prior_class_ids = tuple(
+            int(index) for index in occ2map_prior_class_ids)
+        self._validate_occ2map_prior_cfg()
+
+    def _validate_occ2map_prior_cfg(self):
+        if not self.use_occ2map_prior:
+            return
+        if self.bev_seg_head is None:
+            raise ValueError(
+                'use_occ2map_prior=True requires a configured bev_seg_head.')
+        if self.map_feature_range is None or self.map_feature_size is None:
+            raise ValueError(
+                'use_occ2map_prior=True requires map_feature_range and '
+                'map_feature_size so the prior can be aligned to map BEV.')
+        if self.occ2map_prior_context_z <= 0:
+            raise ValueError('occ2map_prior_context_z must be positive.')
+        if not self.occ2map_prior_output_z_indices:
+            raise ValueError(
+                'occ2map_prior_output_z_indices must contain at least one '
+                'z index.')
+        if any(index < 0 for index in self.occ2map_prior_output_z_indices):
+            raise ValueError(
+                'occ2map_prior_output_z_indices must be non-negative.')
+        if len(self.occ2map_prior_class_ids) != 2:
+            raise ValueError(
+                'occ2map_prior_class_ids must be '
+                '[driveable_surface_id, sidewalk_id].')
+        if any(index < 0 for index in self.occ2map_prior_class_ids):
+            raise ValueError('occ2map_prior_class_ids must be non-negative.')
+        occ_num_classes = getattr(self.cnn3d_decoder, 'num_classes', None)
+        if (occ_num_classes is not None and
+                max(self.occ2map_prior_class_ids) >= occ_num_classes):
+            raise ValueError(
+                'occ2map_prior_class_ids contains an index outside '
+                f'cnn3d_decoder.num_classes={occ_num_classes}.')
 
     def _needs_pqd_query_info(self):
         return (
@@ -200,6 +260,89 @@ class ProtoOccCnnSegHead(BEVDet):
             slices[1],
             slices[2],
         ]
+
+    def _crop_occ2map_prior_feature(self, voxel_feature):
+        source_range = self.shared_feature_range.to(voxel_feature.device)
+        target_range = self.occ2map_prior_feature_range.to(
+            voxel_feature.device)
+        slices = self._feature_slices(
+            voxel_feature.shape[2:5], source_range, target_range)
+        z_slice = slices[2]
+        z_start = 0 if z_slice.start is None else z_slice.start
+        z_stop = voxel_feature.shape[4] if z_slice.stop is None else z_slice.stop
+        z_stop = min(z_stop, z_start + self.occ2map_prior_context_z)
+        if z_stop <= z_start:
+            raise ValueError(
+                'occ2map prior z crop is empty. Check '
+                'occ2map_prior_feature_range and occ2map_prior_context_z.')
+        return voxel_feature[
+            :,
+            :,
+            slices[0],
+            slices[1],
+            slice(z_start, z_stop),
+        ]
+
+    def _make_occ2map_prior(self, voxel_feature):
+        if not self.use_occ2map_prior:
+            return None
+
+        lowz_feature = self._crop_occ2map_prior_feature(voxel_feature)
+        if self.occ2map_prior_detach:
+            with torch.no_grad():
+                occ_logits, _ = self.cnn3d_decoder(
+                    lowz_feature.permute(0, 1, 4, 2, 3))
+        else:
+            occ_logits, _ = self.cnn3d_decoder(
+                lowz_feature.permute(0, 1, 4, 2, 3))
+
+        z_dim = occ_logits.shape[3]
+        if max(self.occ2map_prior_output_z_indices) >= z_dim:
+            raise ValueError(
+                'occ2map_prior_output_z_indices exceeds the decoded low-z '
+                f'feature depth: indices={self.occ2map_prior_output_z_indices}, '
+                f'z_dim={z_dim}.')
+
+        z_indices = torch.tensor(
+            self.occ2map_prior_output_z_indices,
+            device=occ_logits.device,
+            dtype=torch.long)
+        selected = F.softmax(occ_logits.float(), dim=-1).index_select(
+            3, z_indices)
+        driveable_id, sidewalk_id = self.occ2map_prior_class_ids
+        driveable_z = selected[..., driveable_id].clamp(0.0, 1.0)
+        sidewalk_z = selected[..., sidewalk_id].clamp(0.0, 1.0)
+        driveable = 1.0 - torch.prod(1.0 - driveable_z, dim=3)
+        sidewalk = 1.0 - torch.prod(1.0 - sidewalk_z, dim=3)
+
+        area_prior = torch.maximum(driveable, sidewalk)
+        thin_prior = driveable
+        prior = torch.stack((area_prior, thin_prior), dim=1).to(
+            dtype=voxel_feature.dtype)
+
+        grid = self._make_bev_grid(
+            prior,
+            self.occ2map_prior_feature_range,
+            self.map_feature_range,
+            self.map_feature_size)
+        prior = F.grid_sample(
+            prior,
+            grid,
+            mode='bilinear',
+            padding_mode='zeros',
+            align_corners=False)
+        if self.occ2map_prior_detach:
+            prior = prior.detach()
+        return prior
+
+    def _attach_occ2map_prior(self, map_feature, occ2map_prior):
+        if occ2map_prior is None:
+            return map_feature
+        if isinstance(map_feature, dict):
+            updated = dict(map_feature)
+            updated['occ2map_prior'] = occ2map_prior
+            return updated
+        return dict(bev_feature=map_feature, occ2map_prior=occ2map_prior)
 
     def _bev_xy_range(self, value, device, dtype):
         value = value.to(device=device, dtype=dtype)
@@ -385,10 +528,14 @@ class ProtoOccCnnSegHead(BEVDet):
             gt_masks_bev = self._normalize_map_targets(gt_masks_bev)
             if gt_masks_bev is None:
                 raise ValueError('Expected `gt_masks_bev` when training ProtoOccCnnSegHead with a BEV segmentation head.')
+            occ2map_prior = self._make_occ2map_prior(
+                comprehensive_voxel_feature)
             map_feature = self._select_map_feature(bev_feature, map_bev_feature)
             map_feature = self._align_map_feature(map_feature)
             map_feature = self._apply_voxel_aware_map_ingest(
                 map_feature, occ_voxel_feature, query_info)
+            map_feature = self._attach_occ2map_prior(
+                map_feature, occ2map_prior)
             self._check_map_feature_size(map_feature, gt_masks_bev)
             bev_seg_logits = self.bev_seg_head(map_feature)
             map_losses = self.bev_seg_head.loss(bev_seg_logits, gt_masks_bev)
@@ -435,9 +582,11 @@ class ProtoOccCnnSegHead(BEVDet):
             return occ_preds
 
         map_feature = self._select_map_feature(bev_feature, map_bev_feature)
+        occ2map_prior = self._make_occ2map_prior(comprehensive_voxel_feature)
         map_feature = self._align_map_feature(map_feature)
         map_feature = self._apply_voxel_aware_map_ingest(
             map_feature, occ_voxel_feature, query_info)
+        map_feature = self._attach_occ2map_prior(map_feature, occ2map_prior)
         bev_seg_probs = self.bev_seg_head.predict(self.bev_seg_head(map_feature)).detach().cpu().numpy()
         gt_masks_bev = self._normalize_map_targets(kwargs.get('gt_masks_bev'))
         if gt_masks_bev is not None:

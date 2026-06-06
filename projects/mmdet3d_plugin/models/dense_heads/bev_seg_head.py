@@ -125,6 +125,9 @@ class BEVSegHead(BaseModule):
                  map_active_gate_use_focal=True,
                  map_active_gate_use_dice=True,
                  map_active_gate_init_bias=-4.0,
+                 use_occ2map_active_gate_prior=False,
+                 occ2map_prior_channels=2,
+                 occ2map_prior_zero_init=True,
                  map_loss_type=None,
                  map_dice_weight=1.0,
                  map_focal_gamma=2.0,
@@ -194,6 +197,10 @@ class BEVSegHead(BaseModule):
         self.map_active_gate_use_focal = bool(map_active_gate_use_focal)
         self.map_active_gate_use_dice = bool(map_active_gate_use_dice)
         self.map_active_gate_init_bias = float(map_active_gate_init_bias)
+        self.use_occ2map_active_gate_prior = bool(
+            use_occ2map_active_gate_prior)
+        self.occ2map_prior_channels = int(occ2map_prior_channels)
+        self.occ2map_prior_zero_init = bool(occ2map_prior_zero_init)
         self.map_active_gate_class_groups = self._parse_active_gate_groups(
             map_active_gate_class_groups)
         self.map_active_gate_dilations = self._parse_active_gate_dilations(
@@ -315,8 +322,18 @@ class BEVSegHead(BaseModule):
                 nn.init.constant_(
                     self.map_active_gate[-1].bias,
                     self.map_active_gate_init_bias)
+                if self.use_occ2map_active_gate_prior:
+                    self.occ2map_gate_proj = nn.Conv2d(
+                        self.occ2map_prior_channels,
+                        self.map_active_gate_channels,
+                        kernel_size=1)
+                    if self.occ2map_prior_zero_init:
+                        self.occ2map_gate_proj.apply(_zero_init_conv)
+                else:
+                    self.occ2map_gate_proj = None
             else:
                 self.map_active_gate = None
+                self.occ2map_gate_proj = None
             if self.use_thin_roi_refinement:
                 roi_hidden = (
                     current_channels if self.thin_roi_hidden_channels is None
@@ -631,6 +648,11 @@ class BEVSegHead(BaseModule):
             raise ValueError('thin_roi_dilation must be >= 0.')
 
     def _validate_active_gate_cfg(self):
+        if (self.use_occ2map_active_gate_prior
+                and not self.use_map_active_enhance_gate):
+            raise ValueError(
+                'use_occ2map_active_gate_prior=True requires '
+                'use_map_active_enhance_gate=True.')
         if not self.use_map_active_enhance_gate:
             return
         if self.use_dual_area_line_head:
@@ -653,6 +675,9 @@ class BEVSegHead(BaseModule):
             raise ValueError('map_active_gate_beta must be >= 0.')
         if self.map_active_gate_loss_weight < 0:
             raise ValueError('map_active_gate_loss_weight must be >= 0.')
+        if (self.use_occ2map_active_gate_prior
+                and self.occ2map_prior_channels <= 0):
+            raise ValueError('occ2map_prior_channels must be positive.')
 
     def _validate_dual_head_indices(self):
         all_indices = self.area_class_indices + self.line_class_indices
@@ -783,8 +808,8 @@ class BEVSegHead(BaseModule):
             raise ValueError('dynamic_overlay_eps must be greater than zero.')
 
     def forward(self, bev_feature):
-        bev_feature, detail_feature, aux_features = self._split_forward_inputs(
-            bev_feature)
+        bev_feature, detail_feature, aux_features, occ2map_prior = (
+            self._split_forward_inputs(bev_feature))
         bev_feature = self._apply_coordconv(bev_feature)
 
         if self.use_dual_area_line_head:
@@ -793,7 +818,7 @@ class BEVSegHead(BaseModule):
         else:
             decoded_feature = self._run_decoder(self.decoder, bev_feature)
             decoded_feature, gate_logits = self._apply_map_active_gate(
-                decoded_feature)
+                decoded_feature, occ2map_prior)
             seg_logits = self.predictor(decoded_feature)
             seg_logits = self._apply_thin_roi_refinement(
                 decoded_feature, seg_logits)
@@ -815,10 +840,21 @@ class BEVSegHead(BaseModule):
 
         return seg_logits
 
-    def _apply_map_active_gate(self, decoded_feature):
+    def _apply_map_active_gate(self, decoded_feature, occ2map_prior=None):
         if not self.use_map_active_enhance_gate:
             return decoded_feature, None
         gate_logits = self.map_active_gate(decoded_feature)
+        if self.occ2map_gate_proj is not None and occ2map_prior is not None:
+            occ2map_prior = occ2map_prior.to(
+                device=gate_logits.device,
+                dtype=gate_logits.dtype)
+            if occ2map_prior.shape[-2:] != gate_logits.shape[-2:]:
+                occ2map_prior = F.interpolate(
+                    occ2map_prior,
+                    size=gate_logits.shape[-2:],
+                    mode='bilinear',
+                    align_corners=False)
+            gate_logits = gate_logits + self.occ2map_gate_proj(occ2map_prior)
         spatial_gate = gate_logits.sigmoid().amax(dim=1, keepdim=True)
         enhanced = decoded_feature * (
             1.0 + self.map_active_gate_beta * spatial_gate)
@@ -861,9 +897,11 @@ class BEVSegHead(BaseModule):
     def _split_forward_inputs(self, bev_feature):
         detail_feature = None
         aux_features = {}
+        occ2map_prior = None
         if isinstance(bev_feature, dict):
             detail_feature = bev_feature.get('detail_feature', None)
             aux_features = bev_feature.get('aux_features', {}) or {}
+            occ2map_prior = bev_feature.get('occ2map_prior', None)
             bev_feature = bev_feature.get('bev_feature', None)
             if bev_feature is None:
                 raise ValueError(
@@ -873,10 +911,11 @@ class BEVSegHead(BaseModule):
                 raise ValueError('BEVSegHead tuple/list input must not be empty.')
             detail_feature = bev_feature[1] if len(bev_feature) > 1 else None
             aux_features = bev_feature[2] if len(bev_feature) > 2 else {}
+            occ2map_prior = bev_feature[3] if len(bev_feature) > 3 else None
             bev_feature = bev_feature[0]
         aux_features = {str(level): feat
                         for level, feat in aux_features.items()}
-        return bev_feature, detail_feature, aux_features
+        return bev_feature, detail_feature, aux_features, occ2map_prior
 
     def _build_bev_coord(self, bev_feature):
         batch_size, _, height, width = bev_feature.shape

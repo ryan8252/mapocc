@@ -484,7 +484,7 @@ class Dual_Branch_Encoder(nn.Module):
                 'map_highres_fusion must be one of '
                 f'{valid_highres_fusions}, got {map_highres_fusion!r}.')
         self.map_highres_fusion = map_highres_fusion
-        valid_z_compression_types = ('conv3d', 'height_attention')
+        valid_z_compression_types = ('conv3d', 'height_attention', 'sum')
         if map_z_compression_type not in valid_z_compression_types:
             raise ValueError(
                 'map_z_compression_type must be one of '
@@ -527,6 +527,16 @@ class Dual_Branch_Encoder(nn.Module):
                 self.map_z_refine_3d = self._make_map_z_refine3d(vox_feat1)
                 self.map_height_attn = None
                 self.map_height_project = None
+                self.map_z_sum_project = None
+            elif self.map_z_compression_type == 'sum':
+                self.map_z_refine_3d = None
+                self.map_height_attn = None
+                self.map_height_project = None
+                self.map_z_sum_project = nn.Conv2d(
+                    vox_feat1,
+                    map_x0_channels,
+                    kernel_size=1,
+                    padding=0)
             else:
                 self.map_z_refine_3d = None
                 self.map_height_attn = nn.Conv3d(
@@ -538,10 +548,12 @@ class Dual_Branch_Encoder(nn.Module):
                 nn.init.zeros_(self.map_height_attn.weight)
                 if self.map_height_attn.bias is not None:
                     nn.init.zeros_(self.map_height_attn.bias)
+                self.map_z_sum_project = None
         else:
             self.map_z_refine_3d = None
             self.map_height_attn = None
             self.map_height_project = None
+            self.map_z_sum_project = None
         self.map_pre_backbone_adapter = (
             MapPreBackboneAdapter(
                 channels=map_x0_channels,
@@ -736,6 +748,8 @@ class Dual_Branch_Encoder(nn.Module):
             refined = source + self._forward_map_z_refine3d(source)
             return self.down_sample_for_3d_pooling(
                 self._flatten_z_as_channels(refined))
+        if self.map_z_compression_type == 'sum':
+            return self.map_z_sum_project(source.sum(dim=2))
 
         height_logits = self.map_height_attn(source)
         height_weight = torch.softmax(height_logits, dim=2)

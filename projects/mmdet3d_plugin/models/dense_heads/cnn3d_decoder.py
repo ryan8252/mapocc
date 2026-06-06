@@ -106,14 +106,17 @@ class cnn3d_decoder(BaseModule):
         Returns:
 
         """
-        if self.with_cp:
+        use_checkpoint = (
+            self.with_cp and self.training and torch.is_grad_enabled()
+            and img_feats.requires_grad)
+        if use_checkpoint:
             occ_feat = checkpoint(self.final_conv ,img_feats)
             occ_feat = occ_feat.permute(0, 4, 3, 2, 1)
         else:
             occ_feat = self.final_conv(img_feats).permute(0, 4, 3, 2, 1)
         
         mask_feat = occ_feat
-        if self.with_cp:
+        if use_checkpoint:
             occ_pred = checkpoint(self.predicter, occ_feat)
         else:
             occ_pred = self.predicter(occ_feat)

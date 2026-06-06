@@ -31,6 +31,9 @@ class ProtoOccMapOnly(BEVDet):
         self.bev_seg_head = build_head(bev_seg_head)
         self.map_loss_weight = map_loss_weight
         self.train_depth = train_depth
+        if not self.train_depth and hasattr(self.depth_net, 'class_predictor'):
+            for param in self.depth_net.class_predictor.parameters():
+                param.requires_grad_(False)
         # Optional BEVFusion-aligned map grid: resample the map feature from the
         # shared feature range (e.g. +-51.2m) onto the map eval grid
         # (e.g. +-50m / 0.5m). Defaults keep the legacy single-grid behaviour.

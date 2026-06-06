@@ -132,6 +132,82 @@ class NuScenesDatasetMultitask(NuScenesDatasetOccpancy):
         metrics['map/mean/iou@max'] = ious.max(dim=1).values.mean().item()
         return metrics
 
+    @staticmethod
+    def _build_ring_masks(h, w, map_range, ring_edges):
+        """Boolean (h*w,) masks per radial distance ring.
+
+        The BEV grid is assumed to cover [-map_range, map_range] in both axes
+        with `h`/`w` cells. Cell centres are used to compute the ego-centric
+        radial distance; rings are [edge_i, edge_{i+1}). Radial rings are
+        rotation-invariant, so axis order / flips do not matter here.
+        """
+        cy = (torch.arange(h).float() + 0.5) / h * (2.0 * map_range) - map_range
+        cx = (torch.arange(w).float() + 0.5) / w * (2.0 * map_range) - map_range
+        yy, xx = torch.meshgrid(cy, cx, indexing='ij')
+        dist = torch.sqrt(xx ** 2 + yy ** 2).reshape(-1)
+        masks = []
+        for lo, hi in zip(ring_edges[:-1], ring_edges[1:]):
+            masks.append((dist >= lo) & (dist < hi))
+        return masks
+
+    def evaluate_map_rings(self, results, map_range=50.0,
+                           ring_edges=(0.0, 20.0, 40.0, 50.0, 71.0)):
+        """Per-distance-ring map IoU on the native eval grid.
+
+        Diagnoses where the map gap lives (e.g. near-field vs the 40-50m ring
+        that is camera-starved when LSS lift/depth stop at 45m). Same TP/FP/FN
+        IoU definition as `evaluate_map`, just restricted to each radial ring.
+        """
+        thresholds = torch.tensor([0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65])
+        num_classes = len(self.map_classes)
+        num_rings = len(ring_edges) - 1
+        tp = torch.zeros(num_rings, num_classes, len(thresholds))
+        fp = torch.zeros(num_rings, num_classes, len(thresholds))
+        fn = torch.zeros(num_rings, num_classes, len(thresholds))
+        # Coverage accumulators (starvation precheck): is the model even
+        # predicting positives in the far rings vs what the GT requires?
+        gt_pos = torch.zeros(num_rings, num_classes)        # GT-positive cells
+        pred_pos = torch.zeros(num_rings, num_classes)      # pred>=0.35 cells
+        prob_sum = torch.zeros(num_rings, num_classes)      # sum of pred prob
+        ring_cells = torch.zeros(num_rings)                 # cells per ring
+        ring_masks = None
+
+        for result in results:
+            pred = torch.as_tensor(result['masks_bev']).detach().float()
+            label = torch.as_tensor(result['gt_masks_bev']).detach().bool()
+            h, w = pred.shape[-2:]
+            if ring_masks is None:
+                ring_masks = self._build_ring_masks(h, w, map_range, ring_edges)
+
+            pred = pred.reshape(num_classes, -1)
+            label = label.reshape(num_classes, -1)
+            pred_bin = pred[:, :, None] >= thresholds       # (C, HW, T)
+            label_bin = label[:, :, None]                   # (C, HW, 1)
+            for ri, mask in enumerate(ring_masks):
+                pb = pred_bin[:, mask, :]
+                lb = label_bin[:, mask, :]
+                tp[ri] += (pb & lb).sum(dim=1)
+                fp[ri] += (pb & ~lb).sum(dim=1)
+                fn[ri] += (~pb & lb).sum(dim=1)
+                gt_pos[ri] += label[:, mask].sum(dim=1)
+                pred_pos[ri] += (pred[:, mask] >= 0.35).sum(dim=1)
+                prob_sum[ri] += pred[:, mask].sum(dim=1)
+                ring_cells[ri] += int(mask.sum())
+
+        ious = tp / (tp + fp + fn + 1e-7)                   # (R, C, T)
+        metrics = {}
+        for ri, (lo, hi) in enumerate(zip(ring_edges[:-1], ring_edges[1:])):
+            tag = f'map_ring{lo:g}-{hi:g}m'
+            per_class_max = ious[ri].max(dim=1).values       # (C,)
+            cells = ring_cells[ri].clamp(min=1.0)
+            for ci, name in enumerate(self.map_classes):
+                metrics[f'{tag}/{name}/iou@max'] = per_class_max[ci].item()
+                metrics[f'{tag}/{name}/gt_pos_rate'] = (gt_pos[ri, ci] / cells).item()
+                metrics[f'{tag}/{name}/pred_pos_rate@0.35'] = (pred_pos[ri, ci] / cells).item()
+                metrics[f'{tag}/{name}/mean_prob'] = (prob_sum[ri, ci] / cells).item()
+            metrics[f'{tag}/mean/iou@max'] = per_class_max.mean().item()
+        return metrics
+
     def evaluate(self, results, runner=None, show_dir=None, **eval_kwargs):
         if len(results) == 0 or not isinstance(results[0], dict):
             return super(NuScenesDatasetMultitask, self).evaluate(
@@ -163,6 +239,18 @@ class NuScenesDatasetMultitask(NuScenesDatasetOccpancy):
                 for metric in metrics):
             # Native-grid map metrics (whatever grid the GT pipeline produced).
             eval_results.update(self.evaluate_map(results))
+
+            # Optional per-distance-ring breakdown on the native eval grid, to
+            # localise where the map gap lives. Pass via --eval-options:
+            #   map_ring_edges=0,20,40,50,71 map_ring_range=50
+            map_ring_edges = eval_kwargs.get('map_ring_edges', None)
+            if map_ring_edges is not None:
+                if isinstance(map_ring_edges, str):
+                    map_ring_edges = [float(x) for x in map_ring_edges.split(',')]
+                map_ring_edges = tuple(float(x) for x in map_ring_edges)
+                map_ring_range = float(eval_kwargs.get('map_ring_range', 50.0))
+                eval_results.update(self.evaluate_map_rings(
+                    results, map_range=map_ring_range, ring_edges=map_ring_edges))
 
             # Optional same-ruler re-grid(s) for fair comparison against papers
             # evaluated at a different range/resolution (e.g. MAESTRO's
