@@ -213,15 +213,28 @@ class MapHFMFusionLayer(nn.Module):
                  voxel_channels,
                  hidden_channels=None,
                  learnable_residual_gate=False,
-                 residual_gate_init=0.1):
+                 residual_gate_init=0.1,
+                 fusion_mode='residual_concat',
+                 voxel_residual_scale=1.0):
         super().__init__()
         self.bev_channels = bev_channels
         self.voxel_channels = voxel_channels
         self.learnable_residual_gate = bool(learnable_residual_gate)
+        valid_fusion_modes = ('residual_concat', 'voxel_add')
+        if fusion_mode not in valid_fusion_modes:
+            raise ValueError(
+                'MapHFMFusionLayer fusion_mode must be one of '
+                f'{valid_fusion_modes}, got {fusion_mode!r}.')
+        self.fusion_mode = fusion_mode
+        self.voxel_residual_scale = float(voxel_residual_scale)
         hidden_channels = hidden_channels or bev_channels
+        fusion_in_channels = (
+            bev_channels + voxel_channels * 2
+            if self.fusion_mode == 'residual_concat'
+            else voxel_channels * 2)
         self.fusion = nn.Sequential(
             nn.Conv2d(
-                bev_channels + voxel_channels * 2,
+                fusion_in_channels,
                 hidden_channels,
                 kernel_size=3,
                 padding=1,
@@ -275,7 +288,11 @@ class MapHFMFusionLayer(nn.Module):
                 size=bev_feature.shape[-2:],
                 mode='bilinear',
                 align_corners=True)
-        delta = self.fusion(torch.cat([bev_feature, voxel_bev], dim=1))
+        if self.fusion_mode == 'residual_concat':
+            fusion_input = torch.cat([bev_feature, voxel_bev], dim=1)
+        else:
+            fusion_input = voxel_bev
+        delta = self.fusion(fusion_input) * self.voxel_residual_scale
         if self.residual_gate is not None:
             delta = torch.sigmoid(self.residual_gate).view(1, 1, 1, 1) * delta
         return bev_feature + delta
@@ -441,6 +458,9 @@ class Dual_Branch_Encoder(nn.Module):
         use_map_hfm=False,
         map_hfm_lower_source='vox3',
         map_hfm_with_cp=None,
+        map_hfm_order='hfm_then_adapter',
+        map_hfm_fusion_mode='residual_concat',
+        map_hfm_voxel_residual_scale=1.0,
         map_hfm_learnable_residual_gate=False,
         map_hfm_residual_gate_init=0.1,
         map_highres_skip=False,
@@ -467,6 +487,15 @@ class Dual_Branch_Encoder(nn.Module):
         self.return_map_feature = return_map_feature
         self.detach_map_feature = detach_map_feature
         self.use_map_hfm = use_map_hfm
+        valid_map_hfm_orders = ('hfm_then_adapter', 'adapter_then_hfm')
+        if map_hfm_order not in valid_map_hfm_orders:
+            raise ValueError(
+                'map_hfm_order must be one of '
+                f'{valid_map_hfm_orders}, got {map_hfm_order!r}.')
+        self.map_hfm_order = map_hfm_order
+        self.map_hfm_fusion_mode = map_hfm_fusion_mode
+        self.map_hfm_voxel_residual_scale = float(
+            map_hfm_voxel_residual_scale)
         if map_hfm_lower_source not in ('vox2', 'vox3'):
             raise ValueError(
                 "map_hfm_lower_source must be one of 'vox2' or 'vox3', "
@@ -608,17 +637,23 @@ class Dual_Branch_Encoder(nn.Module):
                     bev_feat_ch1,
                     vox_feat2,
                     learnable_residual_gate=self.map_hfm_learnable_residual_gate,
-                    residual_gate_init=self.map_hfm_residual_gate_init),
+                    residual_gate_init=self.map_hfm_residual_gate_init,
+                    fusion_mode=self.map_hfm_fusion_mode,
+                    voxel_residual_scale=self.map_hfm_voxel_residual_scale),
                 MapHFMFusionLayer(
                     bev_feat_ch2,
                     vox_feat2,
                     learnable_residual_gate=self.map_hfm_learnable_residual_gate,
-                    residual_gate_init=self.map_hfm_residual_gate_init),
+                    residual_gate_init=self.map_hfm_residual_gate_init,
+                    fusion_mode=self.map_hfm_fusion_mode,
+                    voxel_residual_scale=self.map_hfm_voxel_residual_scale),
                 MapHFMFusionLayer(
                     bev_feat_ch3,
                     lower_vox_channels,
                     learnable_residual_gate=self.map_hfm_learnable_residual_gate,
-                    residual_gate_init=self.map_hfm_residual_gate_init),
+                    residual_gate_init=self.map_hfm_residual_gate_init,
+                    fusion_mode=self.map_hfm_fusion_mode,
+                    voxel_residual_scale=self.map_hfm_voxel_residual_scale),
             ])
         else:
             self.map_hfm_layers = None
@@ -841,18 +876,30 @@ class Dual_Branch_Encoder(nn.Module):
 
         map_bev_feature = None
         if self.map_bev_encoder_neck is not None:
-            if self.use_map_hfm:
-                # Inject voxel-branch geometry into the map BEV path. Detach of
-                # the shared sources (if enabled) is handled inside the builder.
-                map_source = self._build_map_hfm_features(
-                    map_multi_scale_bev, vox_res, vox1, vox2, vox3)
-            elif self.detach_map_feature:
-                map_source = [feat.detach() for feat in map_multi_scale_bev]
+            if self.map_hfm_order == 'adapter_then_hfm':
+                map_source = (
+                    [feat.detach() for feat in map_multi_scale_bev]
+                    if self.detach_map_feature else map_multi_scale_bev)
+                if self.map_residual_adapter is not None:
+                    # First convert the shared BEV pyramid into a map-specific
+                    # BEV pyramid, then inject collapsed voxel geometry.
+                    map_source = self.map_residual_adapter(map_source)
+                if self.use_map_hfm:
+                    map_source = self._build_map_hfm_features(
+                        map_source, vox_res, vox1, vox2, vox3)
             else:
-                map_source = map_multi_scale_bev
-            if self.map_residual_adapter is not None:
-                # 2D zero-init refinement, applied after the geometry injection.
-                map_source = self.map_residual_adapter(map_source)
+                if self.use_map_hfm:
+                    # Inject voxel-branch geometry into the map BEV path. Detach
+                    # of the shared sources (if enabled) is handled inside the builder.
+                    map_source = self._build_map_hfm_features(
+                        map_multi_scale_bev, vox_res, vox1, vox2, vox3)
+                elif self.detach_map_feature:
+                    map_source = [feat.detach() for feat in map_multi_scale_bev]
+                else:
+                    map_source = map_multi_scale_bev
+                if self.map_residual_adapter is not None:
+                    # 2D zero-init refinement, applied after the geometry injection.
+                    map_source = self.map_residual_adapter(map_source)
             map_bev = self.map_bev_encoder_neck(map_source)
             map_bev_feature = map_bev[0] if isinstance(map_bev, (list, tuple)) else map_bev
             if self.map_highres_skip:
@@ -957,6 +1004,59 @@ class MapOnly_BEV_Encoder(nn.Module):
 
 
 @BACKBONES.register_module()
+class MapOnly_BEV2D_Encoder(nn.Module):
+    """ProtoOcc map encoder variant for a 2D LSS BEV feature.
+
+    This keeps the existing CustomBEVBackbone + Custom_FPN_LSS map decoder but
+    replaces the fixed cat-Z input with a 4D BEV feature produced by
+    collapse_z=True. It is used to isolate the view-transform representation
+    from the BEVFusion decoder change.
+    """
+
+    def __init__(self,
+                 input_projection=None,
+                 bev_encoder_backbone=None,
+                 map_bev_encoder_neck=None,
+                 detach_map_feature=False):
+        super().__init__()
+        if input_projection is None:
+            self.input_projection = nn.Identity()
+        else:
+            if len(input_projection) != 2:
+                raise ValueError(
+                    'input_projection must be [in_channels, out_channels].')
+            self.input_projection = nn.Conv2d(
+                input_projection[0],
+                input_projection[1],
+                kernel_size=1,
+                padding=0,
+                stride=1)
+        if bev_encoder_backbone is None:
+            raise ValueError(
+                'MapOnly_BEV2D_Encoder requires bev_encoder_backbone.')
+        if map_bev_encoder_neck is None:
+            raise ValueError(
+                'MapOnly_BEV2D_Encoder requires map_bev_encoder_neck.')
+
+        self.detach_map_feature = detach_map_feature
+        self.bev_encoder_backbone = builder.build_backbone(
+            bev_encoder_backbone)
+        self.map_bev_encoder_neck = builder.build_neck(map_bev_encoder_neck)
+
+    def forward(self, x):
+        if x.dim() != 4:
+            raise ValueError(
+                'MapOnly_BEV2D_Encoder expects a 4D BEV feature '
+                f'[B, C, H, W], got shape {tuple(x.shape)}.')
+        x = self.input_projection(x)
+        multi_scale_bev = self.bev_encoder_backbone(x)
+        if self.detach_map_feature:
+            multi_scale_bev = [feat.detach() for feat in multi_scale_bev]
+        map_bev = self.map_bev_encoder_neck(multi_scale_bev)
+        return map_bev[0] if isinstance(map_bev, (list, tuple)) else map_bev
+
+
+@BACKBONES.register_module()
 class MapOnly_BEVFusion_Encoder(nn.Module):
     """Map-only BEVFusion-style 2D decoder.
 
@@ -967,6 +1067,7 @@ class MapOnly_BEVFusion_Encoder(nn.Module):
     def __init__(self,
                  bev_decoder_backbone=None,
                  bev_decoder_neck=None,
+                 input_projection=None,
                  z_collapse='sum'):
         super().__init__()
         if bev_decoder_backbone is None:
@@ -976,6 +1077,18 @@ class MapOnly_BEVFusion_Encoder(nn.Module):
             raise ValueError(
                 'MapOnly_BEVFusion_Encoder requires bev_decoder_neck.')
         self.z_collapse = str(z_collapse)
+        if input_projection is None:
+            self.input_projection = nn.Identity()
+        else:
+            if len(input_projection) != 2:
+                raise ValueError(
+                    'input_projection must be [in_channels, out_channels].')
+            self.input_projection = nn.Conv2d(
+                input_projection[0],
+                input_projection[1],
+                kernel_size=1,
+                padding=0,
+                stride=1)
         self.bev_decoder_backbone = builder.build_backbone(
             bev_decoder_backbone)
         self.bev_decoder_neck = builder.build_neck(bev_decoder_neck)
@@ -1001,6 +1114,7 @@ class MapOnly_BEVFusion_Encoder(nn.Module):
 
     def forward(self, x):
         x = self._collapse_if_needed(x)
+        x = self.input_projection(x)
         multi_scale_bev = self.bev_decoder_backbone(x)
         return self.bev_decoder_neck(multi_scale_bev)
 

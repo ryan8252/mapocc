@@ -6,5 +6,6 @@ from .task_modules import MapTopologyEncoder
 
 __all__ = ['ResNet', 'CustomResNet', 'GeneralizedResNet',
            'Dual_Branch_Encoder', 'MapOnly_BEV_Encoder',
+           'MapOnly_BEV2D_Encoder',
            'MapOnly_BEVFusion_Encoder', 'MapOnly_MTE_Encoder',
            'MapZResidualLayer', 'CustomBEVBackbone', 'MapTopologyEncoder']
