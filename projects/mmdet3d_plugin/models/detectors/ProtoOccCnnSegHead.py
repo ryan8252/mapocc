@@ -19,6 +19,9 @@ class ProtoOccCnnSegHead(BEVDet):
                  cnn3d_decoder=None,
                  prototype_query_decoder=None,
                  bev_seg_head=None,
+                 map_img_view_transformer=None,
+                 map_lss2d_encoder=None,
+                 use_lss2d_as_bev_branch=False,
                  voxel_aware_map_ingest=None,
                  shared_feature_range=None,
                  occ_feature_range=None,
@@ -43,6 +46,20 @@ class ProtoOccCnnSegHead(BEVDet):
         self.cnn3d_decoder = build_head(cnn3d_decoder)
         self.prototype_query_decoder = build_head(prototype_query_decoder)
         self.bev_seg_head = build_head(bev_seg_head) if bev_seg_head is not None else None
+        self.map_img_view_transformer = (
+            builder.build_neck(map_img_view_transformer)
+            if map_img_view_transformer is not None else None)
+        self.map_lss2d_encoder = (
+            builder.build_backbone(map_lss2d_encoder)
+            if map_lss2d_encoder is not None else None)
+        self.use_lss2d_as_bev_branch = bool(use_lss2d_as_bev_branch)
+        needs_map_lss2d = (
+            self.map_lss2d_encoder is not None
+            or self.use_lss2d_as_bev_branch)
+        if needs_map_lss2d and self.map_img_view_transformer is None:
+            raise ValueError(
+                'map_lss2d_encoder/use_lss2d_as_bev_branch requires '
+                'map_img_view_transformer.')
         self.voxel_aware_map_ingest = (
             build_head(voxel_aware_map_ingest)
             if voxel_aware_map_ingest is not None else None)
@@ -170,7 +187,7 @@ class ProtoOccCnnSegHead(BEVDet):
         x = x.view(B, N, output_dim, ouput_H, output_W)
         return x, stereo_feat
         
-    def extract_img_feat(self, img_inputs, img_metas, **kwargs):
+    def _extract_img_feat_impl(self, img_inputs, img_metas, **kwargs):
         img_inputs = self.prepare_inputs(img_inputs)
         x, _ = self.image_encoder(img_inputs[0])
         cam_params = img_inputs[1:7]
@@ -178,12 +195,24 @@ class ProtoOccCnnSegHead(BEVDet):
         mlp_input = self.depth_net.get_mlp_input(*cam_params)
         pv_feat, depth = self.depth_net(x, mlp_input)
         voxel_feat, depth = self.img_view_transformer(depth, pv_feat, [x] + img_inputs[1:7])
+        map_lss2d_feat = None
+        if self.map_img_view_transformer is not None:
+            map_lss2d_feat, _ = self.map_img_view_transformer(
+                depth, pv_feat, [x] + img_inputs[1:7])
 
+        return voxel_feat, depth, pv_feat, map_lss2d_feat
+
+    def extract_img_feat(self, img_inputs, img_metas, **kwargs):
+        voxel_feat, depth, pv_feat, _ = self._extract_img_feat_impl(
+            img_inputs, img_metas, **kwargs)
         return voxel_feat, depth, pv_feat
 
     def extract_feat(self, img_inputs, img_metas, **kwargs):
         voxel_feat, depth, pv_feat = self.extract_img_feat(img_inputs, img_metas, **kwargs)
         return voxel_feat, depth, pv_feat
+
+    def extract_feat_with_map_lss(self, img_inputs, img_metas, **kwargs):
+        return self._extract_img_feat_impl(img_inputs, img_metas, **kwargs)
 
     def _split_encoder_output(self, encoder_output):
         if isinstance(encoder_output, tuple):
@@ -197,12 +226,21 @@ class ProtoOccCnnSegHead(BEVDet):
                 f'but got {len(encoder_output)}.')
         return encoder_output, None, None
 
-    def _select_map_feature(self, bev_feature, map_bev_feature):
-        map_feature = map_bev_feature if map_bev_feature is not None else bev_feature
+    def _select_map_feature(self,
+                            bev_feature,
+                            map_bev_feature,
+                            lss2d_map_feature=None):
+        if lss2d_map_feature is not None:
+            map_feature = lss2d_map_feature
+        elif map_bev_feature is not None:
+            map_feature = map_bev_feature
+        else:
+            map_feature = bev_feature
         if map_feature is None:
             raise ValueError(
                 'BEV segmentation head requires either bev_feature or '
-                'map_bev_feature from Dual_Branch_Encoder.')
+                'map_bev_feature from Dual_Branch_Encoder, or a '
+                'map_lss2d_encoder output.')
         return map_feature
 
     def _get_map_feature_tensor(self, map_feature):
@@ -488,10 +526,15 @@ class ProtoOccCnnSegHead(BEVDet):
                       non_vis_semantic_voxel=None,
                       **kwargs):
         # 2D to 3D view transformation
-        voxel_feat, depth, pv_feat = self.extract_feat(img_inputs=img_inputs, img_metas=img_metas, **kwargs)
+        voxel_feat, depth, pv_feat, map_lss2d_feat = \
+            self.extract_feat_with_map_lss(
+                img_inputs=img_inputs, img_metas=img_metas, **kwargs)
 
         # Dual Branch Encoder (DBE)
-        encoder_output = self.dual_branch_encoder(voxel_feat)
+        bev_branch_input = (
+            map_lss2d_feat if self.use_lss2d_as_bev_branch else None)
+        encoder_output = self.dual_branch_encoder(
+            voxel_feat, bev_branch_input=bev_branch_input)
         comprehensive_voxel_feature, bev_feature, map_bev_feature = \
             self._split_encoder_output(encoder_output)
         occ_voxel_feature = self._crop_occ_feature(comprehensive_voxel_feature)
@@ -530,7 +573,11 @@ class ProtoOccCnnSegHead(BEVDet):
                 raise ValueError('Expected `gt_masks_bev` when training ProtoOccCnnSegHead with a BEV segmentation head.')
             occ2map_prior = self._make_occ2map_prior(
                 comprehensive_voxel_feature)
-            map_feature = self._select_map_feature(bev_feature, map_bev_feature)
+            lss2d_map_feature = (
+                self.map_lss2d_encoder(map_lss2d_feat)
+                if self.map_lss2d_encoder is not None else None)
+            map_feature = self._select_map_feature(
+                bev_feature, map_bev_feature, lss2d_map_feature)
             map_feature = self._align_map_feature(map_feature)
             map_feature = self._apply_voxel_aware_map_ingest(
                 map_feature, occ_voxel_feature, query_info)
@@ -550,10 +597,15 @@ class ProtoOccCnnSegHead(BEVDet):
                     rescale=False,
                     **kwargs):
         # 2D to 3D view transformation
-        voxel_feat, depth, pv_feat = self.extract_feat(img_inputs=img, img_metas=img_metas, **kwargs)
+        voxel_feat, depth, pv_feat, map_lss2d_feat = \
+            self.extract_feat_with_map_lss(
+                img_inputs=img, img_metas=img_metas, **kwargs)
 
         # Dual Branch Encoder (DBE)
-        encoder_output = self.dual_branch_encoder(voxel_feat)
+        bev_branch_input = (
+            map_lss2d_feat if self.use_lss2d_as_bev_branch else None)
+        encoder_output = self.dual_branch_encoder(
+            voxel_feat, bev_branch_input=bev_branch_input)
         comprehensive_voxel_feature, bev_feature, map_bev_feature = \
             self._split_encoder_output(encoder_output)
         occ_voxel_feature = self._crop_occ_feature(comprehensive_voxel_feature)
@@ -581,7 +633,11 @@ class ProtoOccCnnSegHead(BEVDet):
         if self.bev_seg_head is None:
             return occ_preds
 
-        map_feature = self._select_map_feature(bev_feature, map_bev_feature)
+        lss2d_map_feature = (
+            self.map_lss2d_encoder(map_lss2d_feat)
+            if self.map_lss2d_encoder is not None else None)
+        map_feature = self._select_map_feature(
+            bev_feature, map_bev_feature, lss2d_map_feature)
         occ2map_prior = self._make_occ2map_prior(comprehensive_voxel_feature)
         map_feature = self._align_map_feature(map_feature)
         map_feature = self._apply_voxel_aware_map_ingest(
