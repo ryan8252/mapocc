@@ -12,6 +12,7 @@ bevfusion_decoder_in_channels = 64
 map_bev_channels = 128
 
 model = dict(
+    img_backbone=dict(pretrained=None),
     map_bev_encoder=dict(
         _delete_=True,
         type='MapOnly_BEVFusion_Encoder',

@@ -10,6 +10,7 @@ numC_Trans = 80
 map_bev_channels = 256
 
 model = dict(
+    img_backbone=dict(pretrained=None),
     map_bev_encoder=dict(
         map_bev_encoder_neck=dict(
             type='Custom_FPN_LSS',

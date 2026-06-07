@@ -24,6 +24,7 @@ grid_config_3dpool = {
 }
 
 model = dict(
+    img_backbone=dict(pretrained=None),
     depth_net=dict(
         grid_config=grid_config,
         depth_channels=depth_categories),

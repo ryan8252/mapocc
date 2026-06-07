@@ -6,7 +6,7 @@ _base_ = ['./ProtoOcc_multi_cnn_head_map_neck_bevfusion_aligned_map_only_focal_n
 # the C4/C5 CustomFPN image neck with BEVFusion camera-r50's C2-C5 SECONDFPN.
 # No OCC, no PV depth loss, no PV segmentation loss.
 model = dict(
-    img_backbone=dict(out_indices=(0, 1, 2, 3)),
+    img_backbone=dict(pretrained=None, out_indices=(0, 1, 2, 3)),
     img_neck=dict(
         _delete_=True,
         type='SECONDFPN',

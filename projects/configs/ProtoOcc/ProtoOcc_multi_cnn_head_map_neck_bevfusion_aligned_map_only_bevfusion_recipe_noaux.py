@@ -23,7 +23,7 @@ grid_config_3dpool = {
 }
 
 model = dict(
-    img_backbone=dict(out_indices=(0, 1, 2, 3)),
+    img_backbone=dict(pretrained=None, out_indices=(0, 1, 2, 3)),
     img_neck=dict(
         _delete_=True,
         type='SECONDFPN',
