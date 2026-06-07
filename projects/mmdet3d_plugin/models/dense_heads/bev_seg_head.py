@@ -128,6 +128,8 @@ class BEVSegHead(BaseModule):
                  use_occ2map_active_gate_prior=False,
                  occ2map_prior_channels=2,
                  occ2map_prior_zero_init=True,
+                 occ2map_prior_gate_scale=1.0,
+                 occ2map_prior_gate_channel_mask=None,
                  map_loss_type=None,
                  map_dice_weight=1.0,
                  map_focal_gamma=2.0,
@@ -201,6 +203,10 @@ class BEVSegHead(BaseModule):
             use_occ2map_active_gate_prior)
         self.occ2map_prior_channels = int(occ2map_prior_channels)
         self.occ2map_prior_zero_init = bool(occ2map_prior_zero_init)
+        self.occ2map_prior_gate_scale = float(occ2map_prior_gate_scale)
+        self.occ2map_prior_gate_channel_mask = (
+            None if occ2map_prior_gate_channel_mask is None
+            else [float(v) for v in occ2map_prior_gate_channel_mask])
         self.map_active_gate_class_groups = self._parse_active_gate_groups(
             map_active_gate_class_groups)
         self.map_active_gate_dilations = self._parse_active_gate_dilations(
@@ -675,9 +681,17 @@ class BEVSegHead(BaseModule):
             raise ValueError('map_active_gate_beta must be >= 0.')
         if self.map_active_gate_loss_weight < 0:
             raise ValueError('map_active_gate_loss_weight must be >= 0.')
-        if (self.use_occ2map_active_gate_prior
-                and self.occ2map_prior_channels <= 0):
-            raise ValueError('occ2map_prior_channels must be positive.')
+        if self.use_occ2map_active_gate_prior:
+            if self.occ2map_prior_channels <= 0:
+                raise ValueError('occ2map_prior_channels must be positive.')
+            if self.occ2map_prior_gate_scale < 0:
+                raise ValueError('occ2map_prior_gate_scale must be >= 0.')
+            if (self.occ2map_prior_gate_channel_mask is not None
+                    and len(self.occ2map_prior_gate_channel_mask)
+                    != self.map_active_gate_channels):
+                raise ValueError(
+                    'occ2map_prior_gate_channel_mask length must match '
+                    'map_active_gate_channels.')
 
     def _validate_dual_head_indices(self):
         all_indices = self.area_class_indices + self.line_class_indices
@@ -854,7 +868,13 @@ class BEVSegHead(BaseModule):
                     size=gate_logits.shape[-2:],
                     mode='bilinear',
                     align_corners=False)
-            gate_logits = gate_logits + self.occ2map_gate_proj(occ2map_prior)
+            prior_logits = self.occ2map_gate_proj(occ2map_prior)
+            if self.occ2map_prior_gate_channel_mask is not None:
+                channel_mask = prior_logits.new_tensor(
+                    self.occ2map_prior_gate_channel_mask).view(1, -1, 1, 1)
+                prior_logits = prior_logits * channel_mask
+            gate_logits = gate_logits + (
+                self.occ2map_prior_gate_scale * prior_logits)
         spatial_gate = gate_logits.sigmoid().amax(dim=1, keepdim=True)
         enhanced = decoded_feature * (
             1.0 + self.map_active_gate_beta * spatial_gate)

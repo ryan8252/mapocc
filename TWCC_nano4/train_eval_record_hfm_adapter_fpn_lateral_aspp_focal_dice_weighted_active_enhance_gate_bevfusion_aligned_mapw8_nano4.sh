@@ -1,26 +1,15 @@
 #!/bin/bash
 
 # Nano4 / 25a-lgn01 Singularity sbatch launcher for:
-# Strong HFM-adapter + FPN lateral ASPP + focal-Dice weighted map loss
-# + active gate + OCC2Map low-Z soft prior, evaluated on the
-# BEVFusion/MAESTRO aligned map protocol.
+#   active-gate aligned MTL with map_loss_weight=8.
 #
-# Default regime:
-#   full nuScenes train split, 24 epochs, train -> eval epoch_24_ema.pth
-#   -> result.md.
+# Target diagnostic:
+#   map loss around 25% of logged training loss while keeping OCC enabled.
 #
 # Submit from the ProtoOcc checkout on Nano4:
-#   sbatch TWCC_nano4/train_eval_record_hfm_adapter_fpn_lateral_aspp_focal_dice_weighted_active_enhance_gate_occ2map_bevfusion_aligned_nano4.sh
-#
-# 1-GPU smoke example:
-#   RUN_MODE=smoke GPUS=1 SAMPLES_PER_GPU=2 WORKERS_PER_GPU=1 \
-#   sbatch --export=ALL -p dev --gres=gpu:1 --cpus-per-task=8 --mem=256G \
-#     --time=03:59:00 TWCC_nano4/train_eval_record_hfm_adapter_fpn_lateral_aspp_focal_dice_weighted_active_enhance_gate_occ2map_bevfusion_aligned_nano4.sh
-#
-# This wraps quick_test_nano4.sh so container setup, checkpoint selection,
-# eval, and result.md recording stay identical to the known Nano4 workflow.
+#   sbatch TWCC_nano4/train_eval_record_hfm_adapter_fpn_lateral_aspp_focal_dice_weighted_active_enhance_gate_bevfusion_aligned_mapw8_nano4.sh
 
-#SBATCH -J occ2map_safe
+#SBATCH -J act_align_w8
 #SBATCH --account=MST113104
 #SBATCH -p 16gpus
 #SBATCH -N 1
@@ -38,13 +27,13 @@ SUBMIT_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
 export PROTOOCC_DIR="${PROTOOCC_DIR:-/home/u2336262/Desktop/artc_2026/mapocc}"
 
 export RUN_MODE="${RUN_MODE:-full}"
-export CONFIG="${CONFIG:-projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck_hfm_adapter_fpn_lateral_aspp_focal_dice_weighted_active_enhance_gate_occ2map_bevfusion_aligned.py}"
+export CONFIG="${CONFIG:-projects/configs/ProtoOcc/ProtoOcc_multi_cnn_head_map_neck_hfm_adapter_fpn_lateral_aspp_focal_dice_weighted_active_enhance_gate_bevfusion_aligned_mapw8.py}"
 
 case "${RUN_MODE}" in
     smoke)
         DEFAULT_EPOCHS=1
         DEFAULT_TRAIN_ANN_FILE="data/nuscenes/bevdetv2-nuscenes_infos_train_1quarter_seed0.pkl"
-        DEFAULT_WORK_DIR="${PROTOOCC_DIR}/work_dirs/smoke_ProtoOcc_multi_cnn_head_map_neck_hfm_adapter_fpn_lateral_aspp_focal_dice_weighted_active_enhance_gate_occ2map_safe_bevfusion_aligned_1quarter_nano4_h200"
+        DEFAULT_WORK_DIR="${PROTOOCC_DIR}/work_dirs/smoke_ProtoOcc_multi_cnn_head_map_neck_hfm_adapter_fpn_lateral_aspp_focal_dice_weighted_active_enhance_gate_bevfusion_aligned_mapw8_1quarter_nano4_h200"
         DEFAULT_EVAL_TIMEOUT_MIN=90
         DEFAULT_GPUS=1
         DEFAULT_SAMPLES_PER_GPU=2
@@ -54,12 +43,12 @@ case "${RUN_MODE}" in
     full)
         DEFAULT_EPOCHS=24
         DEFAULT_TRAIN_ANN_FILE=""
-        DEFAULT_WORK_DIR="${PROTOOCC_DIR}/work_dirs/ProtoOcc_multi_cnn_head_map_neck_hfm_adapter_fpn_lateral_aspp_focal_dice_weighted_active_enhance_gate_occ2map_safe_bevfusion_aligned_nano4_h200"
+        DEFAULT_WORK_DIR="${PROTOOCC_DIR}/work_dirs/ProtoOcc_multi_cnn_head_map_neck_hfm_adapter_fpn_lateral_aspp_focal_dice_weighted_active_enhance_gate_bevfusion_aligned_mapw8_nano4_h200"
         DEFAULT_EVAL_TIMEOUT_MIN=180
         DEFAULT_GPUS=8
         DEFAULT_SAMPLES_PER_GPU=4
         DEFAULT_WORKERS_PER_GPU=4
-        DEFAULT_LR=2e-4
+        DEFAULT_LR=4e-4
         ;;
     *)
         echo "[ERROR] RUN_MODE must be smoke or full, got: ${RUN_MODE}"
@@ -67,8 +56,6 @@ case "${RUN_MODE}" in
         ;;
 esac
 
-# Default full LR is 2e-4 for aligned-grid stability. Override LR=4e-4 only
-# when intentionally matching the more aggressive native strong-branch recipe.
 export GPUS="${GPUS:-${DEFAULT_GPUS}}"
 export SAMPLES_PER_GPU="${SAMPLES_PER_GPU:-${DEFAULT_SAMPLES_PER_GPU}}"
 export WORKERS_PER_GPU="${WORKERS_PER_GPU:-${DEFAULT_WORKERS_PER_GPU}}"
@@ -92,3 +79,4 @@ else
 fi
 
 exec bash "${QUICK_TEST}" "${CONFIG}"
+
