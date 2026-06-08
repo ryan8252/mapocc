@@ -1187,6 +1187,86 @@ class MapOnly_BEVFusion_Encoder(nn.Module):
 
 
 @BACKBONES.register_module()
+class LSS2DMapCueFusion(nn.Module):
+    """Light residual fusion from a 2D LSS map cue into the DBE map feature."""
+
+    def __init__(self,
+                 base_channels=128,
+                 cue_channels=80,
+                 hidden_channels=128,
+                 residual_gate_init=0.1,
+                 with_cp=False):
+        super().__init__()
+        self.base_channels = int(base_channels)
+        self.cue_channels = int(cue_channels)
+        self.with_cp = bool(with_cp)
+
+        self.cue_adapter = nn.Sequential(
+            nn.Conv2d(
+                self.cue_channels,
+                hidden_channels,
+                kernel_size=1,
+                padding=0,
+                bias=False),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(
+                hidden_channels,
+                self.base_channels,
+                kernel_size=3,
+                padding=1,
+                bias=False),
+            nn.BatchNorm2d(self.base_channels),
+            nn.ReLU(inplace=True))
+        self.zero_init_conv = nn.Conv2d(
+            self.base_channels * 2,
+            self.base_channels,
+            kernel_size=1,
+            padding=0)
+        nn.init.constant_(self.zero_init_conv.weight, 0)
+        if self.zero_init_conv.bias is not None:
+            nn.init.constant_(self.zero_init_conv.bias, 0)
+
+        gate_logit = _gate_logit(residual_gate_init)
+        self.residual_gate = nn.Parameter(torch.full((1,), gate_logit))
+
+    def _run_module(self, module, *inputs):
+        requires_grad = any(
+            torch.is_tensor(input_) and input_.requires_grad
+            for input_ in inputs)
+        if self.with_cp and self.training and requires_grad:
+            return cp.checkpoint(module, *inputs)
+        return module(*inputs)
+
+    def forward(self, map_base, lss2d_cue):
+        if map_base.dim() != 4 or lss2d_cue.dim() != 4:
+            raise ValueError(
+                'LSS2DMapCueFusion expects 4D tensors '
+                f'[B, C, H, W], got {tuple(map_base.shape)} and '
+                f'{tuple(lss2d_cue.shape)}.')
+        if map_base.shape[1] != self.base_channels:
+            raise ValueError(
+                f'Expected map_base to have {self.base_channels} channels, '
+                f'got {map_base.shape[1]}.')
+        if lss2d_cue.shape[1] != self.cue_channels:
+            raise ValueError(
+                f'Expected lss2d_cue to have {self.cue_channels} channels, '
+                f'got {lss2d_cue.shape[1]}.')
+
+        cue = self._run_module(self.cue_adapter, lss2d_cue)
+        if cue.shape[-2:] != map_base.shape[-2:]:
+            cue = F.interpolate(
+                cue,
+                size=map_base.shape[-2:],
+                mode='bilinear',
+                align_corners=False)
+        residual_input = torch.cat([map_base, cue], dim=1)
+        residual = self._run_module(self.zero_init_conv, residual_input)
+        gate = torch.sigmoid(self.residual_gate).view(1, 1, 1, 1)
+        return map_base + gate * residual
+
+
+@BACKBONES.register_module()
 class MapOnly_MTE_Encoder(nn.Module):
     """Map-only encoder using a MapTopologyEncoder (learned softmax-Z pooling)
     in place of ``MapOnly_BEV_Encoder``'s fixed cat-Z flatten + shared BEV

@@ -21,6 +21,7 @@ class ProtoOccCnnSegHead(BEVDet):
                  bev_seg_head=None,
                  map_img_view_transformer=None,
                  map_lss2d_encoder=None,
+                 map_lss2d_fusion=None,
                  use_lss2d_as_bev_branch=False,
                  voxel_aware_map_ingest=None,
                  shared_feature_range=None,
@@ -52,14 +53,18 @@ class ProtoOccCnnSegHead(BEVDet):
         self.map_lss2d_encoder = (
             builder.build_backbone(map_lss2d_encoder)
             if map_lss2d_encoder is not None else None)
+        self.map_lss2d_fusion = (
+            builder.build_backbone(map_lss2d_fusion)
+            if map_lss2d_fusion is not None else None)
         self.use_lss2d_as_bev_branch = bool(use_lss2d_as_bev_branch)
         needs_map_lss2d = (
             self.map_lss2d_encoder is not None
+            or self.map_lss2d_fusion is not None
             or self.use_lss2d_as_bev_branch)
         if needs_map_lss2d and self.map_img_view_transformer is None:
             raise ValueError(
-                'map_lss2d_encoder/use_lss2d_as_bev_branch requires '
-                'map_img_view_transformer.')
+                'map_lss2d_encoder/map_lss2d_fusion/'
+                'use_lss2d_as_bev_branch requires map_img_view_transformer.')
         self.voxel_aware_map_ingest = (
             build_head(voxel_aware_map_ingest)
             if voxel_aware_map_ingest is not None else None)
@@ -250,6 +255,43 @@ class ProtoOccCnnSegHead(BEVDet):
                 raise ValueError('map_feature dict must contain `bev_feature`.')
             return map_tensor
         return map_feature
+
+    def _encode_lss2d_map_feature(self, map_lss2d_feat):
+        if map_lss2d_feat is None:
+            return None
+        if self.map_lss2d_encoder is not None:
+            return self.map_lss2d_encoder(map_lss2d_feat)
+        if self.map_lss2d_fusion is not None:
+            return map_lss2d_feat
+        return None
+
+    def _fuse_lss2d_map_feature(self, map_feature, lss2d_map_feature):
+        if self.map_lss2d_fusion is None or lss2d_map_feature is None:
+            return map_feature
+
+        lss2d_tensor = self._get_map_feature_tensor(lss2d_map_feature)
+        if isinstance(map_feature, dict):
+            fused = dict(map_feature)
+            fused['bev_feature'] = self.map_lss2d_fusion(
+                self._get_map_feature_tensor(map_feature), lss2d_tensor)
+            return fused
+        return self.map_lss2d_fusion(map_feature, lss2d_tensor)
+
+    def _prepare_map_feature(self,
+                             bev_feature,
+                             map_bev_feature,
+                             lss2d_map_feature=None):
+        if self.map_lss2d_fusion is not None and lss2d_map_feature is not None:
+            map_feature = self._select_map_feature(
+                bev_feature, map_bev_feature, None)
+            map_feature = self._align_map_feature(map_feature)
+            lss2d_map_feature = self._align_map_feature(lss2d_map_feature)
+            return self._fuse_lss2d_map_feature(
+                map_feature, lss2d_map_feature)
+
+        map_feature = self._select_map_feature(
+            bev_feature, map_bev_feature, lss2d_map_feature)
+        return self._align_map_feature(map_feature)
 
     def _range_to_xyz(self, value):
         if value.numel() == 6:
@@ -573,12 +615,10 @@ class ProtoOccCnnSegHead(BEVDet):
                 raise ValueError('Expected `gt_masks_bev` when training ProtoOccCnnSegHead with a BEV segmentation head.')
             occ2map_prior = self._make_occ2map_prior(
                 comprehensive_voxel_feature)
-            lss2d_map_feature = (
-                self.map_lss2d_encoder(map_lss2d_feat)
-                if self.map_lss2d_encoder is not None else None)
-            map_feature = self._select_map_feature(
+            lss2d_map_feature = self._encode_lss2d_map_feature(
+                map_lss2d_feat)
+            map_feature = self._prepare_map_feature(
                 bev_feature, map_bev_feature, lss2d_map_feature)
-            map_feature = self._align_map_feature(map_feature)
             map_feature = self._apply_voxel_aware_map_ingest(
                 map_feature, occ_voxel_feature, query_info)
             map_feature = self._attach_occ2map_prior(
@@ -633,13 +673,10 @@ class ProtoOccCnnSegHead(BEVDet):
         if self.bev_seg_head is None:
             return occ_preds
 
-        lss2d_map_feature = (
-            self.map_lss2d_encoder(map_lss2d_feat)
-            if self.map_lss2d_encoder is not None else None)
-        map_feature = self._select_map_feature(
+        lss2d_map_feature = self._encode_lss2d_map_feature(map_lss2d_feat)
+        map_feature = self._prepare_map_feature(
             bev_feature, map_bev_feature, lss2d_map_feature)
         occ2map_prior = self._make_occ2map_prior(comprehensive_voxel_feature)
-        map_feature = self._align_map_feature(map_feature)
         map_feature = self._apply_voxel_aware_map_ingest(
             map_feature, occ_voxel_feature, query_info)
         map_feature = self._attach_occ2map_prior(map_feature, occ2map_prior)
