@@ -55,9 +55,9 @@ map_feature_size = [
     int((map_ybound[1] - map_ybound[0]) / map_ybound[2]),
 ]
 
-# Two lifts share depth_net/pv_feat; the DBE map sub-modules are disabled (None),
-# so some inherited params may not receive grad -> keep DDP happy.
-find_unused_parameters = True
+# Checkpointed shared modules can trigger DDP's "marked ready twice" path when
+# unused-parameter traversal is enabled.
+find_unused_parameters = False
 
 model = dict(
     pc_range=occ_point_cloud_range,
