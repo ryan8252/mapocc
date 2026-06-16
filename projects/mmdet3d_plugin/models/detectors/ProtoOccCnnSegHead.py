@@ -20,6 +20,7 @@ class ProtoOccCnnSegHead(BEVDet):
                  prototype_query_decoder=None,
                  bev_seg_head=None,
                  map_img_view_transformer=None,
+                 map_depth_net=None,
                  map_lss2d_encoder=None,
                  map_lss2d_fusion=None,
                  use_lss2d_as_bev_branch=False,
@@ -50,6 +51,13 @@ class ProtoOccCnnSegHead(BEVDet):
         self.map_img_view_transformer = (
             builder.build_neck(map_img_view_transformer)
             if map_img_view_transformer is not None else None)
+        # Optional separate, *unsupervised* depth for the map LSS branch so it is
+        # decoupled from the OCC (depth-supervised, sharp) depth distribution.
+        self.map_depth_net = (
+            build_head(map_depth_net) if map_depth_net is not None else None)
+        if self.map_depth_net is not None and self.map_img_view_transformer is None:
+            raise ValueError(
+                'map_depth_net requires map_img_view_transformer.')
         self.map_lss2d_encoder = (
             builder.build_backbone(map_lss2d_encoder)
             if map_lss2d_encoder is not None else None)
@@ -153,7 +161,8 @@ class ProtoOccCnnSegHead(BEVDet):
     def _apply_voxel_aware_map_ingest(self,
                                       map_feature,
                                       voxel_feature,
-                                      query_info=None):
+                                      query_info=None,
+                                      gt_masks_bev=None):
         """Optional VAMI fusion before BEVSegHead.
 
         When ``voxel_aware_map_ingest`` is configured, route the
@@ -161,19 +170,30 @@ class ProtoOccCnnSegHead(BEVDet):
         return ``map_feature`` unchanged.
         """
         if self.voxel_aware_map_ingest is None:
-            return map_feature
+            return map_feature, {}
         query_info = query_info or {}
+        module = self.voxel_aware_map_ingest
+        returns_aux = getattr(module, 'returns_aux_losses', False)
+
+        def _run(feat):
+            if returns_aux:
+                return module(
+                    map_feature=feat,
+                    voxel_feature=voxel_feature,
+                    gt_masks_bev=gt_masks_bev,
+                    **query_info)
+            return module(
+                map_feature=feat,
+                voxel_feature=voxel_feature,
+                **query_info), {}
+
         if isinstance(map_feature, dict):
             updated = dict(map_feature)
-            updated['bev_feature'] = self.voxel_aware_map_ingest(
-                map_feature=self._get_map_feature_tensor(map_feature),
-                voxel_feature=voxel_feature,
-                **query_info)
-            return updated
-        return self.voxel_aware_map_ingest(
-            map_feature=map_feature,
-            voxel_feature=voxel_feature,
-            **query_info)
+            updated_feature, aux_losses = _run(
+                self._get_map_feature_tensor(map_feature))
+            updated['bev_feature'] = updated_feature
+            return updated, aux_losses
+        return _run(map_feature)
 
     def image_encoder(self, img, stereo=False):
         imgs = img
@@ -202,8 +222,13 @@ class ProtoOccCnnSegHead(BEVDet):
         voxel_feat, depth = self.img_view_transformer(depth, pv_feat, [x] + img_inputs[1:7])
         map_lss2d_feat = None
         if self.map_img_view_transformer is not None:
+            # Map branch uses its own soft, unsupervised depth when configured;
+            # otherwise it falls back to the shared (OCC, sharp) depth.
+            map_depth = depth
+            if self.map_depth_net is not None:
+                map_depth = self.map_depth_net(x)
             map_lss2d_feat, _ = self.map_img_view_transformer(
-                depth, pv_feat, [x] + img_inputs[1:7])
+                map_depth, pv_feat, [x] + img_inputs[1:7])
 
         return voxel_feat, depth, pv_feat, map_lss2d_feat
 
@@ -619,14 +644,18 @@ class ProtoOccCnnSegHead(BEVDet):
                 map_lss2d_feat)
             map_feature = self._prepare_map_feature(
                 bev_feature, map_bev_feature, lss2d_map_feature)
-            map_feature = self._apply_voxel_aware_map_ingest(
-                map_feature, occ_voxel_feature, query_info)
+            map_feature, ingest_losses = self._apply_voxel_aware_map_ingest(
+                map_feature,
+                occ_voxel_feature,
+                query_info,
+                gt_masks_bev=gt_masks_bev)
             map_feature = self._attach_occ2map_prior(
                 map_feature, occ2map_prior)
             self._check_map_feature_size(map_feature, gt_masks_bev)
             bev_seg_logits = self.bev_seg_head(map_feature)
             map_losses = self.bev_seg_head.loss(bev_seg_logits, gt_masks_bev)
             losses.update(self._scale_map_losses(map_losses))
+            losses.update(ingest_losses)
 
         return losses
 
@@ -677,7 +706,7 @@ class ProtoOccCnnSegHead(BEVDet):
         map_feature = self._prepare_map_feature(
             bev_feature, map_bev_feature, lss2d_map_feature)
         occ2map_prior = self._make_occ2map_prior(comprehensive_voxel_feature)
-        map_feature = self._apply_voxel_aware_map_ingest(
+        map_feature, _ = self._apply_voxel_aware_map_ingest(
             map_feature, occ_voxel_feature, query_info)
         map_feature = self._attach_occ2map_prior(map_feature, occ2map_prior)
         bev_seg_probs = self.bev_seg_head.predict(self.bev_seg_head(map_feature)).detach().cpu().numpy()
