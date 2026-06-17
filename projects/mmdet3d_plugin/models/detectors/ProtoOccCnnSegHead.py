@@ -5,10 +5,73 @@ from .bevdet import BEVDet
 from mmdet3d.models import DETECTORS
 from mmdet3d.models.builder import build_head
 import torch
+from torch import nn
 import torch.nn.functional as F
 from mmdet3d.models import builder
 
- 
+
+class TaskChannelScaling(nn.Module):
+    """Lightweight task-aware channel scaling for OCC and map features.
+
+    The last linear layer is zero-initialized, so both branches start as exact
+    identity transforms: feature * (1 + max_residual * tanh(0)).
+    """
+
+    def __init__(self,
+                 occ_channels,
+                 map_channels,
+                 reduction=4,
+                 min_hidden_channels=16,
+                 max_residual=0.5,
+                 detach_context=False):
+        super().__init__()
+        self.occ_channels = int(occ_channels)
+        self.map_channels = int(map_channels)
+        self.max_residual = float(max_residual)
+        self.detach_context = bool(detach_context)
+        self.occ_gate = self._make_gate(
+            self.occ_channels, reduction, min_hidden_channels)
+        self.map_gate = self._make_gate(
+            self.map_channels, reduction, min_hidden_channels)
+
+    @staticmethod
+    def _make_gate(channels, reduction, min_hidden_channels):
+        hidden_channels = max(
+            int(channels) // max(int(reduction), 1),
+            int(min_hidden_channels))
+        gate = nn.Sequential(
+            nn.Linear(int(channels), hidden_channels),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_channels, int(channels)))
+        nn.init.zeros_(gate[-1].weight)
+        nn.init.zeros_(gate[-1].bias)
+        return gate
+
+    def _context(self, feature, dims):
+        source = feature.detach() if self.detach_context else feature
+        return source.mean(dim=dims)
+
+    def scale_occ(self, occ_feature):
+        if occ_feature.shape[1] != self.occ_channels:
+            raise ValueError(
+                'TaskChannelScaling occ channel mismatch: expected '
+                f'{self.occ_channels}, got {occ_feature.shape[1]}.')
+        context = self._context(occ_feature, dims=(2, 3, 4))
+        scale = 1.0 + self.max_residual * torch.tanh(
+            self.occ_gate(context))
+        return occ_feature * scale.view(scale.shape[0], -1, 1, 1, 1)
+
+    def scale_map(self, map_feature):
+        if map_feature.shape[1] != self.map_channels:
+            raise ValueError(
+                'TaskChannelScaling map channel mismatch: expected '
+                f'{self.map_channels}, got {map_feature.shape[1]}.')
+        context = self._context(map_feature, dims=(2, 3))
+        scale = 1.0 + self.max_residual * torch.tanh(
+            self.map_gate(context))
+        return map_feature * scale.view(scale.shape[0], -1, 1, 1)
+
+
 @DETECTORS.register_module()
 class ProtoOccCnnSegHead(BEVDet):
     def __init__(self,
@@ -25,6 +88,7 @@ class ProtoOccCnnSegHead(BEVDet):
                  map_lss2d_fusion=None,
                  use_lss2d_as_bev_branch=False,
                  voxel_aware_map_ingest=None,
+                 task_channel_scaling=None,
                  shared_feature_range=None,
                  occ_feature_range=None,
                  map_feature_range=None,
@@ -76,6 +140,9 @@ class ProtoOccCnnSegHead(BEVDet):
         self.voxel_aware_map_ingest = (
             build_head(voxel_aware_map_ingest)
             if voxel_aware_map_ingest is not None else None)
+        self.task_channel_scaling = (
+            TaskChannelScaling(**task_channel_scaling)
+            if task_channel_scaling is not None else None)
         self.shared_feature_range = torch.tensor(
             shared_feature_range if shared_feature_range is not None else pc_range,
             dtype=torch.float32)
@@ -194,6 +261,21 @@ class ProtoOccCnnSegHead(BEVDet):
             updated['bev_feature'] = updated_feature
             return updated, aux_losses
         return _run(map_feature)
+
+    def _apply_task_channel_scaling_occ(self, occ_feature):
+        if self.task_channel_scaling is None:
+            return occ_feature
+        return self.task_channel_scaling.scale_occ(occ_feature)
+
+    def _apply_task_channel_scaling_map(self, map_feature):
+        if self.task_channel_scaling is None:
+            return map_feature
+        if isinstance(map_feature, dict):
+            scaled = dict(map_feature)
+            scaled['bev_feature'] = self.task_channel_scaling.scale_map(
+                self._get_map_feature_tensor(map_feature))
+            return scaled
+        return self.task_channel_scaling.scale_map(map_feature)
 
     def image_encoder(self, img, stereo=False):
         imgs = img
@@ -605,6 +687,8 @@ class ProtoOccCnnSegHead(BEVDet):
         comprehensive_voxel_feature, bev_feature, map_bev_feature = \
             self._split_encoder_output(encoder_output)
         occ_voxel_feature = self._crop_occ_feature(comprehensive_voxel_feature)
+        occ_voxel_feature = self._apply_task_channel_scaling_occ(
+            occ_voxel_feature)
 
         # 3d CNN for generating Prototype
         prototoype_occ_pred, mask_feat = self.cnn3d_decoder(occ_voxel_feature.permute(0,1,4,2,3))
@@ -644,6 +728,7 @@ class ProtoOccCnnSegHead(BEVDet):
                 map_lss2d_feat)
             map_feature = self._prepare_map_feature(
                 bev_feature, map_bev_feature, lss2d_map_feature)
+            map_feature = self._apply_task_channel_scaling_map(map_feature)
             map_feature, ingest_losses = self._apply_voxel_aware_map_ingest(
                 map_feature,
                 occ_voxel_feature,
@@ -678,6 +763,8 @@ class ProtoOccCnnSegHead(BEVDet):
         comprehensive_voxel_feature, bev_feature, map_bev_feature = \
             self._split_encoder_output(encoder_output)
         occ_voxel_feature = self._crop_occ_feature(comprehensive_voxel_feature)
+        occ_voxel_feature = self._apply_task_channel_scaling_occ(
+            occ_voxel_feature)
 
         # Prototype Query Generator
         prototoype_occ_pred, mask_feat = self.cnn3d_decoder(occ_voxel_feature.permute(0,1,4,2,3))
@@ -705,6 +792,7 @@ class ProtoOccCnnSegHead(BEVDet):
         lss2d_map_feature = self._encode_lss2d_map_feature(map_lss2d_feat)
         map_feature = self._prepare_map_feature(
             bev_feature, map_bev_feature, lss2d_map_feature)
+        map_feature = self._apply_task_channel_scaling_map(map_feature)
         occ2map_prior = self._make_occ2map_prior(comprehensive_voxel_feature)
         map_feature, _ = self._apply_voxel_aware_map_ingest(
             map_feature, occ_voxel_feature, query_info)

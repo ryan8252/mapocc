@@ -125,6 +125,14 @@ class BEVSegHead(BaseModule):
                  map_active_gate_use_focal=True,
                  map_active_gate_use_dice=True,
                  map_active_gate_init_bias=-4.0,
+                 use_query_refinement=False,
+                 query_refine_num_bins=5,
+                 query_refine_heads=8,
+                 query_refine_ffn_ratio=2,
+                 query_refine_attn_dropout=0.0,
+                 query_refine_alpha_init=0.0,
+                 query_refine_detach_logits=True,
+                 query_refine_scale_dot=True,
                  use_occ2map_active_gate_prior=False,
                  occ2map_prior_channels=2,
                  occ2map_prior_zero_init=True,
@@ -199,6 +207,13 @@ class BEVSegHead(BaseModule):
         self.map_active_gate_use_focal = bool(map_active_gate_use_focal)
         self.map_active_gate_use_dice = bool(map_active_gate_use_dice)
         self.map_active_gate_init_bias = float(map_active_gate_init_bias)
+        self.use_query_refinement = bool(use_query_refinement)
+        self.query_refine_num_bins = int(query_refine_num_bins)
+        self.query_refine_heads = int(query_refine_heads)
+        self.query_refine_ffn_ratio = int(query_refine_ffn_ratio)
+        self.query_refine_attn_dropout = float(query_refine_attn_dropout)
+        self.query_refine_detach_logits = bool(query_refine_detach_logits)
+        self.query_refine_scale_dot = bool(query_refine_scale_dot)
         self.use_occ2map_active_gate_prior = bool(
             use_occ2map_active_gate_prior)
         self.occ2map_prior_channels = int(occ2map_prior_channels)
@@ -360,6 +375,56 @@ class BEVSegHead(BaseModule):
                 self.thin_roi_refiner[-1].apply(_zero_init_conv)
             else:
                 self.thin_roi_refiner = None
+
+        self.query_refine_class_embed = None
+        self.query_refine_bin_embed = None
+        self.query_refine_query_norm = None
+        self.query_refine_attn = None
+        self.query_refine_attn_norm = None
+        self.query_refine_ffn = None
+        self.query_refine_ffn_norm = None
+        self.query_refine_mask_embed = None
+        if self.use_query_refinement:
+            if self.use_dual_area_line_head:
+                raise ValueError(
+                    'use_query_refinement=True currently supports only the '
+                    'single BEVSegHead decoder path.')
+            if self.query_refine_num_bins <= 0:
+                raise ValueError('query_refine_num_bins must be positive.')
+            if self.query_refine_heads <= 0:
+                raise ValueError('query_refine_heads must be positive.')
+            if current_channels % self.query_refine_heads != 0:
+                raise ValueError(
+                    'query_refine_heads must divide the BEVSegHead decoder '
+                    f'channels: {self.query_refine_heads} vs '
+                    f'{current_channels}.')
+            ffn_channels = current_channels * max(self.query_refine_ffn_ratio, 1)
+            self.query_refine_class_embed = nn.Embedding(
+                num_classes, current_channels)
+            self.query_refine_bin_embed = nn.Embedding(
+                self.query_refine_num_bins, current_channels)
+            self.query_refine_query_norm = nn.LayerNorm(current_channels)
+            self.query_refine_attn = nn.MultiheadAttention(
+                current_channels,
+                self.query_refine_heads,
+                dropout=self.query_refine_attn_dropout,
+                batch_first=True)
+            self.query_refine_attn_norm = nn.LayerNorm(current_channels)
+            self.query_refine_ffn = nn.Sequential(
+                nn.Linear(current_channels, ffn_channels),
+                nn.ReLU(inplace=True),
+                nn.Linear(ffn_channels, current_channels))
+            self.query_refine_ffn_norm = nn.LayerNorm(current_channels)
+            self.query_refine_mask_embed = nn.Sequential(
+                nn.Linear(current_channels, current_channels),
+                nn.ReLU(inplace=True),
+                nn.Linear(current_channels, current_channels),
+                nn.ReLU(inplace=True),
+                nn.Linear(current_channels, current_channels))
+            self.query_refine_alpha = nn.Parameter(
+                torch.tensor(float(query_refine_alpha_init)))
+        else:
+            self.register_parameter('query_refine_alpha', None)
 
         self.map_aux_heads = nn.ModuleDict()
         if self.use_map_aux_loss:
@@ -833,7 +898,9 @@ class BEVSegHead(BaseModule):
             decoded_feature = self._run_decoder(self.decoder, bev_feature)
             decoded_feature, gate_logits = self._apply_map_active_gate(
                 decoded_feature, occ2map_prior)
-            seg_logits = self.predictor(decoded_feature)
+            cnn_logits = self.predictor(decoded_feature)
+            seg_logits = self._apply_query_refinement(
+                decoded_feature, cnn_logits)
             seg_logits = self._apply_thin_roi_refinement(
                 decoded_feature, seg_logits)
 
@@ -1016,6 +1083,91 @@ class BEVSegHead(BaseModule):
                 stride=1,
                 padding=self.thin_roi_dilation)
         return roi
+
+    def _query_refine_bin_bounds(self, height):
+        num_bins = min(self.query_refine_num_bins, height)
+        bounds = []
+        for bin_index in range(num_bins):
+            start = int(round(float(bin_index) * height / num_bins))
+            end = int(round(float(bin_index + 1) * height / num_bins))
+            end = max(end, start + 1)
+            bounds.append((start, min(end, height)))
+        return bounds
+
+    def _gather_query_refine_queries(self, decoded_feature, seg_logits):
+        batch_size, channels, height, width = decoded_feature.shape
+        _, num_classes, _, _ = seg_logits.shape
+        select_logits = (
+            seg_logits.detach() if self.query_refine_detach_logits
+            else seg_logits)
+        feature_flat = decoded_feature.flatten(2)
+        query_list = []
+        class_ids = []
+        bin_ids = []
+        bounds = self._query_refine_bin_bounds(height)
+
+        for bin_index, (start, end) in enumerate(bounds):
+            for class_index in range(num_classes):
+                bin_logits = select_logits[
+                    :, class_index, start:end, :].flatten(1)
+                local_index = bin_logits.argmax(dim=1)
+                flat_index = local_index + start * width
+                gather_index = flat_index.view(batch_size, 1, 1).expand(
+                    -1, channels, 1)
+                query_list.append(
+                    feature_flat.gather(2, gather_index).squeeze(-1))
+                class_ids.append(class_index)
+                bin_ids.append(bin_index)
+
+        queries = torch.stack(query_list, dim=1)
+        class_ids = torch.tensor(
+            class_ids, device=decoded_feature.device, dtype=torch.long)
+        bin_ids = torch.tensor(
+            bin_ids, device=decoded_feature.device, dtype=torch.long)
+        return queries, class_ids, bin_ids, bounds
+
+    def _apply_query_refinement(self, decoded_feature, seg_logits):
+        if not self.use_query_refinement:
+            return seg_logits
+
+        batch_size, channels, height, width = decoded_feature.shape
+        if seg_logits.shape[1] != self.num_classes:
+            raise ValueError(
+                'query refinement expects seg_logits channel count to match '
+                f'num_classes={self.num_classes}, got {seg_logits.shape[1]}.')
+
+        queries, class_ids, bin_ids, bounds = self._gather_query_refine_queries(
+            decoded_feature, seg_logits)
+        class_embed = self.query_refine_class_embed(class_ids).to(
+            dtype=queries.dtype)
+        bin_embed = self.query_refine_bin_embed(bin_ids).to(
+            dtype=queries.dtype)
+        queries = queries + class_embed.unsqueeze(0) + bin_embed.unsqueeze(0)
+        queries = self.query_refine_query_norm(queries)
+
+        attn_out, _ = self.query_refine_attn(
+            queries, queries, queries, need_weights=False)
+        queries = self.query_refine_attn_norm(queries + attn_out)
+        ffn_out = self.query_refine_ffn(queries)
+        queries = self.query_refine_ffn_norm(queries + ffn_out)
+
+        mask_embed = self.query_refine_mask_embed(queries)
+        if self.query_refine_scale_dot:
+            mask_embed = mask_embed * (channels ** -0.5)
+        all_query_logits = torch.einsum(
+            'bqc,bchw->bqhw', mask_embed, decoded_feature)
+
+        query_logits = seg_logits.new_zeros(
+            batch_size, self.num_classes, height, width)
+        offset = 0
+        for start, end in bounds:
+            next_offset = offset + self.num_classes
+            query_logits[:, :, start:end, :] = all_query_logits[
+                :, offset:next_offset, start:end, :]
+            offset = next_offset
+
+        alpha = self.query_refine_alpha.to(dtype=seg_logits.dtype)
+        return seg_logits + alpha * query_logits
 
     def loss(self, seg_logits, gt_masks_bev):
         gt_masks_bev = gt_masks_bev.float()
