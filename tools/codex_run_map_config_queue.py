@@ -272,6 +272,7 @@ def write_result(
         "loss_map_aux_100_dice",
         "loss_map_aux_50_bce",
         "loss_map_aux_50_dice",
+        "loss_map_supp",
         "loss_segmentation",
         "loss_depth",
         "grad_norm",

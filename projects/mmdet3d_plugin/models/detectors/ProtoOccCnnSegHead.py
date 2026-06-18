@@ -72,6 +72,104 @@ class TaskChannelScaling(nn.Module):
         return map_feature * scale.view(scale.shape[0], -1, 1, 1)
 
 
+class LossUncertaintyWeighting(nn.Module):
+    """Homoscedastic uncertainty weighting over named loss groups."""
+
+    DEFAULT_GROUPS = (
+        dict(name='map', prefixes=('loss_map_', )),
+        dict(name='depth_img',
+             keys=('loss_depth', 'loss_segmentation')),
+        dict(name='occ_proto',
+             keys=('loss_CE_prototype',
+                   'lovasz_softmax_loss_prototype')),
+        dict(name='pqd',
+             keys=('loss_cls', 'loss_mask', 'loss_dice',
+                   'loss_cls_RPL', 'loss_mask_RPL', 'loss_dice_RPL')),
+    )
+
+    def __init__(self,
+                 groups=None,
+                 init_log_vars=None,
+                 min_log_var=-2.0,
+                 max_log_var=2.0):
+        super().__init__()
+        groups = groups if groups is not None else self.DEFAULT_GROUPS
+        init_log_vars = init_log_vars or {}
+        self.groups = []
+        self.min_log_var = float(min_log_var)
+        self.max_log_var = float(max_log_var)
+        self.log_vars = nn.ParameterDict()
+        for group in groups:
+            name = group['name']
+            keys = tuple(group.get('keys', ()))
+            prefixes = tuple(group.get('prefixes', ()))
+            self.groups.append(dict(name=name, keys=keys, prefixes=prefixes))
+            init_value = float(init_log_vars.get(name, 0.0))
+            self.log_vars[name] = nn.Parameter(torch.tensor([init_value]))
+
+    @staticmethod
+    def _scale_value(value, scale):
+        if torch.is_tensor(value):
+            return value * scale
+        if isinstance(value, (list, tuple)):
+            return [item * scale for item in value]
+        return value
+
+    @staticmethod
+    def _mean_value(value):
+        if torch.is_tensor(value):
+            return value.mean()
+        if isinstance(value, (list, tuple)):
+            total = None
+            for item in value:
+                item_mean = item.mean()
+                total = item_mean if total is None else total + item_mean
+            return total
+        return None
+
+    @staticmethod
+    def _matches(loss_name, group):
+        if loss_name in group['keys']:
+            return True
+        return any(loss_name.startswith(prefix)
+                   for prefix in group['prefixes'])
+
+    def forward(self, losses):
+        weighted = dict(losses)
+        assigned = set()
+        for group in self.groups:
+            name = group['name']
+            group_keys = [
+                key for key in losses
+                if key not in assigned and self._matches(key, group)
+            ]
+            if not group_keys:
+                continue
+
+            log_var = torch.clamp(
+                self.log_vars[name], self.min_log_var, self.max_log_var)
+            precision = torch.exp(-log_var)
+            raw_total = None
+            for key in group_keys:
+                value = losses[key]
+                weighted[key] = self._scale_value(value, precision)
+                value_mean = self._mean_value(value)
+                if value_mean is not None:
+                    raw_total = (
+                        value_mean if raw_total is None
+                        else raw_total + value_mean)
+                assigned.add(key)
+
+            weighted[f'loss_uncertainty_{name}_reg'] = log_var.squeeze()
+            weighted[f'uncertainty_{name}_precision'] = (
+                precision.detach().squeeze())
+            weighted[f'uncertainty_{name}_log_var'] = (
+                log_var.detach().squeeze())
+            if raw_total is not None:
+                weighted[f'uncertainty_{name}_raw'] = raw_total.detach()
+        return weighted
+
+
 @DETECTORS.register_module()
 class ProtoOccCnnSegHead(BEVDet):
     def __init__(self,
@@ -100,6 +198,7 @@ class ProtoOccCnnSegHead(BEVDet):
                  occ2map_prior_context_z=3,
                  occ2map_prior_output_z_indices=(0, 1),
                  occ2map_prior_class_ids=(11, 13),
+                 loss_uncertainty_weighting=None,
                  **kwargs):
         super(ProtoOccCnnSegHead, self).__init__(**kwargs)
         self.pts_bbox_head = None # useless
@@ -143,6 +242,9 @@ class ProtoOccCnnSegHead(BEVDet):
         self.task_channel_scaling = (
             TaskChannelScaling(**task_channel_scaling)
             if task_channel_scaling is not None else None)
+        self.loss_uncertainty_weighting = (
+            LossUncertaintyWeighting(**loss_uncertainty_weighting)
+            if loss_uncertainty_weighting is not None else None)
         self.shared_feature_range = torch.tensor(
             shared_feature_range if shared_feature_range is not None else pc_range,
             dtype=torch.float32)
@@ -741,6 +843,9 @@ class ProtoOccCnnSegHead(BEVDet):
             map_losses = self.bev_seg_head.loss(bev_seg_logits, gt_masks_bev)
             losses.update(self._scale_map_losses(map_losses))
             losses.update(ingest_losses)
+
+        if self.loss_uncertainty_weighting is not None:
+            losses = self.loss_uncertainty_weighting(losses)
 
         return losses
 
