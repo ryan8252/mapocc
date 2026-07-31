@@ -1,4 +1,5 @@
 import logging
+import math
 
 import torch
 from torch import nn
@@ -121,6 +122,7 @@ class BEVSegHead(BaseModule):
                  map_active_gate_class_groups=None,
                  map_active_gate_dilations=0,
                  map_active_gate_beta=0.5,
+                 map_active_gate_group_betas=None,
                  map_active_gate_loss_weight=0.2,
                  map_active_gate_use_focal=True,
                  map_active_gate_use_dice=True,
@@ -203,6 +205,8 @@ class BEVSegHead(BaseModule):
             None if map_active_gate_hidden_channels is None
             else int(map_active_gate_hidden_channels))
         self.map_active_gate_beta = float(map_active_gate_beta)
+        self.map_active_gate_group_betas = self._parse_active_gate_group_betas(
+            map_active_gate_group_betas)
         self.map_active_gate_loss_weight = float(map_active_gate_loss_weight)
         self.map_active_gate_use_focal = bool(map_active_gate_use_focal)
         self.map_active_gate_use_dice = bool(map_active_gate_use_dice)
@@ -694,6 +698,17 @@ class BEVSegHead(BaseModule):
             return [int(dilations) for _ in range(self.map_active_gate_channels)]
         return [int(dilation) for dilation in dilations]
 
+    def _parse_active_gate_group_betas(self, group_betas):
+        if group_betas is None:
+            return [self.map_active_gate_beta
+                    for _ in range(self.map_active_gate_channels)]
+        try:
+            return [float(beta) for beta in group_betas]
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                'map_active_gate_group_betas must be a sequence of numbers.'
+            ) from exc
+
     def _validate_thin_cfg(self):
         if (self.use_thin_boundary_aux_loss
                 and not self.thin_boundary_class_indices):
@@ -740,10 +755,19 @@ class BEVSegHead(BaseModule):
             raise ValueError(
                 'map_active_gate_dilations length must match '
                 'map_active_gate_channels.')
+        if len(self.map_active_gate_group_betas) != self.map_active_gate_channels:
+            raise ValueError(
+                'map_active_gate_group_betas length must match '
+                'map_active_gate_channels.')
         if any(dilation < 0 for dilation in self.map_active_gate_dilations):
             raise ValueError('map_active_gate_dilations must be >= 0.')
-        if self.map_active_gate_beta < 0:
-            raise ValueError('map_active_gate_beta must be >= 0.')
+        if (not math.isfinite(self.map_active_gate_beta)
+                or self.map_active_gate_beta < 0):
+            raise ValueError('map_active_gate_beta must be finite and >= 0.')
+        if any(not math.isfinite(beta) or beta < 0
+               for beta in self.map_active_gate_group_betas):
+            raise ValueError(
+                'map_active_gate_group_betas must be finite and >= 0.')
         if self.map_active_gate_loss_weight < 0:
             raise ValueError('map_active_gate_loss_weight must be >= 0.')
         if self.use_occ2map_active_gate_prior:
@@ -942,9 +966,11 @@ class BEVSegHead(BaseModule):
                 prior_logits = prior_logits * channel_mask
             gate_logits = gate_logits + (
                 self.occ2map_prior_gate_scale * prior_logits)
-        spatial_gate = gate_logits.sigmoid().amax(dim=1, keepdim=True)
-        enhanced = decoded_feature * (
-            1.0 + self.map_active_gate_beta * spatial_gate)
+        gate_prob = gate_logits.sigmoid()
+        group_betas = gate_prob.new_tensor(
+            self.map_active_gate_group_betas).view(1, -1, 1, 1)
+        spatial_gain = (gate_prob * group_betas).amax(dim=1, keepdim=True)
+        enhanced = decoded_feature * (1.0 + spatial_gain)
         return enhanced, gate_logits
 
     def _run_decoder(self, decoder, x):

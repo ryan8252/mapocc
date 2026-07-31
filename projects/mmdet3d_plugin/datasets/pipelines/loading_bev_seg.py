@@ -29,6 +29,8 @@ class LoadBEVSegmentation(object):
         canvas_h = int(patch_h / ybound[2])
         canvas_w = int(patch_w / xbound[2])
 
+        self.xbound = tuple(float(value) for value in xbound)
+        self.ybound = tuple(float(value) for value in ybound)
         self.patch_size = (patch_h, patch_w)
         self.canvas_size = (canvas_h, canvas_w)
         self.classes = tuple(classes)

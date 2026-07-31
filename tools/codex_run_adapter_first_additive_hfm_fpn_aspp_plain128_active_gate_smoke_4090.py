@@ -242,7 +242,13 @@ def parse_train_summary(train_log: Optional[Path]) -> Tuple[Optional[str], Dict[
             final_line = line
     if final_line is None:
         return None, {}
-    metrics = dict(re.findall(r"([A-Za-z0-9_]+):\s*([0-9.+-eE]+)", final_line))
+    metrics: Dict[str, str] = {}
+    for key, raw_value in re.findall(r"([A-Za-z0-9_]+):\s*([^,\s]+)", final_line):
+        try:
+            float(raw_value)
+        except ValueError:
+            continue
+        metrics[key] = raw_value
     return final_line, metrics
 
 
