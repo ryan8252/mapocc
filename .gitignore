@@ -14,4 +14,7 @@ projects/build
 *old*
 build-old
 ppl.cv
-*/__pycache__/*
+*/__pycache__/**.nbc
+*.nbi
+mmdetection3d/
+.dist_test/

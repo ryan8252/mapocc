@@ -7,6 +7,93 @@ from mmcv.cnn.bricks import ConvModule
 from mmdet.models import NECKS
 import torch.nn.functional as F
 
+
+def _zero_init_conv(module):
+    if isinstance(module, nn.Conv2d):
+        nn.init.constant_(module.weight, 0)
+        if module.bias is not None:
+            nn.init.constant_(module.bias, 0)
+
+
+def _gate_logit(init_value):
+    init_value = float(init_value)
+    init_value = min(max(init_value, 1e-4), 1.0 - 1e-4)
+    value = torch.tensor(init_value / (1.0 - init_value))
+    return torch.log(value).item()
+
+
+@NECKS.register_module()
+class LSSFPN(nn.Module):
+    """BEVFusion-style LSS FPN neck for a two-level BEV decoder pyramid."""
+
+    def __init__(self,
+                 in_indices,
+                 in_channels,
+                 out_channels,
+                 scale_factor=1):
+        super(LSSFPN, self).__init__()
+        self.in_indices = tuple(in_indices)
+        self.in_channels = tuple(in_channels)
+        self.out_channels = out_channels
+        self.scale_factor = scale_factor
+
+        self.fuse = nn.Sequential(
+            nn.Conv2d(
+                self.in_channels[0] + self.in_channels[1],
+                out_channels,
+                kernel_size=1,
+                bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(
+                out_channels,
+                out_channels,
+                kernel_size=3,
+                padding=1,
+                bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True))
+
+        if self.scale_factor > 1:
+            self.upsample = nn.Sequential(
+                nn.Upsample(
+                    scale_factor=self.scale_factor,
+                    mode='bilinear',
+                    align_corners=True),
+                nn.Conv2d(
+                    out_channels,
+                    out_channels,
+                    kernel_size=3,
+                    padding=1,
+                    bias=False),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True))
+        else:
+            self.upsample = None
+
+    def forward(self, feats):
+        x1 = feats[self.in_indices[0]]
+        x2 = feats[self.in_indices[1]]
+        if x1.shape[1] != self.in_channels[0]:
+            raise ValueError(
+                f'LSSFPN expected {self.in_channels[0]} channels at '
+                f'index {self.in_indices[0]}, got {x1.shape[1]}.')
+        if x2.shape[1] != self.in_channels[1]:
+            raise ValueError(
+                f'LSSFPN expected {self.in_channels[1]} channels at '
+                f'index {self.in_indices[1]}, got {x2.shape[1]}.')
+
+        x1 = F.interpolate(
+            x1,
+            size=x2.shape[-2:],
+            mode='bilinear',
+            align_corners=True)
+        x = self.fuse(torch.cat([x1, x2], dim=1))
+        if self.upsample is not None:
+            x = self.upsample(x)
+        return x
+
+
 @NECKS.register_module()
 class FPN_LSS(nn.Module):
     def __init__(self,
@@ -74,29 +161,82 @@ class Custom_FPN_LSS(nn.Module):
                  input_feature_index=(0, 1, 2),
                  norm_cfg=dict(type='BN'),
                  extra_upsample=2,
-                 with_cp=False):
+                 with_cp=False,
+                 use_fpn_lateral_projection=False,
+                 fpn_lateral_in_channels=None,
+                 fpn_projection_channels=256,
+                 use_fpn_global_context=False,
+                 fpn_global_context_type='aspp',
+                 fpn_context_channels=None,
+                 fpn_context_learnable_gate=False,
+                 fpn_context_gate_init=0.1,
+                 return_map_aux_features=False,
+                 map_aux_feature_levels=('100', '50')):
         super(Custom_FPN_LSS, self).__init__()
         self.input_feature_index = input_feature_index
         self.extra_upsample = extra_upsample is not None
         self.out_channels = out_channels
         self.with_cp = with_cp
+        self.use_fpn_lateral_projection = bool(use_fpn_lateral_projection)
+        self.use_fpn_global_context = bool(use_fpn_global_context)
+        self.return_map_aux_features = bool(return_map_aux_features)
+        self.map_aux_feature_levels = tuple(str(level)
+                                            for level in map_aux_feature_levels)
+        self.fpn_global_context_type = str(fpn_global_context_type).lower()
+        self.fpn_context_learnable_gate = bool(fpn_context_learnable_gate)
+        self.fpn_context_gate_init = float(fpn_context_gate_init)
+        self.fpn_projection_channels = int(fpn_projection_channels)
         self.up = nn.Upsample(
             scale_factor=scale_factor, mode='bilinear', align_corners=True)
 
         channels_factor = 2 if self.extra_upsample else 1
+        self.fused_channels = out_channels * channels_factor
+        self.fpn_lateral_in_channels = self._resolve_lateral_in_channels(
+            fpn_lateral_in_channels,
+            catconv_in_channels1,
+            catconv_in_channels2,
+            self.fused_channels)
+
+        if self.use_fpn_global_context:
+            low_channels = self.fpn_lateral_in_channels[2]
+            self.fpn_global_context = self._build_global_context(
+                low_channels,
+                fpn_context_channels,
+                norm_cfg,
+                self.fpn_context_learnable_gate,
+                self.fpn_context_gate_init)
+        else:
+            self.fpn_global_context = None
+
+        if self.use_fpn_lateral_projection:
+            self.fpn_lateral_projs = nn.ModuleList([
+                ConvModule(
+                    in_channels,
+                    self.fpn_projection_channels,
+                    kernel_size=1,
+                    bias=False,
+                    norm_cfg=norm_cfg,
+                    act_cfg=dict(type='ReLU', inplace=True))
+                for in_channels in self.fpn_lateral_in_channels
+            ])
+            catconv_in_channels1 = self.fpn_projection_channels * 2
+            catconv_in_channels2 = (
+                self.fused_channels + self.fpn_projection_channels)
+        else:
+            self.fpn_lateral_projs = None
 
         self.cat_conv1 = self._make_cat_conv(
-            catconv_in_channels1, out_channels * channels_factor, norm_cfg)
+            catconv_in_channels1, self.fused_channels, norm_cfg)
         self.cat_conv2 = self._make_cat_conv(
-            catconv_in_channels2, out_channels * channels_factor, norm_cfg)
+            catconv_in_channels2, self.fused_channels, norm_cfg)
 
         self.up2 = nn.Sequential(
             nn.Upsample(scale_factor=extra_upsample, mode='bilinear', align_corners=True),
-            nn.Conv2d(out_channels * channels_factor, out_channels, kernel_size=3, padding=1, bias=False),
-            build_norm_layer(norm_cfg, out_channels)[1],
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=1, padding=0)
-        )
+                nn.Conv2d(self.fused_channels, out_channels, kernel_size=3, padding=1, bias=False),
+                build_norm_layer(norm_cfg, out_channels)[1],
+                nn.ReLU(inplace=True),
+                nn.Conv2d(out_channels, out_channels, kernel_size=1, padding=0)
+            )
 
     def _make_cat_conv(self, in_channels, out_channels, norm_cfg):
         return nn.Sequential(
@@ -110,6 +250,14 @@ class Custom_FPN_LSS(nn.Module):
 
     def forward(self, feats):
         x3, x2, x1 = feats[self.input_feature_index[0]], feats[self.input_feature_index[1]], feats[self.input_feature_index[2]]
+        if self.fpn_global_context is not None:
+            x1 = self._apply_checkpoint(self.fpn_global_context, x1)
+
+        if self.fpn_lateral_projs is not None:
+            x3 = self._apply_checkpoint(self.fpn_lateral_projs[0], x3)
+            x2 = self._apply_checkpoint(self.fpn_lateral_projs[1], x2)
+            x1 = self._apply_checkpoint(self.fpn_lateral_projs[2], x1)
+
         x1_up = F.interpolate(x1, size=x2.shape[2:], mode='bilinear', align_corners=True)
 
         x2_cat = torch.cat([x2, x1_up], dim=1)
@@ -125,10 +273,183 @@ class Custom_FPN_LSS(nn.Module):
         else:
             x4_out = None
 
+        if self.return_map_aux_features:
+            aux_features = {}
+            if '100' in self.map_aux_feature_levels:
+                aux_features['100'] = x3_cat
+            if '50' in self.map_aux_feature_levels:
+                aux_features['50'] = x2_cat
+            return dict(bev_feature=x4_out, aux_features=aux_features)
+
         return [x4_out, x4_out, x4_out, x4_out]
 
     def _apply_checkpoint(self, module, *inputs):
-        if self.with_cp:
+        if self.with_cp and self.training:
             return checkpoint(module, *inputs)
         else:
             return module(*inputs)
+
+    def _resolve_lateral_in_channels(self,
+                                     fpn_lateral_in_channels,
+                                     catconv_in_channels1,
+                                     catconv_in_channels2,
+                                     fused_channels):
+        if fpn_lateral_in_channels is not None:
+            fpn_lateral_in_channels = tuple(
+                int(channel) for channel in fpn_lateral_in_channels)
+            if len(fpn_lateral_in_channels) != 3:
+                raise ValueError(
+                    'fpn_lateral_in_channels must contain three values for '
+                    'level0, level1, and level2.')
+            return fpn_lateral_in_channels
+
+        level0_channels = int(catconv_in_channels2) - int(fused_channels)
+        if level0_channels <= 0:
+            raise ValueError(
+                'Cannot infer level0 channels for Custom_FPN_LSS from '
+                f'catconv_in_channels2={catconv_in_channels2} and '
+                f'fused_channels={fused_channels}.')
+
+        # The local ProtoOcc BEV backbone uses [C, 2C, 4C] pyramid channels.
+        level1_channels = level0_channels * 2
+        level2_channels = int(catconv_in_channels1) - level1_channels
+        if level2_channels <= 0:
+            raise ValueError(
+                'Cannot infer level2 channels for Custom_FPN_LSS from '
+                f'catconv_in_channels1={catconv_in_channels1} and '
+                f'level1_channels={level1_channels}. Set '
+                '`fpn_lateral_in_channels` explicitly.')
+        return (level0_channels, level1_channels, level2_channels)
+
+    def _build_global_context(self,
+                              in_channels,
+                              context_channels,
+                              norm_cfg,
+                              learnable_gate,
+                              gate_init):
+        if self.fpn_global_context_type == 'aspp':
+            return _FPNASPPContext(
+                in_channels,
+                context_channels=context_channels,
+                norm_cfg=norm_cfg,
+                learnable_residual_gate=learnable_gate,
+                residual_gate_init=gate_init)
+        if self.fpn_global_context_type == 'ppm':
+            return _FPNPPMContext(
+                in_channels,
+                context_channels=context_channels,
+                norm_cfg=norm_cfg,
+                learnable_residual_gate=learnable_gate,
+                residual_gate_init=gate_init)
+        raise ValueError(
+            'Unsupported fpn_global_context_type: '
+            f'{self.fpn_global_context_type}. Expected "aspp" or "ppm".')
+
+
+class _FPNASPPContext(nn.Module):
+    def __init__(self,
+                 in_channels,
+                 context_channels=None,
+                 norm_cfg=dict(type='BN'),
+                 learnable_residual_gate=False,
+                 residual_gate_init=0.1):
+        super(_FPNASPPContext, self).__init__()
+        self.learnable_residual_gate = bool(learnable_residual_gate)
+        if context_channels is None:
+            context_channels = max(in_channels // 4, 32)
+        self.branches = nn.ModuleList()
+        for dilation in (1, 2, 4):
+            self.branches.append(
+                ConvModule(
+                    in_channels,
+                    context_channels,
+                    kernel_size=3,
+                    padding=dilation,
+                    dilation=dilation,
+                    bias=False,
+                    norm_cfg=norm_cfg,
+                    act_cfg=dict(type='ReLU', inplace=True)))
+        self.pool_branch = ConvModule(
+            in_channels,
+            context_channels,
+            kernel_size=1,
+            bias=False,
+            norm_cfg=None,
+            act_cfg=dict(type='ReLU', inplace=True))
+        self.project = ConvModule(
+            context_channels * 4,
+            in_channels,
+            kernel_size=1,
+            bias=True,
+            norm_cfg=None,
+            act_cfg=None)
+        self.project.apply(_zero_init_conv)
+        if self.learnable_residual_gate:
+            self.residual_gate = nn.Parameter(
+                torch.full((1,), _gate_logit(residual_gate_init)))
+        else:
+            self.residual_gate = None
+
+    def forward(self, x):
+        out = [branch(x) for branch in self.branches]
+        pooled = F.adaptive_avg_pool2d(x, 1)
+        pooled = self.pool_branch(pooled)
+        pooled = F.interpolate(
+            pooled, size=x.shape[2:], mode='bilinear', align_corners=True)
+        out.append(pooled)
+        delta = self.project(torch.cat(out, dim=1))
+        if self.residual_gate is not None:
+            delta = torch.sigmoid(self.residual_gate).view(1, 1, 1, 1) * delta
+        return x + delta
+
+
+class _FPNPPMContext(nn.Module):
+    def __init__(self,
+                 in_channels,
+                 context_channels=None,
+                 pool_scales=(1, 2, 3, 6),
+                 norm_cfg=dict(type='BN'),
+                 learnable_residual_gate=False,
+                 residual_gate_init=0.1):
+        super(_FPNPPMContext, self).__init__()
+        self.learnable_residual_gate = bool(learnable_residual_gate)
+        if context_channels is None:
+            context_channels = max(in_channels // len(pool_scales), 32)
+        self.pool_scales = tuple(pool_scales)
+        self.branches = nn.ModuleList()
+        for scale in self.pool_scales:
+            branch_norm_cfg = None if scale == 1 else norm_cfg
+            self.branches.append(
+                ConvModule(
+                    in_channels,
+                    context_channels,
+                    kernel_size=1,
+                    bias=False,
+                    norm_cfg=branch_norm_cfg,
+                    act_cfg=dict(type='ReLU', inplace=True)))
+        self.project = ConvModule(
+            in_channels + context_channels * len(self.pool_scales),
+            in_channels,
+            kernel_size=1,
+            bias=True,
+            norm_cfg=None,
+            act_cfg=None)
+        self.project.apply(_zero_init_conv)
+        if self.learnable_residual_gate:
+            self.residual_gate = nn.Parameter(
+                torch.full((1,), _gate_logit(residual_gate_init)))
+        else:
+            self.residual_gate = None
+
+    def forward(self, x):
+        out = [x]
+        for scale, branch in zip(self.pool_scales, self.branches):
+            pooled = F.adaptive_avg_pool2d(x, scale)
+            pooled = branch(pooled)
+            pooled = F.interpolate(
+                pooled, size=x.shape[2:], mode='bilinear', align_corners=True)
+            out.append(pooled)
+        delta = self.project(torch.cat(out, dim=1))
+        if self.residual_gate is not None:
+            delta = torch.sigmoid(self.residual_gate).view(1, 1, 1, 1) * delta
+        return x + delta

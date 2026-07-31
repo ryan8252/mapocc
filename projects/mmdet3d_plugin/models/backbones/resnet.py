@@ -1,11 +1,88 @@
 import torch.utils.checkpoint as checkpoint
 from torch import nn
 
+from mmcv.cnn import build_norm_layer
 from mmcv.cnn.bricks.conv_module import ConvModule
 from mmdet.models.backbones.resnet import BasicBlock, Bottleneck
 from mmdet3d.models import BACKBONES
 from typing import Optional, Union, Sequence
 import torch
+
+
+def _checkpoint_non_reentrant(function, *args):
+    return checkpoint.checkpoint(function, *args, use_reentrant=False)
+
+
+@BACKBONES.register_module()
+class GeneralizedResNet(nn.Module):
+    """BEVFusion-style 2D BEV decoder backbone.
+
+    `blocks` follows BEVFusion's `[num_blocks, out_channels, stride]` format.
+    """
+
+    def __init__(self,
+                 in_channels,
+                 blocks,
+                 norm_cfg=dict(type='BN'),
+                 with_cp=False):
+        super(GeneralizedResNet, self).__init__()
+        self.blocks = [tuple(block) for block in blocks]
+        self.with_cp = with_cp
+
+        layers = []
+        current_channels = in_channels
+        for num_blocks, out_channels, stride in self.blocks:
+            layers.append(
+                self._make_layer(
+                    current_channels,
+                    out_channels,
+                    num_blocks,
+                    stride,
+                    norm_cfg))
+            current_channels = out_channels
+        self.layers = nn.ModuleList(layers)
+
+    def _make_layer(self, in_channels, out_channels, num_blocks, stride,
+                    norm_cfg):
+        downsample = None
+        if stride != 1 or in_channels != out_channels:
+            downsample = nn.Sequential(
+                nn.Conv2d(
+                    in_channels,
+                    out_channels,
+                    kernel_size=1,
+                    stride=stride,
+                    bias=False),
+                build_norm_layer(norm_cfg, out_channels)[1])
+
+        layers = [
+            BasicBlock(
+                inplanes=in_channels,
+                planes=out_channels,
+                stride=stride,
+                downsample=downsample,
+                norm_cfg=norm_cfg)
+        ]
+        for _ in range(num_blocks - 1):
+            layers.append(
+                BasicBlock(
+                    inplanes=out_channels,
+                    planes=out_channels,
+                    stride=1,
+                    downsample=None,
+                    norm_cfg=norm_cfg))
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        feats = []
+        for layer in self.layers:
+            if self.with_cp:
+                x = _checkpoint_non_reentrant(layer, x)
+            else:
+                x = layer(x)
+            feats.append(x)
+        return feats
+
 
 @BACKBONES.register_module()
 class CustomResNet(nn.Module):
@@ -59,7 +136,7 @@ class CustomResNet(nn.Module):
         x_tmp = x
         for lid, layer in enumerate(self.layers):
             if self.with_cp:
-                x_tmp = checkpoint.checkpoint(layer, x_tmp)
+                x_tmp = _checkpoint_non_reentrant(layer, x_tmp)
             else:
                 x_tmp = layer(x_tmp)
             if lid in self.backbone_output_ids:
@@ -149,7 +226,7 @@ class CustomBEVBackbone(nn.Module):
         x_tmp = x
         for lid, layer in enumerate(self.layers):
             if self.with_cp:
-                x_tmp = checkpoint.checkpoint(layer, x_tmp)
+                x_tmp = _checkpoint_non_reentrant(layer, x_tmp)
             else:
                 x_tmp = layer(x_tmp)
             if lid in self.backbone_output_ids:
@@ -245,7 +322,7 @@ class CustomResNet3D(nn.Module):
         x_tmp = x
         for lid, layer in enumerate(self.layers):
             if self.with_cp:
-                x_tmp = checkpoint.checkpoint(layer, x_tmp)
+                x_tmp = _checkpoint_non_reentrant(layer, x_tmp)
             else:
                 x_tmp = layer(x_tmp)
             if lid in self.backbone_output_ids:

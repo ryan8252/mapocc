@@ -160,6 +160,46 @@ def sigmoid_focal_loss(pred,
     return loss
 
 
+def binary_mask_focal_loss(pred,
+                           target,
+                           weight=None,
+                           gamma=2.0,
+                           alpha=0.25,
+                           reduction='mean',
+                           avg_factor=None,
+                           activated=False):
+    """Sigmoid focal loss for dense multi-label binary masks.
+
+    This variant expects `pred` and `target` to have the same shape, e.g.
+    `(B, C, H, W)`, and treats every channel independently as a binary mask.
+    """
+    pred = pred.float()
+    target = target.float()
+
+    if activated:
+        prob = pred
+        loss = F.binary_cross_entropy(prob, target, reduction='none')
+    else:
+        prob = pred.sigmoid()
+        loss = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
+
+    pt = prob * target + (1 - prob) * (1 - target)
+    focal_weight = (1 - pt).pow(gamma)
+    if alpha >= 0:
+        alpha_t = alpha * target + (1 - alpha) * (1 - target)
+        focal_weight = alpha_t * focal_weight
+    loss = loss * focal_weight
+
+    if weight is not None and weight.shape != loss.shape:
+        if weight.numel() == loss.size(0):
+            weight = weight.view((loss.size(0),) + (1,) * (loss.ndim - 1))
+        else:
+            assert weight.numel() == loss.numel()
+            weight = weight.view_as(loss)
+
+    return weight_reduce_loss(loss, weight, reduction, avg_factor)
+
+
 @LOSSES.register_module()
 class CustomFocalLoss(nn.Module):
 
@@ -263,3 +303,43 @@ class CustomFocalLoss(nn.Module):
         else:
             raise NotImplementedError
         return loss_cls
+
+
+@LOSSES.register_module()
+class BinaryMaskFocalLoss(nn.Module):
+
+    def __init__(self,
+                 use_sigmoid=True,
+                 gamma=2.0,
+                 alpha=0.25,
+                 reduction='mean',
+                 loss_weight=1.0,
+                 activated=False):
+        super(BinaryMaskFocalLoss, self).__init__()
+        assert use_sigmoid is True, 'Only sigmoid focal loss supported now.'
+        self.use_sigmoid = use_sigmoid
+        self.gamma = gamma
+        self.alpha = alpha
+        self.reduction = reduction
+        self.loss_weight = loss_weight
+        self.activated = activated
+
+    def forward(self,
+                pred,
+                target,
+                weight=None,
+                avg_factor=None,
+                reduction_override=None):
+        assert reduction_override in (None, 'none', 'mean', 'sum')
+        reduction = reduction_override if reduction_override else self.reduction
+
+        loss = binary_mask_focal_loss(
+            pred,
+            target,
+            weight=weight,
+            gamma=self.gamma,
+            alpha=self.alpha,
+            reduction=reduction,
+            avg_factor=avg_factor,
+            activated=self.activated)
+        return self.loss_weight * loss

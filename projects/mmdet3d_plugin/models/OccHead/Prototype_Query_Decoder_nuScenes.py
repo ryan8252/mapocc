@@ -327,19 +327,32 @@ class Prototype_Query_Decoder_nuScenes(MaskHead):
             mask_camera,
             mask_feat,
             occ_pred,
+            return_query_info=False,
             **kwargs,
         ):
         gt_labels, gt_masks, gt_binaries = self.preprocess_gt(gt_occ, img_metas, )
-        all_cls_scores, all_mask_preds, RPL_args = self(voxel_feats, img_metas, mask_feat, occ_pred, )
-        losses = self.loss(all_cls_scores, all_mask_preds, gt_labels, gt_masks, gt_binaries, gt_occ, mask_camera, img_metas, RPL_args)
-
-        return losses
-
-    def forward(self, 
+        decoder_outputs = self(
             voxel_feats,
             img_metas,
             mask_feat,
-            occ_pred=None,
+            occ_pred,
+            return_query_info=return_query_info)
+        if return_query_info:
+            all_cls_scores, all_mask_preds, RPL_args, query_info = decoder_outputs
+        else:
+            all_cls_scores, all_mask_preds, RPL_args = decoder_outputs
+        losses = self.loss(all_cls_scores, all_mask_preds, gt_labels, gt_masks, gt_binaries, gt_occ, mask_camera, img_metas, RPL_args)
+
+        if return_query_info:
+            return losses, query_info
+        return losses
+
+    def forward(self, 
+            voxel_feats,  #CFV [B, 48, 200, 200, 16]
+            img_metas,  
+            mask_feat,    # cnn3d_decoder 的 mask_feat [B,200,200,16,32] 給 AdaPG 抽 32 維 prototype 用
+            occ_pred=None, # prototoype_occ_pred 是 18 類 coarse semantic logits [B,200,200,16,18]
+            return_query_info=False,
             **kwargs,
         ):
         batch_size = len(img_metas)
@@ -348,7 +361,7 @@ class Prototype_Query_Decoder_nuScenes(MaskHead):
 
         # Scene-Adaptive Prototype Generator
         mask_target = occ_pred.clone().detach().permute(0,4,1,2,3)
-        mask_ = F.softmax(mask_target, dim=1)
+        mask_ = F.softmax(mask_target, dim=1) # 每個 voxel 對 18 個 occupancy class 的 coarse probability。
         top2_values, top2_indices = torch.topk(mask_, 2, dim=1)
         difference = top2_values[:, 0] - top2_values[:, 1]
         scores = 1.0 - difference
@@ -426,12 +439,12 @@ class Prototype_Query_Decoder_nuScenes(MaskHead):
             query_feat = self.for_query_embed(query_feat).unsqueeze(1).repeat((1, batch_size, 1))
 
         query_feat = self.query_self_attn(query_feat, [self_attn_mask])
-        
+        # query_feat: Scene-Aware Queries
 
         # Preidct final occupancy
         cls_pred_list = []
         mask_pred_list = []
-        cls_pred, mask_pred = self.forward_head(query_feat, mask_features)
+        cls_pred, mask_pred = self.forward_head(query_feat, mask_features) # mask_features 來自 CFV
 
         cls_pred_list.append(cls_pred)
         mask_pred_list.append(mask_pred)
@@ -449,6 +462,21 @@ class Prototype_Query_Decoder_nuScenes(MaskHead):
         RPL_args['cls_pred_list'] = RPL_cls_pred_list
         RPL_args['mask_pred_list'] = RPL_mask_pred_list
 
+        if return_query_info:
+            query_real_qbc = query_feat[RPL_pad_size:]
+            query_embed_real_bqc = query_real_qbc.transpose(0, 1).contiguous()
+            query_norm_real_qbc = self.post_norm(query_real_qbc)
+            query_norm_real_bqc = query_norm_real_qbc.transpose(0, 1).contiguous()
+            mask_embed_real_qbc = self.mask_embed(query_norm_real_qbc)
+            mask_embed_real_bqc = mask_embed_real_qbc.transpose(0, 1).contiguous()
+            query_info = dict(
+                query_embed_real_bqc=query_embed_real_bqc,
+                query_norm_real_bqc=query_norm_real_bqc,
+                mask_embed_real_bqc=mask_embed_real_bqc,
+                RPL_pad_size=RPL_pad_size)
+
+            return cls_pred_list_, mask_pred_list_, RPL_args, query_info
+
         return cls_pred_list_, mask_pred_list_, RPL_args
 
     def format_results(self, mask_cls_results, mask_pred_results):
@@ -463,9 +491,19 @@ class Prototype_Query_Decoder_nuScenes(MaskHead):
             img_metas,
             mask_feat,
             occ_pred=None,
+            return_query_info=False,
             **kwargs,
         ):
-        all_cls_scores, all_mask_preds, _ = self(voxel_feats, img_metas, mask_feat, occ_pred)
+        decoder_outputs = self(
+            voxel_feats,
+            img_metas,
+            mask_feat,
+            occ_pred,
+            return_query_info=return_query_info)
+        if return_query_info:
+            all_cls_scores, all_mask_preds, _, query_info = decoder_outputs
+        else:
+            all_cls_scores, all_mask_preds, _ = decoder_outputs
         mask_cls_results = all_cls_scores[-1]
         mask_pred_results = all_mask_preds[-1]
         
@@ -473,4 +511,6 @@ class Prototype_Query_Decoder_nuScenes(MaskHead):
         occ_score = output_voxels.permute(0,2,3,4,1).softmax(-1)
         occ_res = occ_score.argmax(-1)
         occ_res = occ_res.cpu().numpy().astype(np.uint8)
+        if return_query_info:
+            return list(occ_res), query_info
         return list(occ_res)

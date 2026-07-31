@@ -525,5 +525,76 @@ class CM_DepthNet(BaseModule):
                 reduction='none',
             ).sum() / max(1.0, fg_mask.sum())
         depth_loss_dict['loss_depth'] = self.loss_depth_weight * depth_loss
-        
+
         return depth_loss_dict
+
+
+@HEADS.register_module()
+class MapDepthNet(BaseModule):
+    """Lightweight, *unsupervised* depth distribution for the map LSS branch.
+
+    Why this exists (方案 1 / map depth decoupling):
+        OCC needs ``CM_DepthNet`` supervised by ``loss_depth`` so the depth is
+        sharpened toward the LiDAR surface return -- good for surface/voxel
+        localization. But that sharp depth makes the BEV splat sparse: each ray
+        deposits its feature into ~1 cell, which starves flat map classes
+        (drivable / divider / ...). The map-only ablations showed map prefers a
+        *soft* depth (BEVFusion-style implicit depth) + 2D sum-pool (49.09).
+
+        In the multitask model the map LSS2D branch otherwise *shares* the OCC
+        (sharp) depth via the detector. This head gives the map branch its own
+        soft depth distribution, shaped only by the map segmentation gradient
+        (no depth loss attached), while OCC keeps its sharp supervised depth.
+
+    It deliberately stays cheap: shares the image-neck feature with
+    ``CM_DepthNet`` but keeps separate weights and skips the camera MLP / ASPP /
+    DCN machinery. Zero-init of the final conv makes the initial depth uniform
+    (max spread -> dense BEV coverage at the start of training).
+    """
+
+    def __init__(self,
+                 in_channels=512,
+                 mid_channels=256,
+                 depth_channels=88,
+                 num_layers=2,
+                 with_cp=False,
+                 init_uniform=True):
+        super(MapDepthNet, self).__init__()
+        self.fp16_enable = False
+        self.with_cp = with_cp
+        self.depth_channels = depth_channels
+        self.D = depth_channels
+        layers = [
+            nn.Conv2d(
+                in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+        ]
+        for _ in range(max(0, num_layers - 1)):
+            layers += [
+                nn.Conv2d(
+                    mid_channels, mid_channels, kernel_size=3, padding=1,
+                    bias=False),
+                nn.BatchNorm2d(mid_channels),
+                nn.ReLU(inplace=True),
+            ]
+        self.reduce_conv = nn.Sequential(*layers)
+        self.depth_pred = nn.Conv2d(
+            mid_channels, depth_channels, kernel_size=1, stride=1, padding=0)
+        if init_uniform:
+            nn.init.zeros_(self.depth_pred.weight)
+            if self.depth_pred.bias is not None:
+                nn.init.zeros_(self.depth_pred.bias)
+
+    @force_fp32()
+    def forward(self, x):
+        # x: image-neck feature [B, N, C, H, W] (same source as CM_DepthNet).
+        x = x.to(torch.float32)
+        B, N, C, H, W = x.shape
+        x = x.view(B * N, C, H, W)
+        if self.with_cp and x.requires_grad:
+            x = cp.checkpoint(self.reduce_conv, x)
+        else:
+            x = self.reduce_conv(x)
+        depth = self.depth_pred(x)
+        return depth.softmax(dim=1)
