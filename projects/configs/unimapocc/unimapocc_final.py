@@ -1,6 +1,29 @@
 _base_ = ['../../../mmdetection3d/configs/_base_/datasets/nus-3d.py',
           '../../../mmdetection3d/configs/_base_/default_runtime.py']
 
+# =============================================================================
+# UniMapOcc final standalone model config
+# =============================================================================
+# This file intentionally does not inherit any ProtoOcc experiment config.
+# Only the standard MMDetection3D dataset/runtime bases above are retained.
+#
+# Local implementation index (relative to the ProtoOcc repository root):
+#   Multi-task detector / head wiring:
+#     projects/mmdet3d_plugin/models/detectors/ProtoOccCnnSegHead.py
+#   Shared OCC/Map encoder, Map-HFM, and map residual adapter:
+#     projects/mmdet3d_plugin/models/backbones/dual_branch_encoder.py
+#   128-channel map neck, FPN lateral projection, and residual ASPP:
+#     projects/mmdet3d_plugin/models/necks/lss_fpn.py
+#   OCC CNN head:
+#     projects/mmdet3d_plugin/models/dense_heads/cnn3d_decoder.py
+#   Occupancy prototype query decoder:
+#     projects/mmdet3d_plugin/models/OccHead/Prototype_Query_Decoder_nuScenes.py
+#   Map CNN head, weighted focal-Dice, and active enhancement gate:
+#     projects/mmdet3d_plugin/models/dense_heads/bev_seg_head.py
+#   Local binary mask focal loss:
+#     projects/mmdet3d_plugin/models/losses/focal_loss.py
+# =============================================================================
+
 plugin = True
 plugin_dir = 'projects/mmdet3d_plugin/'
 point_cloud_range = [-40.0, -40.0, -1, 40.0, 40.0, 5.4]
@@ -66,7 +89,10 @@ numC_Trans = 80
 depth_categories = 88
 num_class = 18
 voxel_out_channels = 48
+map_bev_channels = 128
 
+# Keep ProtoOcc's native BEV range so the future map head can supervise
+# directly on the occupancy/BEV feature lattice without extra reprojection.
 map_xbound = [-40.0, 40.0, 0.4]
 map_ybound = [-40.0, 40.0, 0.4]
 
@@ -75,12 +101,19 @@ nusc_version = 'v1.0-trainval'
 data_root = 'data/nuscenes/'
 file_client_args = dict(backend='disk')
 
+# Multi-head detector:
+#   OCC: cnn3d_decoder + Prototype_Query_Decoder_nuScenes
+#   Map: BEVSegHead
+# Implemented in:
+#   projects/mmdet3d_plugin/models/detectors/ProtoOccCnnSegHead.py
 model = dict(
-    type='ProtoOccMultitask',          # ← changed from ProtoOccCnnSegHead
+    type='ProtoOccCnnSegHead',
+    # Applied to every loss returned by BEVSegHead, including gate losses.
+    map_loss_weight=4.0,  # λ_map in the paper, default = 4.0
     pc_range=point_cloud_range,
     grid_size=grid_size,
-    img_bev_encoder_backbone=None,
-    img_bev_encoder_neck=None,
+    img_bev_encoder_backbone=None,  # for avoiding error during init BEVDet
+    img_bev_encoder_neck=None,  # for avoiding error during init BEVDet
     img_backbone=dict(
         pretrained='torchvision://resnet50',
         type='ResNet',
@@ -130,6 +163,35 @@ model = dict(
         voxel_out_channels=voxel_out_channels,
         down_sample_for_3d_pooling=[numC_Trans * grid_size[2], numC_Trans * 2],
         return_bev_feature=True,
+        return_map_feature=True,
+        detach_map_feature=False,
+
+        # Map-HFM / VGMR
+        # Implementation:
+        #   projects/mmdet3d_plugin/models/backbones/dual_branch_encoder.py
+        #   class MapHFMFusionLayer and
+        #   Dual_Branch_Encoder._build_map_hfm_features()
+        # Three voxel sources [vox_res, vox1, vox3] are collapsed with
+        # mean-Z + max-Z and injected into the three BEV pyramid levels.
+        use_map_hfm=True,
+        map_hfm_lower_source='vox3',
+        map_hfm_order='hfm_then_adapter',
+        map_hfm_fusion_mode='residual_concat',
+        map_hfm_voxel_residual_scale=1.0,
+
+        # Per-scale map residual adapter
+        # Implementation:
+        #   projects/mmdet3d_plugin/models/backbones/dual_branch_encoder.py
+        #   class PerScaleMapResidualAdapter
+        # Per level: 1x1 -> depthwise 3x3 -> 1x1 (last 1x1 is zero-init),
+        # followed by an identity residual addition.
+        map_residual_adapter=dict(
+            type='PerScaleMapResidualAdapter',
+            in_channels=[numC_Trans * 2, numC_Trans * 4, numC_Trans * 8],
+            residual_scale=1.0,
+            with_cp=True,
+            detach_input=False),
+
         bev_encoder_backbone=dict(
             type='CustomBEVBackbone',
             stride=[2, 2, 2],
@@ -140,7 +202,38 @@ model = dict(
             catconv_in_channels1=numC_Trans * 8 + numC_Trans * 4,
             catconv_in_channels2=numC_Trans * 2 + voxel_out_channels * 2,
             out_channels=voxel_out_channels,
-            input_feature_index=(0, 1, 2))),
+            input_feature_index=(0, 1, 2)),
+
+        # Dedicated 128-channel Map neck
+        # Implementation:
+        #   projects/mmdet3d_plugin/models/necks/lss_fpn.py
+        #   class Custom_FPN_LSS
+        #
+        # FPN lateral:
+        #   [160, 320, 640] -> three independent 1x1 projections to 256ch.
+        # Residual ASPP:
+        #   applied to the lowest-resolution 640ch / 25x25 level before
+        #   lateral projection and top-down fusion.
+        map_bev_encoder_neck=dict(
+            type='Custom_FPN_LSS',
+            catconv_in_channels1=numC_Trans * 8 + numC_Trans * 4,
+            catconv_in_channels2=numC_Trans * 2 + map_bev_channels * 2,
+            out_channels=map_bev_channels,
+            input_feature_index=(0, 1, 2),
+            with_cp=True,
+            use_fpn_lateral_projection=True,
+            fpn_lateral_in_channels=[
+                numC_Trans * 2,
+                numC_Trans * 4,
+                numC_Trans * 8,
+            ],
+            fpn_projection_channels=256,
+            use_fpn_global_context=True,
+            fpn_global_context_type='aspp')),
+
+    # OCC CNN head
+    # Implementation:
+    #   projects/mmdet3d_plugin/models/dense_heads/cnn3d_decoder.py
     cnn3d_decoder=dict(
         type='cnn3d_decoder',
         in_dim=voxel_out_channels,
@@ -154,9 +247,13 @@ model = dict(
             ignore_index=255,
             loss_weight=1.0),
         loss_weight=10.),
+    # Occupancy prototype query decoder
+    # Implementation:
+    #   projects/mmdet3d_plugin/models/OccHead/
+    #   Prototype_Query_Decoder_nuScenes.py
     prototype_query_decoder=dict(
         type='Prototype_Query_Decoder_nuScenes',
-        with_cp=True,
+        with_cp=True,  # for reducing GPU memory usage
         feat_channels=voxel_out_channels,
         out_channels=voxel_out_channels,
         num_queries=18,
@@ -234,49 +331,66 @@ model = dict(
             semantic_on=True,
             panoptic_on=False,
             instance_on=False)),
-    # ── Prototype-based Map Head (replaces BEVSegHead) ────────────────────
-    proto_map_head=dict(
-        type='ProtoMapHead',
-        in_channels=voxel_out_channels,         # 48
-        hidden_channels=voxel_out_channels * 2, # 96
-        num_classes=len(map_classes),           # 6
+    # Map CNN head
+    # Implementation:
+    #   projects/mmdet3d_plugin/models/dense_heads/bev_seg_head.py
+    bev_seg_head=dict(
+        type='BEVSegHead',
+        in_channels=map_bev_channels,
+        hidden_channels=map_bev_channels,
+        num_classes=len(map_classes),
         num_convs=2,
-        attn_heads=8,
-        ema_weight=0.01,
-        prototype_mining_mode='pred_threshold',
-        prototype_mining_alpha=0.5,
-        prototype_pooling_scope='batch_local',
-        use_scene_adaptive=True,
-        use_ema_bank=True,
-        use_learnable_query=True,
-        use_query_self_attn=True,
         with_cp=True,
-        loss_coarse_bce=dict(
+
+        # Retained from the original merged config for exact config parity.
+        # With map_loss_type='focal_dice', BEVSegHead._resolve_map_loss_cfgs()
+        # replaces these runtime loss objects with focal + Dice definitions.
+        loss_bce=dict(
             type='CrossEntropyLoss',
             use_sigmoid=True,
             reduction='mean',
-            loss_weight=2.5),
-        loss_coarse_dice=dict(
-            type='DiceLoss',
-            use_sigmoid=True,
-            activate=True,
-            reduction='mean',
-            naive_dice=True,
-            loss_weight=0.5),
-        loss_mask_focal=dict(
-            type='BinaryMaskFocalLoss',
-            use_sigmoid=True,
-            gamma=2.0,
-            alpha=0.25,
-            reduction='mean',
             loss_weight=5.0),
-        loss_mask_dice=dict(
+        loss_dice=dict(
             type='DiceLoss',
             use_sigmoid=True,
             activate=True,
             reduction='mean',
             naive_dice=True,
-            loss_weight=1.0)))
+            loss_weight=1.0),
+
+        # Static-class-weighted focal + Dice map loss
+        # Loss selection, weighting, and aggregation:
+        #   projects/mmdet3d_plugin/models/dense_heads/bev_seg_head.py
+        # Local BinaryMaskFocalLoss implementation:
+        #   projects/mmdet3d_plugin/models/losses/focal_loss.py
+        # DiceLoss itself is provided by the MMDetection loss registry.
+        map_loss_type='focal_dice',
+        map_dice_weight=1.0,
+        map_focal_gamma=2.0,
+        map_focal_alpha=0.25,
+        use_map_class_weights=True,
+        # Class order:
+        # [drivable_area, ped_crossing, walkway,
+        #  stop_line, carpark_area, divider]
+        map_class_weights=[1.0, 2.0, 2.0, 2.0, 4.0, 4.0],
+
+        # Group-aware map-active feature enhancement gate
+        # Network, feature enhancement, GT target, and gate losses:
+        #   projects/mmdet3d_plugin/models/dense_heads/bev_seg_head.py
+        # The gate is predicted from decoded map features at both training and
+        # inference. GT is used only to supervise its focal/Dice gate losses.
+        use_map_active_enhance_gate=True,
+        map_active_gate_channels=2,
+        map_active_gate_class_groups=[
+            [0, 2, 4],  # area/background regions
+            [1, 3, 5],  # thin/overlay regions
+        ],
+        map_active_gate_dilations=[0, 2],
+        map_active_gate_beta=0.5,
+        map_active_gate_loss_weight=0.2,
+        map_active_gate_use_focal=True,
+        map_active_gate_use_dice=True,
+        map_active_gate_init_bias=-4.0))
 
 bda_aug_conf = dict(
     rot_lim=(-0., 0.),
@@ -420,7 +534,6 @@ lr_config = dict(
     warmup_ratio=0.001,
     step=[29, ])
 runner = dict(type='EpochBasedRunner', max_epochs=24)
-# find_unused_parameters = False
 
 custom_hooks = [
     dict(
@@ -446,38 +559,3 @@ log_config = dict(
         dict(type='TextLoggerHook'),
         dict(type='TensorboardLoggerHook')
     ])
-
-
-# ===> per class IoU of 6019 samples:
-# ===> others - IoU = 10.9
-# ===> barrier - IoU = 44.4
-# ===> bicycle - IoU = 23.14
-# ===> bus - IoU = 39.72
-# ===> car - IoU = 48.68
-# ===> construction_vehicle - IoU = 20.89
-# ===> motorcycle - IoU = 23.44
-# ===> pedestrian - IoU = 26.61
-# ===> traffic_cone - IoU = 25.39
-# ===> trailer - IoU = 27.62
-# ===> truck - IoU = 33.87
-# ===> driveable_surface - IoU = 80.6
-# ===> other_flat - IoU = 43.12
-# ===> sidewalk - IoU = 51.48
-# ===> terrain - IoU = 54.28
-# ===> manmade - IoU = 39.45
-# ===> vegetation - IoU = 34.65
-# ===> mIoU of 6019 samples: 36.96
-
-
-# Map Head
-# 31.46 mIoU。
-
-# 各 map 類別：
-
-# class	best IoU
-# drivable_area	71.83
-# walkway	37.81
-# carpark_area	23.33
-# ped_crossing	21.86
-# divider	19.01
-# stop_line	14.92

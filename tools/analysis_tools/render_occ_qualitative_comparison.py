@@ -52,27 +52,27 @@ CLASS_NAMES = (
     "free",
 )
 
-# Palette follows the qualitative style commonly used by nuScenes occupancy
-# papers: object classes are saturated, surfaces/stuff are muted, free is white.
+# Palette matches tools/analysis_tools/vis_occ.py for classes 0..16.
+# Free (class 17) is rendered as white.
 CLASS_COLORS = np.asarray(
     [
         [0, 0, 0],
-        [255, 127, 0],
-        [251, 180, 174],
-        [255, 235, 0],
-        [0, 145, 220],
-        [0, 190, 220],
-        [190, 190, 0],
-        [230, 0, 0],
-        [255, 225, 145],
-        [125, 55, 45],
-        [135, 35, 165],
-        [155, 155, 155],
-        [100, 0, 80],
-        [145, 0, 95],
-        [145, 240, 90],
-        [220, 220, 235],
-        [0, 160, 0],
+        [112, 128, 144],
+        [220, 20, 60],
+        [255, 127, 80],
+        [255, 158, 0],
+        [233, 150, 70],
+        [255, 61, 99],
+        [0, 0, 230],
+        [47, 79, 79],
+        [255, 140, 0],
+        [255, 99, 71],
+        [0, 207, 191],
+        [175, 0, 75],
+        [75, 0, 75],
+        [112, 180, 60],
+        [222, 184, 135],
+        [0, 175, 0],
         [255, 255, 255],
     ],
     dtype=np.float32,
